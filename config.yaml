@@ -334,7 +334,14 @@ live:
     # chokepoint (e.g. cam_206 <-> cam_224 = 3 + 2 = 5s). cam_224 & cam_219 are
     # co-visible (same room, overlapping views) -> 0: no time constraint (the
     # co-active veto handles co-presence). Undirected. Format: [a, b, min_sec].
-    enabled: true
+    #
+    # DISABLED after A100 testing: with these cameras the view-to-view handoff is
+    # FASTER than the walking distance suggests (adjacent/overlapping fields of
+    # view), so a 2-3s minimum pruned the TRUE cross-camera match (linked collapsed
+    # 5 -> 1, topology_pruned=508). Min-transit vetoes only work when cameras are
+    # far apart with a real gap between views; here they are not. Back to
+    # appearance-only. (Set enabled: true only if you separate the cameras.)
+    enabled: false
     edges:
       - [cam_224, cam_219, 0]   # same room, co-visible (overlapping views)
       - [cam_224, cam_213, 2]   # room -> chokepoint (measured)
