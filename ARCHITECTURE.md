@@ -7,8 +7,8 @@ that is stable for the same real person **across cameras** and **across
 re-appearances** within a camera. The pipeline is fully self-contained: it
 builds and owns its own Qdrant gallery — there is no separate registration step
 or external service. Output: annotated videos (boxes + reid-id labels, with
-`global_id` kept for compatibility) and a console run-summary. Per-person crop
-images are optional (`crops.save`, off by default).
+`global_id` kept for compatibility) and a console run-summary. (On-disk
+per-person crop saving is disabled in the code — see the CropSaver note in §3.)
 
 There are two entry paths, and **both settle cross-camera identity with the same
 offline reconcile** (`identity/reconcile.py`):
@@ -62,7 +62,7 @@ ADR-002 adds two more stages **inside** the identity layer's decision, between
    │ 1. VideoSource          video file      → frame              │
    │ 2. (optional) resize    frame            → frame (downscaled) │
    │ 3. PersonDetector       frame            → [Detection + track_id]  (YOLO11n + ByteTrack)
-   │ 4. CropSaver (optional)  frame+dets      → crops/<cam>/id_<t>/  (only if crops.save)
+   │ 4. CropSaver (disabled)  frame+dets      → in-memory only (no files written)
    │ 5. TrackEmbedder        crop             → det.embedding (512-d)  [shared model lock]
    │      └─ quality gate + occlusion gate + throttle/cache          │
    │ 6. IdentityService      embedding+where+when → det.reid_id     [identity lock]
@@ -95,11 +95,13 @@ Returns `Detection(x1,y1,x2,y2, confidence, class_id, track_id, ...)`. `track_id
 is **per-camera** and stable frame-to-frame; it may be `None` until ByteTrack
 confirms a box. `crop_person()` is the shared "box → safe crop" primitive.
 
-### CropSaver — `src/crop_saver.py` (optional, off by default)
-Only active when `crops.save: true`. Writes one crop per tracked person every
-`crops.interval` (10) frames, from the **clean** frame (before boxes are drawn),
-to `crops/<camera>/id_<track>/`. Not required by the pipeline — the embedder
-crops in-memory — it's for debugging / collecting ReID training data.
+### CropSaver — `src/crop_saver.py` (disk saving DISABLED)
+Only constructed when `crops.save: true` (off by default). It throttles per-track
+crops and returns them **in memory** — it **writes nothing to disk** (the on-disk
+`crops/<camera>/id_<track>/` saving was removed), and `main.py` discards the
+return. Not required by the pipeline: the embedder makes its own in-memory crop
+via `crop_person()`. To actually collect crops on disk again you'd re-add a
+consumer for the returned crops.
 
 ### ReIDExtractor — `src/reid/extractor.py`
 OSNet-AIN-x1_0, loaded once and shared. Pipeline per crop: BGR→RGB → resize
@@ -347,9 +349,10 @@ The pipeline is correct; the **embedding model is the ceiling** on this domain.
 - **If overlap reappears, the fix is still model-side**, roughly cheapest
   first:
   1. Try other available pretrained checkpoints (already done once here).
-  2. Fine-tune OSNet on crops collected from your own cameras (`crops.save:
-     true` already collects these) with a metric-learning loss (triplet /
-     ArcFace) — directly targets a specific deployment's domain gap.
+  2. Fine-tune OSNet on crops collected from your own cameras (crop saving is
+     currently disabled — you'd re-enable on-disk crops first) with a
+     metric-learning loss (triplet / ArcFace) — directly targets a specific
+     deployment's domain gap.
   3. Synthetic pretraining (RandPerson) and/or MetaBIN (see §5) — the
      "textbook" fix, but there is currently no training pipeline in this repo
      to build on (an earlier `tools/`/`notebooks/` scaffold for this was
@@ -364,7 +367,7 @@ The pipeline is correct; the **embedding model is the ceiling** on this domain.
 |---|---|---|
 | `detector.confidence_threshold` | 0.4 | drop weak detections |
 | `tracker.config` | bytetrack.yaml | tracker |
-| `crops.interval` | 10 | save a crop every N frames |
+| `crops.interval` | 10 | crop-helper throttle (frames/crop; disk saving disabled) |
 | `reid.weights` | osnet_ain_x1_0.pth | ReID checkpoint — recalibrate everything below if this changes (§6) |
 | `reid.interval` / `ttl` | 10 / 300 | re-embed cadence / cache eviction |
 | `reid.quality.max_occlusion_ratio` | 0.5 | reject multi-body crops |

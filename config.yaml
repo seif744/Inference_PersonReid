@@ -43,12 +43,14 @@ tracker:
   config: bytetrack.yaml     # ships with ultralytics; "botsort.yaml" also works
 
 crops:
-  # OFF by default: embeddings are sent straight to the vector store, no crop
-  # files are written. Flip to true only if you want the per-person crop images
-  # on disk for debugging or as ReID training data.
+  # On-disk crop saving is DISABLED in the code (crop_saver.py writes nothing).
+  # The ReID path never needs on-disk crops -- the embedder makes its own
+  # in-memory crop. Leave save: false. Setting it true only constructs the
+  # (in-memory, discarded) crop helper; it does NOT write files. Re-add a real
+  # consumer for the returned crops before relying on this to collect data.
   save: false
   dir: crops
-  interval: 10               # (only used when save: true) save a crop every N frames
+  interval: 10               # crop-helper throttle (frames between crops per track)
   padding: 0
 
 reid:

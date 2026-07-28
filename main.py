@@ -515,6 +515,7 @@ def process_video(name, path, detector, crop_saver, embedder, store, identity,
         with shared["lock"]:
             shared["annotations"][name] = annotations
             shared["done"].add(name)
+            shared["processed"][name] = frame_index
         print(f"{tag} Done. Processed {frame_index} frames.")
 
 
@@ -785,6 +786,7 @@ def main():
         "frames": {},
         "done": set(),
         "annotations": {},   # {name: [per-frame box geometry]} for the re-render
+        "processed": {},     # {name: frames processed} -- detects a total failure
     }
     stop_event = threading.Event()  # set to True to ask all workers to stop
 
@@ -822,6 +824,20 @@ def main():
         t.join(timeout=5)
 
     cv2.destroyAllWindows()
+
+    # ---- Fail loudly if EVERY camera produced nothing -----------------------
+    # process_video swallows per-camera exceptions so one bad source can't kill
+    # the others -- but if ALL of them processed 0 frames (broken install, wrong
+    # paths, unreadable streams), we must NOT silently reconcile an empty gallery
+    # and exit 0. Surface it as an error so an unattended run is detectable.
+    # (A partial failure is left to the per-camera ERROR logs above; a legitimate
+    # people-free video still processes frames, so 0 total frames == real failure.)
+    processed = shared.get("processed", {})
+    if jobs and processed and sum(processed.values()) == 0:
+        raise SystemExit(
+            "[main] ERROR: every camera processed 0 frames "
+            f"({', '.join(sorted(processed))}) -- nothing to reconcile. "
+            "Check the video paths / install and re-run.")
 
     # ---- STAGE 7b: offline reconciliation ----------------------------------
     # The live Identity Service decides each track once and never revisits it, so
