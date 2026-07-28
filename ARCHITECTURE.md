@@ -1,13 +1,24 @@
 # Architecture
 
-Multi-camera person re-identification (ReID) over recorded CCTV. Given one video
-per camera, the system detects and tracks people, embeds their appearance, and
-assigns a **reid id** that is stable for the same real person **across cameras**
-and **across re-appearances** within a camera. The pipeline is fully
-self-contained: it builds and owns its own Qdrant gallery — there is no separate
-registration step or external service. Output: annotated videos (boxes +
-reid-id labels, with `global_id` kept for compatibility) and a console
-run-summary. Per-person crop images are optional (`crops.save`, off by default).
+Multi-camera person re-identification (ReID). Given one source per camera — a
+**live RTSP stream** (`--mode live`) or a **recorded video file** — the system
+detects and tracks people, embeds their appearance, and assigns a **reid id**
+that is stable for the same real person **across cameras** and **across
+re-appearances** within a camera. The pipeline is fully self-contained: it
+builds and owns its own Qdrant gallery — there is no separate registration step
+or external service. Output: annotated videos (boxes + reid-id labels, with
+`global_id` kept for compatibility) and a console run-summary. Per-person crop
+images are optional (`crops.save`, off by default).
+
+There are two entry paths, and **both settle cross-camera identity with the same
+offline reconcile** (`identity/reconcile.py`):
+
+- **File-batch** (`main.py`, §2) — a worker thread per video file; live sticky
+  assignment during the pass, then offline reconcile + re-render.
+- **Live streaming** (`src/live/`, §8) — a real-time, load-shedding, per-camera
+  threaded pipeline for RTSP. It never records the raw feed; it persists
+  observations + the processed frames during the run and, on stop, runs the
+  same offline reconcile to produce the corrected `output_<cam>.mp4`.
 
 ---
 
@@ -108,15 +119,6 @@ One per camera (cache keyed by per-camera `track_id`). `process()`:
   of the gallery.
 - Accepted crops go through **one batched forward pass**; rejected crops keep the
   track's last good vector.
-
-### Registry lookup helper — `main.py`
-After embedding a track, `registry_match_for_embedding()` searches the existing
-`registry_gallery` collection and returns a label payload when the top hit clears
-`registry.threshold`.
-- Read-only by design: it does `search()` only.
-- Uses the same 512-d cosine embeddings as the Registry service.
-- The label formatter prefers `name`, then `employee_id`, and falls back to
-  `person_id` if that is all the payload provides.
 
 ### PersonVectorStore — `src/database/store.py`
 Thin Qdrant wrapper. This is the ONLY gallery the pipeline uses — the identity
@@ -381,3 +383,85 @@ The pipeline is correct; the **embedding model is the ceiling** on this domain.
 | `identity.reconcile.same_camera_threshold` | 0.90 | same-camera defrag merge |
 | `identity.reconcile.min_tracklet_observations` | 3 | below this = detector noise |
 | `identity.reconcile.require_reciprocal_best` | true | mutual-NN guard on cross-camera merges |
+
+---
+
+## 8. Live streaming pipeline — `src/live/`
+
+The real-time path (`--mode live`, or `auto` when any source is a stream URL).
+It targets a GPU server for N live RTSP cameras and is **headless** — its
+deliverable is `output_<cam>.mp4`. It never records the raw feed. Stage
+boundaries and queue/drop policies are fixed; the discipline is **bound latency,
+shed load**: queues are small and drop (and count the drop) rather than let lag
+grow, so overload is a bounded, logged loss instead of ever-growing latency.
+
+**Per-camera + shared stages** (one carrier `Frame` object flows through each):
+
+```
+per camera:  DecodeBackend -> CaptureThread -> NewestSlot            \
+shared:      BatchScheduler -> inference_queue -> InferenceStage ->   > identity_queue
+shared:      IdentityStage -> per-cam render_queue                   /
+per camera:  RenderStage -> (writer / capture clip)
+```
+
+- **CaptureThread** (`capture.py`) decodes one camera; `NewestSlot` keeps only
+  the freshest frame (drop-stale) so a slow consumer never sees a backlog.
+- **BatchScheduler** (`scheduler.py`) gathers a freshness-bounded batch across
+  cameras; **InferenceStage** (`inference.py`) runs per-camera detector +
+  ByteTrack (one tracker per camera) and the shared, lock-serialised ReID
+  extractor.
+- **IdentityStage** (`identity_stage.py`) is a single serial thread wrapping the
+  thread-free **IdentityEngine** (`identity_engine.py`): an in-memory active-set
+  with the proven policies (evidence gate, same-camera-overlap hard veto,
+  same-camera cold-reactivation, cross-camera reciprocal-best, mint-when-uncertain)
+  plus a fail-open **topology** veto (`topology.py`). A `CameraFairQueue`
+  (`priority.py`) interleaves cameras so none starves under a burst.
+- **RenderStage** / **WriterStage** (`render.py`, `writer.py`) draw and encode;
+  the writer paces to wall-clock in the non-reconcile mode.
+
+### 8.1 Offline reconciliation on stop (`live.reconcile`, default on)
+
+The online engine decides each track causally and can't see a person who is in
+two cameras at the same instant — so its live ids are provisional. To deliver
+correct ids without recording the raw stream, the live path mirrors the
+file-batch flow using the frames it already processes:
+
+1. **Persist observations** — `IdentityStage` writes every *fresh* embedding
+   (already throttled to every `reid.interval` frames, optionally subsampled by
+   `live.reconcile.sample_stride`) to the Qdrant gallery, with metadata
+   `camera / track_id / frame / run_id / ts / bbox / confidence / crop_quality`
+   and **no live id** (reconcile rebuilds identity from scratch).
+2. **Capture processed frames** — `RenderStage` runs in *capture mode*: it writes
+   each clean processed frame to a transient `._live_src_<cam>.mp4` and records
+   that frame's box geometry, both from the same `Frame` so they stay
+   index-aligned. This is the processed frames only — not the raw feed.
+3. **On stop** (Ctrl-C / all sources ended / `max_duration`), after every stage
+   has joined, `pipeline.py::_finalize_offline()` runs the file path's
+   `reconcile_tracklets` → `render_final_videos` → `print_run_summary`
+   **unchanged**, at the `identity.reconcile.*` thresholds — so a live run and a
+   file run reconcile identically — then deletes the temp clips (kept with
+   `live.reconcile.keep_frames`).
+
+If the store is unreachable or `live.reconcile.enabled` is false, the live path
+falls back to writing the immediate (online-id) `output_<cam>.mp4`.
+
+### 8.2 Key live configuration (`config.yaml` → `live:`)
+
+| Key | Meaning |
+|---|---|
+| `run.mode` | `live` / `auto` (live for stream URLs) / `batch` |
+| `run.device` | `auto` (GPU if present) / `cuda:N` / `cpu` |
+| `run.max_duration_sec` | 0 = until stopped (Ctrl-C / sources end) |
+| `capture.*` | reconnect + frame-staleness bounds |
+| `inference.max_batch_size` / `max_workers` | batch size (1 on CPU) / per-camera concurrency |
+| `inference.pose_ensemble` | live-only: skip the 2nd (pose) model for throughput |
+| `identity.min_evidence_obs` / `*_threshold` / `accept_margin` | online-engine gates (on-screen ids) |
+| `reconcile.enabled` | run the offline reconcile + re-render on stop |
+| `reconcile.sample_stride` | store every Nth fresh embedding per track |
+| `reconcile.keep_frames` | keep the transient processed-frame clips |
+| `topology.enabled` / `edges` | fail-open cross-camera transit-time veto (off by default) |
+
+> The cross-camera **merge** thresholds come from `identity.reconcile.*` (shared
+> with the file path), not from `live.identity.*` (which only tunes the
+> provisional on-screen ids). Recalibrate `identity.reconcile.*` when the ReID
+> checkpoint or camera domain changes (§6).

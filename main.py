@@ -1,10 +1,18 @@
 """
 main.py  --  the ENTRY POINT. Run this file to start the pipeline(s).
 
-    python main.py
+    python main.py                                   # file-batch on config videos
+    python main.py --videos a.mp4 b.mp4              # file-batch on given files
+    python main.py --mode live --videos rtsp://...   # real-time streaming pipeline
 
-This is the "conductor". It reads config.yaml and, for EACH video listed under
-source.videos, runs the same per-frame pipeline:
+Routing (see main(), `live.run.mode`):
+  * STREAM URLs (rtsp:// / http:// ...) are handled by the real-time pipeline in
+    src/live/ -- it reads the feed live (never recording the raw stream) and, on
+    stop, runs the offline reconcile to settle correct cross-camera ids.
+  * LOCAL FILES are handled by the file-batch flow below.
+
+This module is the "conductor" for the FILE-BATCH flow: it reads config.yaml and,
+for EACH video, runs the same per-frame pipeline:
 
     STAGE 1-2   VideoSource      video file  ->  frame
     STAGE 3-4   PersonDetector   frame       ->  [Detection...] (+ track IDs)
@@ -142,33 +150,6 @@ def get_screen_size():
         return size
     except Exception:
         return (1920, 1080)
-
-
-def gui_available():
-    """
-    True only if OpenCV can actually OPEN a window in this environment.
-
-    Why a subprocess: when the display/Qt backend can't initialise (a headless
-    box, or a WSL without a working X server -- the classic "Could not load the
-    Qt platform plugin xcb"), OpenCV does not raise a catchable Python error --
-    it ABORTS the whole process (SIGABRT / core dump). So we cannot probe it
-    in-process with try/except. We probe in a throwaway child process instead:
-    if the child aborts, we learn windows are unusable WITHOUT taking down the
-    real pipeline, and fall back to headless (the saved videos still render).
-    """
-    # No DISPLAY on Linux => definitely no windows; skip the (slow) probe.
-    if sys.platform.startswith("linux") and not os.environ.get("DISPLAY"):
-        return False
-    try:
-        import subprocess
-        result = subprocess.run(
-            [sys.executable, "-c",
-             "import cv2; cv2.namedWindow('__probe__'); cv2.destroyAllWindows()"],
-            capture_output=True, timeout=60,
-        )
-        return result.returncode == 0
-    except Exception:
-        return False
 
 
 # Video file extensions we recognise when scanning a directory.
@@ -383,123 +364,6 @@ def render_final_videos(jobs, cfg, shared, store, run_id):
         futures = [executor.submit(render_one, name, path) for name, path, *_ in jobs]
         for fut in futures:
             fut.result()
-
-
-# =============================================================================
-# PHASE 1 (LIVE mode only): record raw streams to disk, no ML.
-# Decoupling capture from processing is what lets N cameras run without any
-# real-time constraint -- reading+writing frames is cheap and keeps up, and the
-# heavy detect/track/embed/reconcile happens OFFLINE afterwards on the recording
-# (Phase 2 = the ordinary batch pipeline). One recorder thread per stream; an
-# optional raw monitoring window runs on the main thread.
-# =============================================================================
-def capture_stream(name, url, rec_path, fps, stream_cfg, shared, stop_event):
-    """
-    Read `url` and write every decoded frame to `rec_path` at `fps`, until
-    stop_event is set (q / Ctrl-C) or the source ends. NO detection/embedding --
-    just decode + write, so it keeps up with real time for several cameras.
-    Publishes the latest frame to `shared` for the optional monitoring window.
-
-    drop_stale is OFF here: we want a faithful, full-frame-rate recording, not
-    the freshest-only frames the live display wanted. Reconnect stays ON so a
-    transient RTSP hiccup doesn't end the capture.
-    """
-    tag = f"[{name}]"
-    writer = None
-    n = 0
-    try:
-        with VideoSource(
-            path=url,
-            stop_event=stop_event,
-            reconnect_attempts=stream_cfg.get("reconnect_attempts", 5),
-            reconnect_backoff=stream_cfg.get("reconnect_backoff", 1.0),
-            drop_stale=False,
-        ) as cam:
-            print(f"{tag} Recording stream -> {rec_path}")
-            for frame in cam.frames():
-                if stop_event.is_set():
-                    break
-                if writer is None:
-                    h, w = frame.shape[:2]
-                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                    writer = cv2.VideoWriter(rec_path, fourcc, fps, (w, h))
-                writer.write(frame)
-                n += 1
-                # Publish for the monitoring window (a copy so the display thread
-                # can read it while we move on).
-                with shared["lock"]:
-                    shared["frames"][name] = frame.copy()
-                if n % 60 == 0:
-                    print(f"{tag} recording... {n} frames")
-    except Exception as e:
-        print(f"{tag} ERROR while recording: {e}")
-    finally:
-        if writer is not None:
-            writer.release()
-        with shared["lock"]:
-            shared["done"].add(name)
-        print(f"{tag} Recorded {n} frames -> {rec_path}")
-
-
-def run_capture_phase(sources, cfg):
-    """
-    Record every STREAM source to recorded_<name>.mp4 (files pass through). Runs
-    one recorder thread per stream plus an optional raw monitoring window on the
-    main thread; returns {name: recorded_path} for the streams. Blocks until the
-    user stops it ('q' in a window, or Ctrl-C) or every stream ends on its own.
-    """
-    stream_sources = [(n, p) for n, p in sources if is_stream_path(p)]
-    if not stream_sources:
-        return {}
-
-    stream_cfg = cfg.get("source", {}).get("stream", {}) or {}
-    out_cfg = cfg.get("output", {}) or {}
-    disp_cfg = cfg.get("display", {}) or {}
-    # Recording fps: streams report unreliable CAP_PROP_FPS, so we use a fixed
-    # config fps for the recording. Phase 2 re-renders at display.output_fps
-    # regardless (same as any file), so what matters is that every frame is kept.
-    fps = float(out_cfg.get("fps_default", disp_cfg.get("output_fps", 20.0)))
-
-    shared = {"lock": threading.Lock(), "frames": {}, "done": set()}
-    stop_event = threading.Event()
-
-    recorded = {}
-    threads = []
-    for name, url in stream_sources:
-        rec_path = f"recorded_{name}.mp4"
-        recorded[name] = rec_path
-        t = threading.Thread(
-            target=capture_stream,
-            args=(name, url, rec_path, fps, stream_cfg, shared, stop_event),
-            name=f"rec-{name}",
-        )
-        t.start()
-        threads.append(t)
-
-    names = [n for n, _ in stream_sources]
-    want_window = disp_cfg.get("show_window", True)
-    print(f"[capture] Recording {len(names)} stream(s): {', '.join(names)}. "
-          f"Press 'q' in a window or Ctrl-C to stop and start processing.")
-    try:
-        if want_window and gui_available():
-            # Reuse the monitoring window loop: it shows the raw frames and quits
-            # on 'q'. total_videos = number of streams so it exits when all end.
-            run_display(names, cfg, shared, stop_event, len(names))
-        else:
-            if want_window:
-                print("[capture] No usable GUI display -> recording HEADLESS. "
-                      "Press Ctrl-C to stop.")
-            # Headless: wait for the streams (which only end on stop / failure).
-            for t in threads:
-                t.join()
-    except KeyboardInterrupt:
-        print("\n[capture] Ctrl-C -> stopping capture...")
-
-    stop_event.set()
-    for t in threads:
-        t.join(timeout=10)
-    cv2.destroyAllWindows()
-    return recorded
 
 
 # =============================================================================
@@ -775,13 +639,15 @@ def main():
           f"{', '.join(n for n, _ in sources)}")
     print(f"[main] Run id: {run_id}")
 
-    # ---- v5 live-pipeline routing (Stage 0) --------------------------------
-    # The new real-time streaming pipeline lives in src/live/ and is built in
-    # stages. `live.run.mode` selects the path; a capability report is logged so
-    # the chosen device/decode is visible even on a headless server. This block
-    # does NOT change file-batch behaviour: mode `auto` (default) keeps today's
-    # logic (record-then-batch for URLs, batch for files); `batch` forces the
-    # file path; `live` is reserved for the v5 pipeline (Stage 1+).
+    # ---- pipeline routing --------------------------------------------------
+    # `live.run.mode` selects the path; a capability report is logged so the
+    # chosen device/decode is visible even on a headless server.
+    #   live  -> the real-time streaming pipeline (src/live/), files OR streams
+    #   auto  -> live pipeline if ANY source is a stream URL, else file-batch
+    #   batch -> file-batch (files only; stream URLs are rejected)
+    # Stream URLs are ALWAYS handled by the live pipeline (it reads RTSP live and
+    # settles correct ids with the offline reconcile on stop); the file-batch
+    # path below only ever sees local files.
     live_cfg = cfg.get("live", {}) or {}
     run_cfg = live_cfg.get("run", {}) or {}
     run_mode = args.mode or run_cfg.get("mode", "auto")   # --mode overrides config
@@ -795,41 +661,21 @@ def main():
     except Exception as e:
         print(f"[main] (capability report unavailable: {e})")
 
-    if run_mode == "live":
-        # v5 real-time pipeline (src/live/). Handles files OR streams; produces
-        # output_<cam>.mp4 live. Separate from the file-batch + record-then-batch
-        # paths below (which `auto`/`batch` still use).
+    has_stream = any(is_stream_path(p) for _, p in sources)
+    if run_mode == "live" or (run_mode == "auto" and has_stream):
+        # Real-time streaming pipeline (src/live/): reads each source live (never
+        # recording the raw RTSP feed) and, on stop, runs the offline reconcile to
+        # settle correct cross-camera ids and re-render output_<cam>.mp4.
         from live.pipeline import LivePipeline
         LivePipeline(sources, cfg).run()
         print("[main] All done.")
         return
+    if has_stream:
+        raise SystemExit(
+            "[main] batch mode cannot process stream URLs. Use --mode live "
+            "(or run.mode: auto) for RTSP/HTTP streams.")
 
-    # A run is "live" if ANY source is a stream URL (rtsp://, http://, ...).
-    # LIVE mode is a two-phase design that AVOIDS any real-time processing
-    # constraint (so N cameras never build up latency):
-    #   Phase 1 (here): cheaply RECORD each raw stream to recorded_<name>.mp4
-    #     with NO ML -- just decode + write, which easily keeps up with several
-    #     cameras -- while showing an optional raw monitoring window. Stop with
-    #     'q' or Ctrl-C.
-    #   Phase 2 (the rest of main): run the EXACT SAME batch pipeline as a video
-    #     file run on those recordings -> detect/track/embed/assign/reconcile/
-    #     re-render -> output_<name>.mp4 at full fps and full quality.
-    # A files-only run skips Phase 1 entirely and is byte-identical to before.
-    # `run.mode: batch` forces the file path even if a URL was passed.
-    live_run = (run_mode != "batch") and any(is_stream_path(p) for _, p in sources)
-    recorded_paths = {}    # name -> recorded_<name>.mp4 (stream sources only)
-    if live_run:
-        recorded_paths = run_capture_phase(sources, cfg)
-        if not any(os.path.exists(p) for p in recorded_paths.values()):
-            print("[main] No stream frames were recorded; nothing to process.")
-            return
-        # Converge with the file path: each stream source becomes its recording;
-        # any file sources in the same run stay as-is. From here on `sources`
-        # are all local files and Phase 2 is an ordinary batch run.
-        sources = [(name, recorded_paths.get(name, path)) for name, path in sources]
-        print("[main] Capture finished -> processing the recording(s) offline "
-              "through the full pipeline (no real-time constraint).")
-
+    # ---- FILE-BATCH path (local files only from here on) --------------------
     if crop_cfg.get("save"):
         clear_directory(crop_cfg.get("dir", "crops"))
         print(f"[main] Cleared crops directory: {crop_cfg.get('dir', 'crops')}")
@@ -916,12 +762,10 @@ def main():
     id_cfg = cfg.get("identity", {})
     if id_cfg.get("enabled") and store is not None:
         from identity.service import IdentityService
-        # NOTE: the online decision core stays OFF here (online_cfg=None). In the
-        # record-then-batch design every run that reaches this point processes
-        # local files (recordings or user files), so identity is owned by the
-        # SAME sticky live-assign + offline reconcile as a video-file run -- that
-        # is what gives the saved MP4 its file-quality ids. (The online core in
-        # service.py remains available/gated for a future live-preview need.)
+        # NOTE: the online decision core stays OFF here (online_cfg=None). This is
+        # the FILE-BATCH path -- identity is a sticky live-assign during the pass
+        # plus the offline reconcile afterwards, which is what gives the saved MP4
+        # its final cross-camera ids. (Streams are handled by src/live/ instead.)
         identity = IdentityService(
             store,
             threshold=id_cfg.get("threshold", 0.85),
@@ -1008,24 +852,6 @@ def main():
         render_final_videos(jobs, cfg, shared, store, run_id)
 
     print_run_summary(store, jobs, cfg, run_id=run_id)
-
-    # ---- Clean up raw stream recordings (LIVE mode only) --------------------
-    # The recordings were just an intermediate to reach the batch pipeline. By
-    # default we delete them once output_<name>.mp4 exists; keep them with
-    # output.keep_recording: true (e.g. to re-process or audit the raw capture).
-    if recorded_paths:
-        keep = cfg.get("output", {}).get("keep_recording", False)
-        for name, rec_path in recorded_paths.items():
-            if not os.path.exists(rec_path):
-                continue
-            if keep:
-                print(f"[main] Keeping raw recording: {rec_path}")
-            else:
-                try:
-                    os.remove(rec_path)
-                    print(f"[main] Removed raw recording: {rec_path}")
-                except OSError as e:
-                    print(f"[main] Could not remove {rec_path}: {e}")
 
     print("[main] All done.")
 

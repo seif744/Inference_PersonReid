@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-This project is a **CPU-only, fully self-contained multi-camera person re-identification (ReID) system** for recorded CCTV footage.
+This project is a **fully self-contained multi-camera person re-identification (ReID) system** for both **live RTSP streams** and **recorded CCTV footage**. It runs on CPU (file-batch / development) and targets a GPU server for real-time live processing.
 
 Its objective is to maintain **stable global identities across multiple fixed cameras** while requiring little or no manual threshold tuning between deployments.
 
@@ -14,7 +14,7 @@ Unlike most academic ReID projects, this system is intended to solve the complet
 
 The following constraints define every engineering decision.
 
-- CPU-only inference
+- Must remain **CPU-capable** (file-batch / dev runs on CPU); live real-time may use GPU but the system is never GPU-*only*
 - Pretrained models only
 - No model training
 - No fine-tuning
@@ -28,7 +28,7 @@ The following constraints define every engineering decision.
 
 Do **not** recommend:
 
-- GPU-only solutions
+- GPU-*only* solutions (must degrade to CPU for file/dev runs)
 - Custom training
 - Fine-tuning
 - Collecting labeled datasets
@@ -39,7 +39,7 @@ Do **not** recommend:
 # Current Architecture
 
 ```
-Video
+Live RTSP stream  /  Video file
     ↓
 YOLO11n
     ↓
@@ -53,7 +53,7 @@ IdentityService
     ↓
 Qdrant
     ↓
-Offline Reconciliation
+Offline Reconciliation   (both paths; live runs it on Ctrl-C)
     ↓
 Final Render
 ```

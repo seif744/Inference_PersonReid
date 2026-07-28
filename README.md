@@ -1,10 +1,19 @@
 # Multi-Camera Person Re-Identification
 
-Detect and track people across multiple camera videos, embed their appearance,
-and assign a **reid id** that stays the same for one real person **across
-cameras** and **across re-appearances**. The pipeline is fully self-contained —
-it builds and owns its own Qdrant gallery; there is no separate registration
-step or external service. Produces annotated videos.
+Detect and track people across multiple cameras, embed their appearance, and
+assign a **reid id** that stays the same for one real person **across cameras**
+and **across re-appearances**. Two input modes, one identity result:
+
+- **Live RTSP** (`--mode live`) — reads N streams in real time, never recording
+  the raw feed; on stop it runs the offline reconcile and writes corrected
+  `output_<cam>.mp4`. Real-time targets a GPU server.
+- **Video files** (default / `--mode batch`) — the same detect → track → embed →
+  reconcile → re-render flow on recorded footage. Runs on CPU.
+
+The pipeline is fully self-contained — it builds and owns its own Qdrant gallery;
+there is no separate registration step or external service. Both modes settle
+cross-camera identity with the **same offline reconcile** and produce annotated
+videos where one person carries one reid id/colour in every camera.
 
 > **How it works internally:** see **[ARCHITECTURE.md](ARCHITECTURE.md)** for the
 > full data flow, every component, the concurrency model, and design rationale.
@@ -94,8 +103,10 @@ compatibility, but `reid_id` is the label the pipeline presents. Full per-stage 
   docker --version
   docker compose version
   ```
-- **One or more video files** (e.g. `.avi`, `.mp4`). RTSP URLs also work.
-  CPU-only is fine — the whole pipeline runs on CPU.
+- **One or more video files** (e.g. `.avi`, `.mp4`) **or RTSP/HTTP stream URLs**.
+- **CPU** is fine for file inputs and development. **Live RTSP in real time
+  targets a GPU** (the live pipeline auto-detects the device); CPU drops too many
+  frames to judge live quality on.
 
 ---
 
@@ -141,10 +152,9 @@ DukeMTMC-reID + Market1501 + CUHK03, evaluated on MSMT17) from the official
 `deep-person-reid` MODEL_ZOO (`osnet_ain_x1_0`) — download via `gdown` from the
 Google Drive link on that page and place it at `src/reid/weights/`.
 
-`src/reid/weights/osnet_x1_0_market1501.pth` and `osnet_x1_0_msmt17.pth` are
-also still present (earlier defaults) — swap `reid.weights` back to either if
-you want to compare, but they are **not recommended** for this project's
-footage given the measured improvement above.
+To compare against an earlier checkpoint (e.g. `osnet_x1_0_msmt17` or
+`osnet_x1_0` Market1501), fetch it the same way and point `reid.weights` at it —
+but OSNet-AIN is the recommended default given the measured separation above.
 
 ---
 
@@ -167,8 +177,8 @@ This launches `qdrant/qdrant:latest` and exposes:
 - **gRPC (optional):** `localhost:6334`
 
 Data persists in `./qdrant_storage/` (gitignored), so it survives restarts.
-If you already run Registry against another Qdrant endpoint, point Inference at
-that same server instead.
+If you already run a Qdrant server elsewhere, point the pipeline at that endpoint
+instead (see 4b).
 
 Verify it's up:
 ```bash
@@ -187,9 +197,6 @@ Out of the box, `config.yaml` already has:
 store:
   enabled: true
   url: http://localhost:6333
-
-store:
-  enabled: false
 ```
 so no extra step is needed for local Docker. If you prefer env-based config,
 create a `.env` file in the project root:
@@ -248,12 +255,8 @@ tracker:
 reid:
   enabled: true
   weights: src/reid/weights/osnet_ain_x1_0.pth
-  device: cpu                    # "cuda" if you have a GPU
+  device: cpu                    # "cuda" if you have a GPU (file-batch path)
   interval: 10                   # re-embed a track at most every N frames
-
-registry:
-  enabled: true
-  url: http://localhost:6333     # shared Qdrant server (see section 4)
 
 identity:
   enabled: true
@@ -282,6 +285,14 @@ identity:
 display:
   show_window: false             # true = live OpenCV windows; false = headless
   save_annotated: true           # write output_<camera>.mp4
+
+live:                            # real-time streaming pipeline (--mode live)
+  run:
+    mode: auto                   # live | auto (live for stream URLs) | batch
+    device: auto                 # auto picks GPU when present, else CPU
+  reconcile:
+    enabled: true                # on stop, run the offline reconcile + re-render
+    sample_stride: 1             # store every Nth fresh embedding per track
 ```
 
 See [ARCHITECTURE.md §7](ARCHITECTURE.md) for what every knob does.
@@ -314,6 +325,27 @@ Precedence: `--videos` > `--videos-dir` > `config.yaml source.videos`. Missing
 files fail fast with a clear message; duplicate names are made unique
 automatically.
 
+### Run on LIVE RTSP streams (`--mode live`)
+
+Pass one URL per camera. The raw feed is **never recorded**; each stream is
+processed in real time, and **Ctrl-C** triggers the offline reconcile that
+settles correct cross-camera ids and writes the final `output_<cam>.mp4`:
+
+```bash
+python main.py --mode live \
+  --videos \
+  "rtsp://USER:PASS@192.168.1.224:554/ch01/0" \
+  "rtsp://USER:PASS@192.168.1.219:554/ch01/0"
+```
+
+- **N cameras = more URLs.** Camera names auto-derive from the last IP octet
+  (`cam_224`, `cam_219`, …). URL-encode credential specials (`@` → `%40`).
+- On Ctrl-C the console prints *"Please wait a moment while we render the final
+  outputs…"*, reconciles, and re-renders — let it finish. Qdrant must be
+  reachable (`store.url`); otherwise it logs and falls back to the live output.
+- `run.mode: auto` (the default) routes any stream URL to this same live path,
+  so `--mode live` is only needed to force it for a file source.
+
 `--reset` wipes the store's collection first, so a run starts from an empty
 gallery. **Destructive** — deletes every stored embedding/identity:
 
@@ -340,9 +372,7 @@ That's it — no crop images by default. (Per-person crop images can be turned
 back on with `crops.save: true` in `config.yaml`, e.g. to collect ReID training
 data or visually sanity-check identity assignment.)
 
-Registry lookups do not change the gallery contents during inference. The
-console still prints a **RUN SUMMARY** at the end for the legacy identity path,
-e.g.:
+The console prints a **RUN SUMMARY** at the end, e.g.:
 ```
 Store: 516 observations -> 11 distinct people (reid_ids)
 Cross-camera people: 1
@@ -372,32 +402,40 @@ Cross-camera people: 1
 ## 9. Project layout
 
 ```
-main.py                     entry point + per-camera orchestration
+main.py                     entry point + routing + FILE-BATCH orchestration
 config.yaml                 all runtime configuration
 requirements.txt            pinned dependencies
 docker-compose.yml          Qdrant server
 ARCHITECTURE.md             deep-dive: data flow, components, design
 src/
-  video_source.py           frame decoding
+  video_source.py           frame decoding (files + streams)
   detector.py                YOLO11 + ByteTrack, Detection, crop_person
   crop_saver.py               per-track crop persistence (only when crops.save: true)
   drawing.py                  boxes / HUD overlay
   reid/
     extractor.py              crop -> 512-d L2-normalized embedding (OSNet)
     service.py                 TrackEmbedder: throttle, cache, quality + occlusion gates
-    weights/                    ReID model checkpoint
+    weights/                    ReID model checkpoint (osnet_ain_x1_0.pth)
   database/
     store.py                   Qdrant wrapper (PersonVectorStore) -- this pipeline's own gallery
   identity/
     service.py                  global-ID assignment (candidate -> re-rank -> verify -> decide -> commit)
     reranking.py                 ADR-002 Upgrade 1: camera-aware k-reciprocal + Jaccard re-ranking
     verifier.py                  ADR-002 Upgrade 2: scored verification layer + decision logging
-    reconcile.py                 offline cross-camera reconciliation
+    reconcile.py                 offline cross-camera reconciliation (used by BOTH paths)
     DESIGN.md                    why the layers are separated
+  live/                       REAL-TIME streaming pipeline (--mode live)
+    pipeline.py                orchestrator: wire stages, run, shutdown + offline reconcile
+    capture.py / decode_backend.py / capabilities.py   per-camera capture + device probe
+    scheduler.py / inference.py                         freshness batching + detect/track/embed
+    identity_stage.py / identity_engine.py / priority.py   online ids + fair queue + store persistence
+    topology.py                 fail-open cross-camera physical-impossibility veto
+    render.py / writer.py / queues.py / frame.py        draw/encode + load-shedding primitives
+tests/live/                  deterministic logic tests (synthetic; no GPU/models needed)
 ```
 
 Generated at runtime (gitignored): `output_*.mp4`, `logs/`, `qdrant_storage/`,
-`qdrant_data/`.
+`qdrant_data/`, `yolo11n.pt`.
 
 ---
 

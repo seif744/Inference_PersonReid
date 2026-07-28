@@ -8,11 +8,22 @@
 
 ## 0. TL;DR — current state
 
-- Building a **v5 real-time streaming pipeline**: N RTSP cams → per-camera detect/track + ReID → online identity → live-annotated `output_<cam>.mp4`. **Raw stream is never saved; no offline reconcile** (hard handoff invariants).
-- **Done:** ReID model swap (OSNet-AIN), v5 **Stage 0** (scaffold/capability/routing) and **Stage 1** (full threaded skeleton, real-time, produces valid annotated MP4). Both committed + pushed.
-- **Next:** **Stage 3** (the identity engine) — reprioritized ahead of Stage 2 because the current pain is *reid quality*, not throughput.
-- **Known issue (expected, not a bug):** on `--mode live` today, reids are unstable — same person gets different ids, no cross-camera persistence. That is exactly what **Stage 3** builds. Stage 1 identity is intentionally minimal (plumbing only).
-- **CPU is unusable** for this (choppy, bad ids) — never judge quality on CPU. The GPU server is the target.
+- **v5 real-time streaming pipeline** (`src/live/`): N RTSP cams → per-camera
+  detect/track + ReID → online identity → `output_<cam>.mp4`. Validated on the
+  A100 GPU server. The **raw stream is never saved.**
+- **Correct-answer-at-the-end (current workflow):** the online engine's live ids
+  are provisional; on **Ctrl-C** the live path runs the **offline reconcile**
+  (the same `reconcile_tracklets` the file path uses) over persisted
+  observations + the captured processed frames, and re-renders
+  `output_<cam>.mp4` with correct cross-camera ids. This deliberately relaxes the
+  original "no offline reconcile" invariant — the supervisor approved trading
+  instant-on-Ctrl-C output for correct ids, without leaving OSNet-AIN. See
+  `live.reconcile` in config.yaml and ARCHITECTURE.md §8.
+- **Done:** ReID model swap (OSNet-AIN); v5 Stage 0/1 (scaffold + threaded
+  skeleton), Stage 2 (per-camera parallel inference), Stage 3 (identity engine),
+  and the offline-reconcile-on-stop flow. Committed + pushed on `research`.
+- **CPU is only for logic/plumbing tests** — never judge reid quality on CPU
+  (choppy, drops frames). The GPU server is the target.
 
 ---
 
@@ -20,7 +31,8 @@
 
 - N RTSP streams (test with 3; a 4th added later — must be **N-generic**, never hardcode a count).
 - Real-time → annotated `output_<cam>.mp4` per camera. Device-portable (GPU when present, else CPU).
-- **Invariants (non-negotiable):** raw stream **never saved**; **no live reconcile**; false-merge-conservative (mint when unsure); real-time-first (frame-drop = overload protection); the existing **file-batch path must not break** (behavioural-equivalence regression gate).
+- **Invariants (non-negotiable):** raw stream **never saved** (only the *processed* frames are held transiently, then deleted after the final render); false-merge-conservative (mint when unsure); real-time-first (frame-drop = overload protection); the existing **file-batch path must not break** (behavioural-equivalence regression gate).
+- **Amended:** the original "no offline reconcile on the live path" invariant was **lifted** (supervisor decision): correct ids at the end matter more than instant output, so the live path now runs the offline reconcile on Ctrl-C (§4). Still no raw-stream recording, still OSNet-AIN.
 
 ## 2. Execution rules (FIXED — highest authority)
 
@@ -36,10 +48,11 @@
 
 | Mode | What it does | Use |
 |---|---|---|
-| **`--mode live`** | **v5 real-time** pipeline (`src/live/`). Streams → live-annotated `output_<cam>.mp4`. **No recording, no reconcile.** Ctrl-C finalizes + exits. Identity = online active-set (good only after Stage 3). | **The target.** RTSP. |
-| `auto` (default) / `--mode batch` | Original **file-batch** flow (+ a record-then-batch stopgap for URLs). Uses **offline reconcile** (good reids) but **saves raw stream** → **forbidden by v5**. Kept ONLY as the untouched file-batch regression gate. | File inputs / regression only. **Do NOT use for RTSP going forward.** |
+| **`--mode live`** | **v5 real-time** pipeline (`src/live/`). Streams (or files) → real-time processing, **raw feed never recorded**. Online engine gives provisional on-screen ids; **Ctrl-C runs the offline reconcile** and re-renders `output_<cam>.mp4` with correct cross-camera ids. | **The target.** RTSP. |
+| `auto` (default) | **Live** pipeline if any source is a stream URL; **file-batch** if all sources are files. | Everyday use. |
+| `--mode batch` | **File-batch** flow (`main.py`): per-file detect/track/embed → offline reconcile → re-render. Stream URLs are rejected. | File inputs / the behavioural-equivalence regression gate. |
 
-The good reids seen historically came from the **file-batch offline reconcile** — a non-causal pass the live path is not allowed to use. Live must reach quality via the **online engine (Stage 3)**, which *approximates* (never equals) offline.
+Both paths now settle identity with the **same** `reconcile_tracklets` (non-causal, whole-gallery). The record-then-batch RTSP stopgap was removed — the live pipeline handles streams directly and reconciles on stop.
 
 ---
 
@@ -56,15 +69,19 @@ The good reids seen historically came from the **file-batch offline reconcile** 
 
 ---
 
-## 5. What's NEXT (future plans, in order)
+## 5. What's DONE / NEXT
 
-- **Stage 3 — full identity engine (NEXT; fixes the reids).** In-memory active-set (prototypes/medoids) + **cold reactivation** (fixes *same person → different ids*) + **cross-camera reciprocal-best matching** (fixes *no cross-camera persistence*) + anti-starvation priority queue + pluggable **topology veto** (fail-open stub until adjacency/transit data arrives). Ports the proven policies: same-camera time-overlap HARD veto, thresholds, runner-up margin, mint-when-uncertain. In-memory → **no Qdrant required**. Validated locally on synthetic embeddings (re-acquire / cross-camera link / no false-merge), then GPU-validated on the server.
-- **Stage 2 — GPU throughput.** Fair scheduler (fairness + starvation bound) + **batched detector + ReID across cameras, one ByteTrack per camera** (obey the stop-rule). First GPU throughput milestone.
-- **Stage 4 — GPU decode (server task).** NVDEC backend. `cv2` here has **no `cudacodec`** and no decord/PyNvVideoCodec, so GPU-resident decode needs a server decode lib (OpenCV-CUDA build / PyNvVideoCodec / torchaudio-CUDA / decord). Until then: CPU decode → 1 upload → GPU inference → 1 download.
-- **Stage 5 — ops hardening.** Metrics (per-cam fps, latency, queue depths, drops, **batch size/utilisation**, peaks), warm-up ordering, CUDA OOM/context handling, disk/codec degradation.
-- **Stage 6 — acceptance + self-contained server scripts.** `scripts/run_acceptance.py`, `run_gpu_benchmark.py` (4-cam P95 latency, drop %), `run_24h_memory.py`; explicit **multi-N** test.
+**Done and validated on the GPU server:**
+- **Stage 2 — GPU throughput.** Fair scheduler (fairness + starvation bound) + per-camera parallel inference, one ByteTrack per camera (stop-rule obeyed).
+- **Stage 3 — full identity engine.** In-memory active-set (prototypes/medoids) + cold reactivation + cross-camera reciprocal-best + anti-starvation priority queue + pluggable fail-open topology veto. Gives the provisional on-screen ids.
+- **Offline reconcile on the live path.** `IdentityStage` persists fresh observations to Qdrant; `RenderStage` captures processed frames + geometry; on stop `pipeline.py::_finalize_offline()` runs `reconcile_tracklets` → `render_final_videos` → `print_run_summary` (reused unchanged). Logic-tested (`tests/live/test_stage6_offline_reconcile.py`) and confirmed working on the A100.
 
-**Validation cadence:** iterate + logic-test **locally** each stage (deterministic, synthetic — no GPU/video); ship to GPU (git pull) for **milestone** checks: throughput after Stage 2, **id-quality after Stage 3**.
+**Remaining (optional / future):**
+- **Stage 4 — GPU decode.** NVDEC backend. `cv2` here has **no `cudacodec`**; GPU-resident decode needs a server decode lib (OpenCV-CUDA build / PyNvVideoCodec / decord). Until then: CPU decode → 1 upload → GPU inference → 1 download.
+- **Stage 5 — ops hardening.** CUDA OOM/context handling, disk/codec degradation (metrics + warm-up ordering already in).
+- **Stage 6 — acceptance + server scripts.** `run_gpu_benchmark.py` (N-cam P95 latency, drop %), `run_24h_memory.py`; explicit multi-N test.
+
+**Validation cadence:** logic-test **locally** (deterministic, synthetic — no GPU/video); ship to GPU (git pull) for **quality/throughput** checks — never judge reid quality on CPU.
 
 ---
 
@@ -81,13 +98,13 @@ The good reids seen historically came from the **file-batch offline reconcile** 
 
 ## 7. Gotchas (don't re-learn the hard way)
 
-- **`--mode live` ≠ record-then-batch.** Live = real-time, no recording, no reconcile. Record-then-batch is forbidden by the handoff (saves raw stream) — don't reach for it.
+- **Live never records the raw feed.** It reads RTSP live and, for the final re-render, holds only the *processed* frames in a transient `._live_src_<cam>.mp4` (deleted after render). The old record-then-batch RTSP stopgap has been removed.
 - **Never judge quality on CPU** — it drops most frames (drop-stale) and starves identity. GPU only.
-- **Stage-1 live reids are supposed to be rough** — the identity engine is Stage 3.
-- **Two identity systems coexist by design:** batch `reconcile_tracklets` (file path, untouched) vs the fresh live active-set (`src/live/identity_stage.py`).
-- **Do not modify** `process_video` / `reconcile_tracklets` / `render_final_videos` / `IdentityService` (file-batch regression gate).
-- **Topology data still missing** — needed to activate the cross-camera physical-impossibility veto; until then it's fail-open.
+- **Live on-screen ids are provisional; correct ids come from the Ctrl-C reconcile.** Don't expect the real-time overlay to be the final answer.
+- **`reconcile_tracklets` is shared by both paths** but the file-batch entry points are the regression gate: **do not modify** `process_video` / `reconcile_tracklets` / `render_final_videos` / `IdentityService` — the live path *reuses* the latter three unchanged.
+- **Merge thresholds live in `identity.reconcile.*`** (shared), not `live.identity.*` (provisional on-screen only). Recalibrate `identity.reconcile.*` on a checkpoint/domain change.
+- **Topology is fail-open** and currently OFF (measured transit times pruned true matches on these overlapping cameras) — appearance-only until cameras are separated.
 
 ## 8. Pointers
-- Pipeline: `src/live/*.py`. Routing + modes: `main.py` (`run.mode`, `--mode`, `run_capture_phase`, `render_final_videos`). Config: `config.yaml` (`live:` block + `identity`/`reid`). Reused: `src/detector.py`, `src/reid/extractor.py`, `src/reid/service.py`, `src/database/store.py`, `src/drawing.py`, `src/video_source.py`.
+- Pipeline: `src/live/*.py` (orchestrator `pipeline.py`; offline finalize `pipeline.py::_finalize_offline`). Routing + modes: `main.py` (`run.mode`, `--mode`). Offline reconcile reused by both paths: `src/identity/reconcile.py` + `render_final_videos`/`print_run_summary` in `main.py`. Config: `config.yaml` (`live:` block incl. `live.reconcile` + `identity.reconcile`/`reid`). Reused: `src/detector.py`, `src/reid/extractor.py`, `src/reid/service.py`, `src/database/store.py`, `src/drawing.py`, `src/video_source.py`.
 - Full staged plan (local, not in repo): `~/.claude/plans/functional-kindling-church.md`.
