@@ -19,20 +19,10 @@ source:
   # big speedup for dev with little ReID cost. Use 0 for a final full-res run.
   resize_width: 0
 
-  # LIVE STREAMS (rtsp:// / http:// / ... URLs). A run is "live" if ANY --videos
-  # entry (or a videos[].path here) is a URL. A live run is TWO phases (see
-  # main.py run_capture_phase): Phase 1 cheaply RECORDS each raw stream to
-  # recorded_<name>.mp4 (decode + write only, NO detection -- so it keeps up with
-  # several cameras) while showing an optional monitoring window; on 'q'/Ctrl-C
-  # Phase 2 runs the ORDINARY batch pipeline on those recordings, producing the
-  # same reconciled output_<name>.mp4 as a video-file run (full fps, full
-  # quality). These knobs apply to Phase 1 capture and are IGNORED for files.
-  stream:
-    reconnect_attempts: 5      # consecutive failed reads before giving up on a stream
-    reconnect_backoff: 1.0     # seconds; actual wait grows with the failure streak
-    drop_stale: true           # (live monitoring only) keep only the newest frame.
-                               # Phase-1 RECORDING always keeps every frame
-                               # regardless, so the output isn't decimated.
+  # STREAM URLs (rtsp:// / http:// ...) are handled by the real-time pipeline in
+  # src/live/ -- see the `live:` block below for its capture/reconnect settings.
+  # A run uses the live pipeline when run.mode is `live`, or when run.mode is
+  # `auto` and ANY source is a URL. File inputs use the file-batch flow.
 
 detector:
   model: yolo11n.pt          # small YOLO; auto-downloaded on first run
@@ -187,69 +177,30 @@ identity:
                                        # match -- stops look-alike over-merging on
                                        # weak/out-of-domain models. See reconcile.py.
 
-  # ONLINE decision core (Stage 7c): DORMANT under the current record-then-batch
-  # live design (kept OFF). It exists to make LIVE on-screen ids good when the
-  # pipeline decides identity in real time. But we switched RTSP to a two-phase
-  # design -- record the raw stream, then run the ordinary OFFLINE reconcile on
-  # the recording (see source.stream) -- so the saved MP4's ids come from the
-  # same offline reconcile as a file run, and there is no live per-frame decision
-  # to improve. Leave enabled: false. (Re-enable only if a live, boxes-on-screen
-  # preview with good ids is wanted; the implementation in
-  # src/identity/service.py `_assign_online` mirrors reconcile: aggregate +
-  # evidence gate + two-lane match + split-only late-correction.)
-  online:
-    enabled: false
-    min_evidence_obs: 3            # commit a track only after this many good views
-                                   # (live analogue of reconcile.min_tracklet_observations)
-    same_camera_threshold: 0.90    # same-camera lane: re-acquire a dropped track
-    cross_camera_threshold: 0.63   # cross-camera lane: link the same person across cams
-    online_min_margin: 0.03        # cross-camera winner must beat runner-up by this
-                                   # (blank -> identity.min_score_gap)
-    late_correction_window: 30     # frames after resolving during which a track may
-                                   # still SPLIT to a new id if its aggregate contradicts
-                                   # -- the offline-approximation dial (longer = closer
-                                   # to offline, more settling latency)
-    split_contradiction_margin: 0.05  # how far below the admitting threshold the grown
-                                      # aggregate must fall to trigger a split
-    online_state_ttl: 300          # forget a track's online state after N unseen frames
-                                   # (mirror reid.ttl)
-    transition:
-      enabled: false               # camera-transition veto: OFF (no topology). When you
-                                   # can supply adjacency + transit times, enabling this
-                                   # makes physically-impossible cross-camera jumps a hard
-                                   # veto -- the biggest cross-camera false-merge cut.
-
 display:
-  show_window: false         # true = OpenCV windows; false = headless. For a LIVE
-                             # run this also controls the Phase-1 raw monitoring
-                             # window (shown only if the display can open one).
-                             # File runs / Phase-2 processing honor it as-is.
+  show_window: false         # true = OpenCV windows; false = headless. Only the
+                             # file-batch flow uses this; the live pipeline is
+                             # headless (its deliverable is output_<cam>.mp4).
   save_annotated: true       # write output_<name>.mp4 with boxes + ids
   window_scale: 1.0
   output_fps: 20.0           # fps for the saved/annotated output videos. Not read
                              # from the source (a file run uses this regardless of
                              # the source's real fps).
 
-# Live-stream output handling (see source.stream for the two-phase design).
-output:
-  keep_recording: false      # false = delete recorded_<name>.mp4 once the final
-                             # output_<name>.mp4 is produced. true = keep the raw
-                             # capture (e.g. to re-process or audit it).
-  fps_default: 20            # fps stamped on the Phase-1 recording (RTSP CAP_PROP_FPS
-                             # is unreliable). Frame COUNT is preserved either way,
-                             # so the output is never decimated.
-
 # =============================================================================
-# v5 REAL-TIME LIVE PIPELINE (src/live/) -- staged build; see the architecture
-# plan. This is a SEPARATE path from the file-batch flow above; when inactive
-# (run.mode: batch, or file inputs) nothing here runs and batch behaviour is
-# unchanged. Stage 0 wires capability detection + routing only; later stages
-# add capture/scheduler/inference/identity/render/writer. Config is grouped to
-# match the handoff; unknown-to-a-stage keys are simply ignored until built.
+# REAL-TIME LIVE PIPELINE (src/live/). Handles STREAM sources (and files under
+# --mode live): per-camera capture -> scheduler -> inference -> identity ->
+# render -> writer, all threaded and load-shedding for real time. On stop it
+# runs the offline reconcile (live.reconcile) to settle correct cross-camera ids
+# and re-render output_<cam>.mp4. SEPARATE from the file-batch flow above; when
+# the file-batch path runs (batch mode, or auto with file inputs) nothing here
+# executes.
 # =============================================================================
 live:
   run:
-    mode: auto              # auto (live if any source is a URL) | live | batch
+    mode: auto              # live (always the live pipeline) | auto (live if any
+                            # source is a stream URL, else file-batch) | batch
+                            # (file-batch; stream URLs are rejected)
     device: auto            # auto (GPU if available else CPU) | cuda:0 | cpu
     max_duration_sec: 0     # 0 = until stopped (q / Ctrl-C)
   capture:
@@ -305,6 +256,26 @@ live:
                             # single exemplar (medoid-style) -- ported from
                             # identity.bank_size / service.py::_bank_score
     split_contradiction_margin: 0.05
+  # OFFLINE reconciliation for the LIVE path -- the "correct-answer-at-the-end"
+  # flow. The live RTSP feed is NEVER recorded. During the run each camera's
+  # PROCESSED (clean) frames + box geometry are captured to a transient temp clip
+  # (._live_src_<cam>.mp4) and every FRESH ReID observation (embedding + bbox +
+  # confidence + timestamp) is persisted to the store. On stop (Ctrl-C / sources
+  # ended / max_duration) the SAME proven offline reconcile the file path uses
+  # rebuilds cross-camera identities and re-renders output_<cam>.mp4 with the
+  # CORRECT reids -- same person = same id/colour in every camera. The merge
+  # thresholds are taken from identity.reconcile.* (0.63 / 0.90 / reciprocal-best)
+  # so a live run and a file run reconcile IDENTICALLY. Set enabled: false to
+  # restore the old immediate-on-Ctrl-C live-annotated output (paced WriterStage).
+  reconcile:
+    enabled: true
+    sample_stride: 1        # store every Nth FRESH embedding per track. Fresh
+                            # embeddings already arrive only every reid.interval
+                            # frames (they are NOT per-frame), so this is a second,
+                            # optional subsample on top of that. 1 = keep every
+                            # fresh observation (matches the file-batch path).
+    keep_frames: false      # delete the transient per-camera processed-frame clips
+                            # after the final render. true = keep them for audit.
   output:
     write_video: true
     video_path: output_<cam>.mp4
@@ -334,7 +305,14 @@ live:
     # chokepoint (e.g. cam_206 <-> cam_224 = 3 + 2 = 5s). cam_224 & cam_219 are
     # co-visible (same room, overlapping views) -> 0: no time constraint (the
     # co-active veto handles co-presence). Undirected. Format: [a, b, min_sec].
-    enabled: true
+    #
+    # DISABLED after A100 testing: with these cameras the view-to-view handoff is
+    # FASTER than the walking distance suggests (adjacent/overlapping fields of
+    # view), so a 2-3s minimum pruned the TRUE cross-camera match (linked collapsed
+    # 5 -> 1, topology_pruned=508). Min-transit vetoes only work when cameras are
+    # far apart with a real gap between views; here they are not. Back to
+    # appearance-only. (Set enabled: true only if you separate the cameras.)
+    enabled: false
     edges:
       - [cam_224, cam_219, 0]   # same room, co-visible (overlapping views)
       - [cam_224, cam_213, 2]   # room -> chokepoint (measured)

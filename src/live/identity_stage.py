@@ -22,6 +22,7 @@ ids are NEGATIVE and never leave this process (drawing.py renders them as
 
 import threading
 import time
+from collections import defaultdict
 
 from live.identity_engine import IdentityEngine
 from live.priority import CameraFairQueue
@@ -34,13 +35,27 @@ class IdentityStage(threading.Thread):
                  cross_camera_threshold=0.63, accept_margin=0.03,
                  bank_size=20, active_ttl_sec=300.0, max_active_identities=200,
                  topology=None, max_per_lane=64, sweep_interval_sec=2.0,
-                 metrics=None):
+                 metrics=None, store=None, run_id=None, sample_stride=1):
         super().__init__(name="identity", daemon=True)
         self.in_q = identity_queue
         self.render_queues = render_queues          # {cam: DropOldestQueue}
         self.stop_event = stop_event
         self.metrics = metrics
         self.sweep_interval = float(sweep_interval_sec)
+
+        # ---- offline-reconcile persistence (live.reconcile flow) ----
+        # This single-threaded stage is the sole writer, so no store lock is
+        # needed. We persist only FRESH embeddings (already throttled to every
+        # reid.interval frames by TrackEmbedder -- i.e. NOT per-frame), optionally
+        # subsampled again by sample_stride, with the metadata the offline
+        # reconcile + audit need. Identity is left UNASSIGNED in the payload: the
+        # offline reconcile rebuilds it from scratch (it does not trust live ids).
+        self._store = store
+        self._run_id = run_id
+        self._sample_stride = max(1, int(sample_stride))
+        self._sample_count = defaultdict(int)
+        self.stored = 0
+        self._store_failed = False
 
         self.engine = IdentityEngine(
             min_evidence_obs=min_evidence_obs,
@@ -88,8 +103,10 @@ class IdentityStage(threading.Thread):
                 last_sweep = now
 
     def _resolve_frame(self, frame):
-        """Stamp reid_id / global_id on every detection in the frame."""
+        """Stamp reid_id / global_id on every detection in the frame, and (in the
+        offline-reconcile flow) persist fresh observations to the store."""
         fresh = frame.meta.get("fresh_track_ids", set())
+        store_vecs, store_payloads = [], []
         for det in (frame.detections or []):
             if det.track_id is None:
                 det.reid_id = None
@@ -100,6 +117,53 @@ class IdentityStage(threading.Thread):
                                       det.crop_quality, frame.ts, has_fresh_emb)
             det.reid_id = reid
             det.global_id = reid if (reid is not None and reid > 0) else None
+
+            # Persist a SAMPLED fresh observation for the offline reconcile.
+            if self._store is not None and not self._store_failed and has_fresh_emb:
+                key = (frame.cam, det.track_id)
+                self._sample_count[key] += 1
+                if self._sample_count[key] % self._sample_stride == 0:
+                    store_vecs.append(det.embedding)
+                    store_payloads.append(self._observation_payload(frame, det))
+
+        if store_vecs:
+            try:
+                self._store.add_many(store_vecs, store_payloads)
+                self.stored += len(store_vecs)
+            except Exception as e:
+                # Degrade, never crash (v5 §14): losing persistence only weakens
+                # the final reconcile; the live pipeline keeps running.
+                self._store_failed = True
+                print(f"[identity] store persistence DISABLED after error: {e}")
+
+    def _observation_payload(self, frame, det):
+        """Metadata stored alongside the embedding. `camera`/`track_id`/`frame`/
+        `run_id` are what reconcile.py groups + spans + filters by; bbox /
+        confidence / ts / crop_quality are extra audit metadata, kept when
+        available. No reid_id/global_id -- the offline reconcile assigns identity
+        from scratch (it does not trust live decisions)."""
+        payload = {
+            "camera": frame.cam,
+            "track_id": int(det.track_id),
+            "frame": int(frame.frame_index),
+            "run_id": self._run_id,
+            "ts": float(frame.ts),
+        }
+        # Extra metadata, only when the detection actually carries it.
+        bbox = [getattr(det, a, None) for a in ("x1", "y1", "x2", "y2")]
+        if all(v is not None for v in bbox):
+            payload["bbox"] = [float(v) for v in bbox]
+        conf = getattr(det, "confidence", None)
+        if conf is not None:
+            payload["confidence"] = float(conf)
+        # crop_quality is the metrics dict from reid/service.py (accepted/blur/
+        # brightness/...); store it as-is (JSON-serializable) for audit.
+        cq = getattr(det, "crop_quality", None)
+        if isinstance(cq, dict):
+            payload["crop_quality"] = cq
+        elif cq is not None:
+            payload["crop_quality"] = float(cq)
+        return payload
 
     # ---- metrics surface (used by later stages / shutdown report) ----------
     @property
@@ -115,6 +179,7 @@ class IdentityStage(threading.Thread):
             "active_identities": len(e.store.gids()),
             "fair_dropped": self.fair.dropped,
             "frames_done": self.frames_done,
+            "stored": self.stored,                      # observations persisted for reconcile
             # cross-camera diagnostics
             "xcam_attempts": e.xcam_attempts,
             "xcam_rej_threshold": e.xcam_rej_threshold,
