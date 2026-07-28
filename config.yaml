@@ -305,6 +305,26 @@ live:
                             # single exemplar (medoid-style) -- ported from
                             # identity.bank_size / service.py::_bank_score
     split_contradiction_margin: 0.05
+  # OFFLINE reconciliation for the LIVE path -- the "correct-answer-at-the-end"
+  # flow. The live RTSP feed is NEVER recorded. During the run each camera's
+  # PROCESSED (clean) frames + box geometry are captured to a transient temp clip
+  # (._live_src_<cam>.mp4) and every FRESH ReID observation (embedding + bbox +
+  # confidence + timestamp) is persisted to the store. On stop (Ctrl-C / sources
+  # ended / max_duration) the SAME proven offline reconcile the file path uses
+  # rebuilds cross-camera identities and re-renders output_<cam>.mp4 with the
+  # CORRECT reids -- same person = same id/colour in every camera. The merge
+  # thresholds are taken from identity.reconcile.* (0.63 / 0.90 / reciprocal-best)
+  # so a live run and a file run reconcile IDENTICALLY. Set enabled: false to
+  # restore the old immediate-on-Ctrl-C live-annotated output (paced WriterStage).
+  reconcile:
+    enabled: true
+    sample_stride: 1        # store every Nth FRESH embedding per track. Fresh
+                            # embeddings already arrive only every reid.interval
+                            # frames (they are NOT per-frame), so this is a second,
+                            # optional subsample on top of that. 1 = keep every
+                            # fresh observation (matches the file-batch path).
+    keep_frames: false      # delete the transient per-camera processed-frame clips
+                            # after the final render. true = keep them for audit.
   output:
     write_video: true
     video_path: output_<cam>.mp4

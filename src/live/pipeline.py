@@ -23,6 +23,7 @@ import os
 import sys
 import threading
 import time
+from datetime import datetime
 
 import numpy as np
 
@@ -59,6 +60,16 @@ class LivePipeline:
                                           #  inference, identity, max_batch}
         self._peaks = {"inference_q": 0, "identity_q": 0, "writer_q": 0}
         self._t_start = None
+        # ---- offline-reconcile flow (live.reconcile) ----
+        self.run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._recon_cfg = (self.cfg.get("identity", {}) or {}).get("reconcile", {}) or {}
+        live_recon = self.live_cfg.get("reconcile", {}) or {}
+        self.reconcile_enabled = bool(live_recon.get("enabled", False))
+        self._sample_stride = int(live_recon.get("sample_stride", 1) or 1)
+        self._keep_frames = bool(live_recon.get("keep_frames", False))
+        self.store = None                 # built in run() when reconcile is on
+        self._clip_paths = {}             # {cam: transient processed-frame clip}
+        self.identity_stage = None        # ref for the final store-count report
 
     # ---- config helpers ----------------------------------------------------
     def _g(self, group, key, default):
@@ -90,12 +101,54 @@ class LivePipeline:
               f"{len(topo.known())} camera(s) [{cams}]; any other camera is fail-open.")
         return topo
 
+    def _build_store(self):
+        """Build the Qdrant gallery for the offline reconcile, from the top-level
+        `store` config (same backend the file path uses: env QDRANT_URL/API_KEY >
+        store.url > store.path). Returns None (and disables reconcile) if the
+        store is off or unreachable -- degrade, never crash."""
+        store_cfg = self.cfg.get("store", {}) or {}
+        if not store_cfg.get("enabled", False):
+            print("[live] store.enabled is false -> cannot persist observations; "
+                  "offline reconcile disabled.")
+            return None
+        try:
+            from database.store import PersonVectorStore
+            url = os.environ.get("QDRANT_URL") or store_cfg.get("url") or None
+            api_key = os.environ.get("QDRANT_API_KEY") or None
+            path = store_cfg.get("path", "qdrant_data")
+            store = PersonVectorStore(path=path, url=url, api_key=api_key)
+            backend = url if url else f"LOCAL '{path}'"
+            print(f"[live] gallery store ready at {backend} "
+                  f"(existing points: {store.count()}).")
+            return store
+        except Exception as e:
+            print(f"[live] could NOT open the gallery store ({e}); offline "
+                  f"reconcile disabled -> falling back to live-annotated output.")
+            return None
+
     def run(self):
         cap = capability_report(self._g("run", "device", "auto"),
                                 self._g("capture", "nvdec", "auto"))
         device = cap["device"]
         print(f"[live] Starting LivePipeline on {len(self.sources)} source(s): "
               f"{', '.join(n for n, _ in self.sources)} | device={device}")
+
+        # ---- offline-reconcile flow: build the gallery store (v5 correct-answer-
+        # at-the-end). The live RTSP feed is NEVER recorded; we persist per-track
+        # embeddings during the run and re-render from the captured processed
+        # frames after Ctrl-C. Needs the store; if it can't be built we fall back
+        # to the classic immediate live-annotated output (paced writer).
+        if self.reconcile_enabled:
+            self.store = self._build_store()
+            if self.store is None:
+                self.reconcile_enabled = False
+        if self.reconcile_enabled:
+            print(f"[live] offline reconcile ENABLED (run_id={self.run_id}): live "
+                  f"reids are provisional; the CORRECT cross-camera ids are settled "
+                  f"on Ctrl-C and re-rendered into output_<cam>.mp4.")
+        else:
+            print("[live] offline reconcile OFF: writing live-annotated output "
+                  "immediately (reids are the online engine's, not reconciled).")
 
         # ---- shared model (one extractor; per-camera detectors/embedders) ----
         reid_cfg = self.cfg.get("reid", {}) or {}
@@ -163,22 +216,34 @@ class LivePipeline:
             self.captures.append(capt)
 
             render_q = DropOldestQueue(max_writer_q)
-            writer_q = DropOldestQueue(max_writer_q)
             render_queues[name] = render_q
-            writer_queues[name] = writer_q
-            renderer = RenderStage(name, render_q, writer_q, self.stop_event)
-            self.renderers.append(renderer)
-            writer = WriterStage(
-                name, writer_q, self.stop_event,
-                out_path=f"output_{name}.mp4", fps=fps,
-                codec=out_cfg.get("codec", "h264"),
-                offline_after_sec=float(out_cfg.get("offline_overlay_after_sec", 3)),
-                reconnect_ref=(lambda c=capt: c.reconnects),
-            )
-            self.writers.append(writer)
-            # register in start order: consumers first (writer, render), captures last
-            self.threads.append((f"writer-{name}", writer))
-            self.threads.append((f"render-{name}", renderer))
+            if self.reconcile_enabled:
+                # Capture mode: the render stage writes CLEAN processed frames to a
+                # transient clip + records box geometry; the final labelled video is
+                # produced after the offline reconcile. No paced writer in this flow.
+                clip_path = f"._live_src_{name}.mp4"
+                self._clip_paths[name] = clip_path
+                renderer = RenderStage(name, render_q, None, self.stop_event,
+                                       capture_mode=True, clip_path=clip_path,
+                                       clip_fps=fps)
+                self.renderers.append(renderer)
+                self.threads.append((f"render-{name}", renderer))
+            else:
+                writer_q = DropOldestQueue(max_writer_q)
+                writer_queues[name] = writer_q
+                renderer = RenderStage(name, render_q, writer_q, self.stop_event)
+                self.renderers.append(renderer)
+                writer = WriterStage(
+                    name, writer_q, self.stop_event,
+                    out_path=f"output_{name}.mp4", fps=fps,
+                    codec=out_cfg.get("codec", "h264"),
+                    offline_after_sec=float(out_cfg.get("offline_overlay_after_sec", 3)),
+                    reconnect_ref=(lambda c=capt: c.reconnects),
+                )
+                self.writers.append(writer)
+                # register in start order: consumers first (writer, render), captures last
+                self.threads.append((f"writer-{name}", writer))
+                self.threads.append((f"render-{name}", renderer))
 
         scheduler = BatchScheduler(
             slots, inference_queue, self.stop_event,
@@ -203,7 +268,12 @@ class LivePipeline:
             # Cross-camera physical-impossibility veto, built from the
             # live.topology config block (fail-open if absent/disabled/empty).
             topology=self._build_topology(),
+            # Offline-reconcile persistence (None store => no persistence).
+            store=self.store if self.reconcile_enabled else None,
+            run_id=self.run_id,
+            sample_stride=self._sample_stride,
         )
+        self.identity_stage = identity
         # shared consumers start before captures
         self.threads.append(("identity", identity))
         self.threads.append(("inference", inference))
@@ -283,7 +353,89 @@ class LivePipeline:
             w.join(timeout=10)     # writer flushes queue + releases the MP4
         if self._t_start is not None:
             self._report(time.monotonic() - self._t_start, final=True)
+        # Offline reconcile runs AFTER every stage has joined: identity has flushed
+        # all observations to the store, and each render stage has finalized its
+        # temp clip -- so the whole-gallery view and the re-render source are both
+        # complete and quiescent.
+        if self.reconcile_enabled:
+            self._finalize_offline()
         print("[live] shutdown complete.")
+
+    def _finalize_offline(self):
+        """The correct-answer-at-the-end step: rebuild cross-camera identities from
+        the persisted observations with the PROVEN offline reconcile, then
+        re-render output_<cam>.mp4 from the captured processed frames so the same
+        person carries one id/colour everywhere. Reuses the file path's
+        reconcile_tracklets / render_final_videos / build_gid_map / print_run_summary
+        unchanged (regression gate intact)."""
+        print("\n[live] Please wait a moment while we render the final outputs "
+              "(offline reconciliation)...")
+        stored = self.identity_stage.stored if self.identity_stage else 0
+        print(f"[live] persisted {stored} observation(s) for run {self.run_id}.")
+        if stored == 0:
+            print("[live] no observations were persisted -> nothing to reconcile; "
+                  "skipping final render.")
+            self._cleanup_clips()
+            return
+        try:
+            from identity.reconcile import reconcile_tracklets
+            # reuse the file path's render + summary helpers (unchanged).
+            from main import render_final_videos, print_run_summary
+        except Exception as e:
+            print(f"[live] could not load the offline reconcile helpers ({e}); "
+                  f"leaving the captured clips in place.")
+            return
+
+        # Merge thresholds come from identity.reconcile.* so live == file reconcile.
+        threshold = self._recon_cfg.get("threshold")
+        if threshold is None:
+            threshold = (self.cfg.get("identity", {}) or {}).get("threshold", 0.63)
+        try:
+            print("[live] reconciling identities across cameras...")
+            reconcile_tracklets(
+                self.store,
+                threshold=threshold,
+                run_id=self.run_id,
+                same_camera_threshold=self._recon_cfg.get("same_camera_threshold", 0.90),
+                require_reciprocal_best=self._recon_cfg.get("require_reciprocal_best", True),
+                min_tracklet_observations=self._recon_cfg.get("min_tracklet_observations", 3),
+            )
+        except Exception as e:
+            print(f"[live] reconcile failed ({e}); rendering with unreconciled ids.")
+
+        # Re-render each camera from its captured processed-frame clip. A minimal
+        # cfg keeps render_final_videos from re-resizing (box geometry was captured
+        # at the clip's resolution) and sets the output fps.
+        fps = float((self.live_cfg.get("output", {}) or {}).get("fps_default", 20))
+        render_cfg = {"source": {"resize_width": 0}, "display": {"output_fps": fps}}
+        jobs = [(name, self._clip_paths[name]) for name, _ in self.sources
+                if name in self._clip_paths]
+        shared = {"annotations": {r.cam: r.annotations for r in self.renderers}}
+        try:
+            print("[live] rendering final annotated videos with reconciled ids...")
+            render_final_videos(jobs, render_cfg, shared, self.store, self.run_id)
+            print_run_summary(self.store,
+                              [(name, path) for name, path in jobs],
+                              {"display": {"save_annotated": True}},
+                              run_id=self.run_id)
+        except Exception as e:
+            print(f"[live] final render/summary error: {e}")
+        finally:
+            self._cleanup_clips()
+
+    def _cleanup_clips(self):
+        """Delete the transient processed-frame clips (unless keep_frames)."""
+        if self._keep_frames:
+            for p in self._clip_paths.values():
+                if os.path.exists(p):
+                    print(f"[live] keeping processed-frame clip: {p}")
+            return
+        for p in self._clip_paths.values():
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except OSError as e:
+                print(f"[live] could not remove {p}: {e}")
 
     # ---- metrics -----------------------------------------------------------
     def _track_peaks(self):
@@ -333,7 +485,7 @@ class LivePipeline:
               f"| inference_done={m['inference'].frames_done}")
         print(f"    identity: minted={st['minted']} reacquired={st['reacquired']} "
               f"linked={st['linked']} active={st['active_identities']} "
-              f"resolved_frames={st['frames_done']}")
+              f"resolved_frames={st['frames_done']} stored={st.get('stored', 0)}")
         print(f"    x-camera: attempts={st['xcam_attempts']} linked={st['linked']} "
               f"rejected[thresh={st['xcam_rej_threshold']} margin={st['xcam_rej_margin']} "
               f"recip={st['xcam_rej_reciprocal']} topology={st['xcam_rej_topology']}] "
