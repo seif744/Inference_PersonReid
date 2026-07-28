@@ -757,7 +757,12 @@ class IdentityService:
         if frames:
             self._last_seen[int(best_gid)] = (camera, run_id, max(frames))
 
-        self._track_to_global[key] = best_gid
+        # NOTE: _track_to_global is keyed by the 2-tuple (camera, track_id) --
+        # the same key assign() reads (and _maybe_split_track writes). Writing the
+        # 3-tuple `key` here would land on an entry nothing reads, leaving the
+        # track cached under its OLD id so later observations keep committing there
+        # (one track split across two identities). Use the 2-tuple.
+        self._track_to_global[(camera, track_id)] = best_gid
         self._drop_identity_if_unreferenced(current_gid)
         return best_gid
 

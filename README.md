@@ -436,9 +436,10 @@ A run produces:
 | Gallery | Qdrant (`store.url` / `store.path`) | every observation + assigned reid id (plus compatibility `global_id`) — this pipeline's own data |
 | Verification decision log | `logs/verification_decisions.jsonl` | one line per accept/reject decision, with its full feature vector — for calibrating or eventually training the verifier |
 
-That's it — no crop images by default. (Per-person crop images can be turned
-back on with `crops.save: true` in `config.yaml`, e.g. to collect ReID training
-data or visually sanity-check identity assignment.)
+That's it — no crop images are written. On-disk crop saving is disabled in the
+code (`crop_saver.py` writes nothing); the embedder makes its own in-memory
+crops, so the ReID path never needs files on disk. `crops.save: true` only builds
+an in-memory (discarded) crop helper — it does not produce files.
 
 The console prints a **RUN SUMMARY** at the end, e.g.:
 ```
@@ -480,7 +481,7 @@ ARCHITECTURE.md             deep-dive: data flow, components, design
 src/
   video_source.py           frame decoding (files + streams)
   detector.py                YOLO11 + ByteTrack, Detection, crop_person
-  crop_saver.py               per-track crop persistence (only when crops.save: true)
+  crop_saver.py               per-track crop helper (in-memory; disk saving disabled)
   drawing.py                  boxes / HUD overlay
   reid/
     extractor.py              crop -> 512-d L2-normalized embedding (OSNet)
