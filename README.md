@@ -18,6 +18,38 @@ videos where one person carries one reid id/colour in every camera.
 > **How it works internally:** see **[ARCHITECTURE.md](ARCHITECTURE.md)** for the
 > full data flow, every component, the concurrency model, and design rationale.
 
+---
+
+## Quickstart
+
+Start to finish (Linux; GPU auto-detected). Details for each step are in the
+numbered sections below.
+
+```bash
+# 1. clone
+git clone https://github.com/seif744/PersonReID.git && cd PersonReID
+
+# 2. OpenCV system libs (Linux/WSL/Docker only; skip on macOS/Windows) -- see §2
+sudo apt-get update && sudo apt-get install -y \
+  libgl1 libglib2.0-0 libsm6 libice6 libxext6 libxrender1
+
+# 3. Python 3.10 env + deps (torch pin is CUDA-enabled; falls back to CPU) -- §2
+python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
+
+# 4. start the Qdrant gallery (Docker) -- §4
+docker compose up -d
+
+# 5. run it -- §6
+#    (a) video files (CPU is fine):
+python main.py --videos /path/cam_a.mp4 /path/cam_b.mp4
+#    (b) OR live RTSP (GPU; Ctrl-C to reconcile + write the final videos):
+python main.py --mode live --videos "rtsp://USER:PASS@HOST:554/ch01/0" "rtsp://..."
+```
+
+Output: `output_<cam>.mp4` per camera (same person = same reid id/colour
+everywhere) + a console run summary. The ReID weight is already in the repo;
+`yolo11n.pt` auto-downloads on first run. Sanity-check your install first with
+the tests in [§2 "Verify the install"](#2-install-the-python-environment).
 
 ---
 
@@ -50,7 +82,7 @@ flowchart TD
 
     QD --> RECON
 
-    subgraph FINAL["🏁 OFFLINE — runs ONCE, after every camera finishes"]
+    subgraph FINAL["OFFLINE — runs ONCE, after every camera finishes"]
         direction TB
         RECON["Reconcile tracklets\nlink the same person\nacross cameras"]
         RECON --> RENDER["Re-render videos\nusing the FINAL\nreid ids"]
@@ -80,6 +112,7 @@ compatibility, but `reid_id` is the label the pipeline presents. Full per-stage 
 ---
 
 ## Table of contents
+- [Quickstart](#quickstart)
 1. [Prerequisites](#1-prerequisites)
 2. [Install the Python environment](#2-install-the-python-environment)
 3. [Model weights](#3-model-weights)
@@ -90,6 +123,8 @@ compatibility, but `reid_id` is the label the pipeline presents. Full per-stage 
 8. [Troubleshooting](#8-troubleshooting)
 9. [Project layout](#9-project-layout)
 10. [Known limitations & roadmap](#10-known-limitations--roadmap)
+11. [Models & credits](#11-models--credits)
+12. [License](#12-license)
 
 ---
 
@@ -104,9 +139,11 @@ compatibility, but `reid_id` is the label the pipeline presents. Full per-stage 
   docker compose version
   ```
 - **One or more video files** (e.g. `.avi`, `.mp4`) **or RTSP/HTTP stream URLs**.
-- **CPU** is fine for file inputs and development. **Live RTSP in real time
-  targets a GPU** (the live pipeline auto-detects the device); CPU drops too many
-  frames to judge live quality on.
+- **CPU** is fine for file inputs, development, and the (synthetic) logic tests.
+  **Live RTSP in real time needs a GPU** — the live pipeline was developed and
+  validated on an **NVIDIA A100** server (it auto-detects the device). CPU drops
+  too many frames to keep up with live streams or to judge live reid quality;
+  never benchmark the live path on CPU.
 
 ---
 
@@ -124,9 +161,40 @@ python -m pip install -r requirements.txt
 `requirements.txt` pins the exact verified versions (ultralytics, torch,
 torchvision, torchreid, qdrant-client, numpy, opencv-python, PyYAML).
 
-> **CPU vs GPU torch:** `requirements.txt` pins CPU-compatible `torch`/
-> `torchvision`. For a specific CUDA build, install torch from the official
-> PyTorch wheel index for your platform *before* `-r requirements.txt`.
+> **CPU vs GPU torch:** the pinned `torch==2.12.1` default Linux wheel is
+> **CUDA-enabled** — it uses an NVIDIA GPU when present (live pipeline
+> `device: auto`) and falls back to CPU otherwise, so the *same* install works on
+> the CPU dev box **and** the A100 server (the server just needs a compatible
+> NVIDIA driver — check with `nvidia-smi`). For a specific CUDA version, install
+> `torch`/`torchvision` from the matching
+> [PyTorch wheel index](https://pytorch.org/get-started/locally/) *before*
+> `pip install -r requirements.txt`.
+
+### System libraries (Linux / WSL / Docker)
+
+`opencv-python` links a few shared libraries that headless Linux images (and many
+Docker bases / WSL) don't ship. If `import cv2` fails with
+`ImportError: libGL.so.1: cannot open shared object file` (or a `libgthread` /
+Qt `xcb` error), install them once:
+
+```bash
+sudo apt-get update && sudo apt-get install -y \
+  libgl1 libglib2.0-0 libsm6 libice6 libxext6 libxrender1
+```
+
+Not needed on macOS or Windows. (These are also required for the live OpenCV
+windows if you ever set `display.show_window: true`; the default is headless.)
+
+### Verify the install
+
+Run the deterministic logic tests — synthetic embeddings, **no GPU/model/video
+needed** — to confirm the identity engine + offline-reconcile wiring:
+
+```bash
+for t in tests/live/test_*.py; do PYTHONPATH=src:tests/live python "$t"; done
+```
+
+Each script prints `OK` on success.
 
 ---
 
@@ -388,7 +456,9 @@ Cross-camera people: 1
 
 | Symptom | Cause / fix |
 |---|---|
+| `ImportError: libGL.so.1` (or `libgthread` / Qt `xcb`) on `import cv2` | Missing OpenCV system libs on Linux/WSL/Docker. Install them (see §2 "System libraries"). |
 | `Connection refused` | Qdrant isn't running. `docker compose up -d`, then `curl http://localhost:6333/readyz`. |
+| Live run uses CPU / is very slow on a GPU box | torch can't see the GPU. Check `nvidia-smi` and `python -c "import torch; print(torch.cuda.is_available())"`; fix the NVIDIA driver or install a matching CUDA torch (§2). |
 | `Unexpected checkpoint keys dropped` | Wrong/corrupt ReID weights. Re-fetch `osnet_ain_x1_0.pth` to `src/reid/weights/`. |
 | Hangs on first run for a while | `yolo11n.pt` is downloading; subsequent runs are fast. |
 | Very slow on CPU | Set `source.resize_width: 1280` and/or `source.max_frames` for tests. |
@@ -453,3 +523,60 @@ implemented; the following are deferred and documented but not built:
 - A MetaBIN training pass to reduce the underlying domain gap.
 - Training a real classifier from `logs/verification_decisions.jsonl` once
   enough runs accumulate, to replace the current hand-set verifier weights.
+
+---
+
+## 11. Models & credits
+
+This pipeline is assembled from pretrained models and open-source libraries — no
+model is trained or fine-tuned here. Each component and its role:
+
+| Model / component | Role in the pipeline | Source / library | Reference |
+|---|---|---|---|
+| **YOLO11n** (`yolo11n.pt`) | Person **detection** every frame (COCO class 0), the entry point for both paths. | [Ultralytics](https://github.com/ultralytics/ultralytics) (COCO-pretrained) | Ultralytics YOLO11 |
+| **ByteTrack** (`bytetrack.yaml`) | Multi-object **tracking** — stable per-camera `track_id`s frame-to-frame; the tracklet is the unit of identity evidence. | Ships with Ultralytics | Zhang et al., *ByteTrack: Multi-Object Tracking by Associating Every Detection Box*, ECCV 2022 |
+| **YOLO11n-pose** (`yolo11n-pose.pt`) | Optional **pose ensemble** that splits a tracker box merging two overlapping people into one. File-batch only; off in live (`inference.pose_ensemble: false`) for throughput. | [Ultralytics](https://github.com/ultralytics/ultralytics) | Ultralytics YOLO11-pose |
+| **OSNet-AIN x1_0** (`osnet_ain_x1_0.pth`) | **Appearance embedding** — one crop → 512-d L2-normalized vector; the cosine similarity that drives re-ranking, verification, and reconciliation. AIN (Adaptive Instance Normalization) adds cross-domain generalization. Multi-source checkpoint (DukeMTMC-reID + Market1501 + CUHK03, eval MSMT17). | [torchreid / deep-person-reid](https://github.com/KaiyangZhou/deep-person-reid) | Zhou et al., *Omni-Scale Feature Learning for Person Re-ID*, ICCV 2019; *Learning Generalisable Omni-Scale Representations…*, IEEE TPAMI 2021 |
+| **Qdrant** | **Vector store** (not a model) — this pipeline's own gallery: stores every observation embedding + payload and serves nearest-neighbour search. | [Qdrant](https://github.com/qdrant/qdrant) | — |
+
+**Libraries:** [torchreid](https://github.com/KaiyangZhou/deep-person-reid)
+(Zhou & Xiang, *Torchreid: A Library for Deep Learning Person Re-ID in Pytorch*,
+2019) provides the OSNet backbone, preprocessing, and feature utilities; PyTorch;
+OpenCV; NumPy; PyYAML.
+
+**Dependency licenses:** Ultralytics YOLO11 is **AGPL-3.0**, torchreid is
+**MIT**, Qdrant is **Apache-2.0**. Because this project builds on AGPL-3.0 code
+(Ultralytics), the project as a whole is distributed under **AGPL-3.0** (see
+§12). Swapping to a non-AGPL detector would be a code change (not just
+`detector.model`), since `src/detector.py` is built on the `ultralytics` API.
+
+---
+
+## 12. License
+
+This project is licensed under the **GNU Affero General Public License v3.0
+(AGPL-3.0)** — full text in [LICENSE](LICENSE). AGPL applies because the pipeline
+combines with **Ultralytics YOLO11 (AGPL-3.0)**; a combined/derivative work must
+carry the same license.
+
+```
+Copyright (C) 2026 Seifer Mathias
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any
+later version. This program is distributed WITHOUT ANY WARRANTY; see the GNU
+AGPL v3.0 for details.
+```
+
+What this means in practice:
+- **Open source + public source = compliant**, and **no Ultralytics Enterprise
+  license is needed** for this use.
+- Anyone who redistributes this (modified or not), **or offers it to users over a
+  network** (AGPL §13, the "Remote Network Interaction" clause), must make the
+  corresponding **source available under AGPL-3.0**.
+- A **closed-source / proprietary** use would instead require an Ultralytics
+  Enterprise license (or removing the AGPL dependency).
+
+> Dependencies keep their own licenses (§11); AGPL-3.0 covers this project's own
+> code.

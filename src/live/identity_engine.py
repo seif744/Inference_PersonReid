@@ -1,7 +1,7 @@
 """
 identity_engine.py  --  Stage 3: the full in-memory identity engine.
 
-This is the FRESH live active-set engine (handoff §5) that turns per-frame
+This is the FRESH live active-set engine that turns per-frame
 appearance embeddings into stable reids WITHOUT Qdrant and WITHOUT the offline
 reconcile the file path uses. It ports the PROVEN decision policies from the
 tuned file system (`identity/service.py::_assign_online` / `_two_lane_match` /
@@ -18,7 +18,7 @@ logic-tested on synthetic embeddings with no GPU/video/threads:
     two-lane match (same-camera cold-reactivation lane, then cross-camera
     reciprocal-best lane with a pluggable topology veto) -> mint-when-uncertain.
 
-Ported invariants (false-merge-conservative, handoff §1):
+Ported invariants (false-merge-conservative):
   * A new track shows a PROVISIONAL (negative) id and commits to nothing until it
     has `min_evidence_obs` good views -- match-or-mint runs on the AGGREGATE.
   * Same-camera time-overlap is a HARD veto (one body can't be two tracks at once).
@@ -64,7 +64,7 @@ def _bin6(s):
 
 
 class ActiveIdentitySet:
-    """In-memory gallery of live identities (handoff §5: prototypes/medoids).
+    """In-memory gallery of live identities (prototypes/medoids).
 
     Per gid we keep a bounded bank of recent UNIT exemplar embeddings. Scoring a
     query blends the prototype (bank mean) with the strongest single exemplar
@@ -173,7 +173,7 @@ class ActiveIdentitySet:
                 return True
         return False
 
-    # ---- eviction (bound memory; handoff limits block) --------------------
+    # ---- eviction (bound memory) --------------------
     def sweep(self, now, ttl_sec, max_active):
         """Evict identities unseen for `ttl_sec` seconds, then LRU-cap the set at
         `max_active`. Returns the number evicted. TTL is generous by design: an

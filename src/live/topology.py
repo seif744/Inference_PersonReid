@@ -6,7 +6,7 @@ reject *physically impossible* jumps: a person last seen in one camera cannot be
 the person now in another if not enough time has elapsed to physically get there.
 This is historically the single biggest cross-camera false-merge cut.
 
-FAIL-OPEN is the fixed invariant (handoff Execution rule 5 + Stage-3 spec): the
+FAIL-OPEN is the fixed invariant: the
 veto only ever *rejects* a pair it has data for. An unknown camera, or no
 topology at all -> the pair is ALLOWED (appearance-only), never blocked. So
 plugging in a partial map can only ADD safe vetoes; it can never starve a camera
@@ -63,7 +63,7 @@ class GraphTopology(TopologyVeto):
     yet. A LONGER gap is always allowed (loitering / an indirect route / a
     missed intermediate camera), so this NEVER causes a false SPLIT of a genuine
     slow re-appearance -- it only removes impossible-fast merges. This is the
-    conservative direction (handoff §1: false-merge-conservative, and never trade
+    conservative direction (false-merge-conservative, and never trade
     correctness for a veto).
 
     Fail-open on any camera the map doesn't know (invariant §2.5): an unknown

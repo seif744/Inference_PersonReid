@@ -13,8 +13,9 @@
 > - **Implemented today** (see **§3.5** for the authoritative description):
 >   appearance similarity + a per-identity feature bank, a match threshold with a
 >   runner-up margin, a same-camera time-overlap guard, and a sticky per-track
->   decision — in the live `service.py`. **Cross-camera linking is done by an
->   offline reconciliation pass** (`reconcile.py`) after all cameras finish.
+>   decision — in `service.py` (file-batch) and `src/live/identity_engine.py`
+>   (streaming). **Cross-camera linking is done by an offline reconciliation
+>   pass** (`reconcile.py`) that BOTH paths run after all cameras finish / on stop.
 > - **NOT implemented (future work):** the temporal / camera-topology / motion
 >   **constraints** described in §3.2. They remain the planned route to higher
 >   accuracy but are **not in the code**. Until then, matching is appearance-only
@@ -53,11 +54,13 @@ memoryless** by design, and that is exactly why it must not decide identity:
    that context — no gallery, no camera map, no clock. Any identity it "assigned"
    would be a guess from a single image.
 
-2. **Appearance alone is ambiguous — we measured it.** In Phase 4 the
-   same-person and different-person cosine distributions **overlap** (same-min
-   0.51 < diff-max 0.85). No fixed threshold on the embedding separates people
-   cleanly. Identity must be resolved with *more* signal than appearance; the
-   model only produces the appearance signal.
+2. **Appearance alone is ambiguous — we measured it.** With an out-of-domain
+   checkpoint the same-person and different-person cosine distributions
+   **overlapped outright**, so no fixed threshold on the embedding separated
+   people cleanly; even with today's OSNet-AIN, where the gap is cleaner, a
+   borderline pair can still confuse a lone threshold (see `ARCHITECTURE.md` §6
+   for the current measured distributions). Identity must be resolved with *more*
+   signal than appearance; the model only produces the appearance signal.
 
 3. **Separation of concerns / testability.** The model is a pure function: same
    input → same output, trivially unit-testable and swappable — proven in
@@ -204,6 +207,15 @@ camera's view of one track) with the whole gallery visible:
 
 A same-camera time-overlap guard forbids fusing two co-present tracks throughout.
 **This offline pass is what actually produces cross-camera identities today.**
+
+**Live streaming path — `src/live/identity_engine.py`.** The real-time pipeline
+(`--mode live`) has its own in-memory identity engine that obeys the **same
+boundaries** (§1/§2/§4): the extractor still only measures, the engine still owns
+every decision. It assigns provisional on-screen ids in real time (evidence gate,
+same-camera cold reactivation, cross-camera reciprocal-best, same-camera-overlap
+hard veto, mint-when-uncertain) and, on stop, runs the **same `reconcile.py`**
+over the run's persisted observations to settle the final cross-camera ids — so
+both paths share one reconciliation. See `ARCHITECTURE.md` §8.
 
 ---
 
