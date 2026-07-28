@@ -205,6 +205,7 @@ Two model files are needed:
 | File | How to get it | In a fresh clone? |
 |---|---|---|
 | `yolo11n.pt` (detector) | **Auto-downloaded** by ultralytics on first run | No (gitignored; fetched automatically) |
+| `yolo11n-pose.pt` (pose ensemble) | **Auto-downloaded** by ultralytics — but only on a **file-batch** run (the live path disables the pose ensemble, so live runs never fetch it) | No (gitignored; fetched automatically) |
 | `src/reid/weights/osnet_ain_x1_0.pth` (ReID, default) | Committed to the repo | Yes — already present |
 
 The default ReID checkpoint is **OSNet-AIN x1_0** (set by `reid.weights` in
