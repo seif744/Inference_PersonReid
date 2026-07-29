@@ -8,17 +8,24 @@ re-appearances** within a camera. The pipeline is fully self-contained: it
 builds and owns its own Qdrant gallery — there is no separate registration step
 or external service. Output: annotated videos (boxes + reid-id labels, with
 `global_id` kept for compatibility) and a console run-summary. (On-disk
-per-person crop saving is disabled in the code — see the CropSaver note in §3.)
+per-person crop saving is disabled in the code — see the CropSaver note in
+[section 3, "Components"](#3-components).)
 
 There are two entry paths, and **both settle cross-camera identity with the same
 offline reconcile** (`identity/reconcile.py`):
 
-- **File-batch** (`main.py`, §2) — a worker thread per video file; live sticky
+- **File-batch** (`main.py`, [section 2](#2-data-flow)) — a worker thread per video file; live sticky
   assignment during the pass, then offline reconcile + re-render.
-- **Live streaming** (`src/live/`, §8) — a real-time, load-shedding, per-camera
+- **Live streaming** (`src/live/`, [section 8](#8-live-streaming-pipeline--srclive)) — a real-time, load-shedding, per-camera
   threaded pipeline for RTSP. It never records the raw feed; it persists
   observations + the processed frames during the run and, on stop, runs the
   same offline reconcile to produce the corrected `output_<cam>.mp4`.
+
+> **How cross-references are written here.** "**section N**" means the numbered
+> section of **this** file (1–8 below); a reference to another document names it
+> first, e.g. "[README.md → section 6](README.md#6-run-the-pipeline)". All of
+> them are clickable links. (Bare `§N` references, which never said which
+> document they meant, have been replaced.)
 
 ---
 
@@ -143,7 +150,8 @@ The one component allowed to decide WHO someone is.
   2. **Re-ranking** (`identity.rerank.enabled`, Upgrade 1): if enabled,
      `CameraAwareReranker` re-scores candidates using real k-reciprocal
      neighbour sets + Jaccard overlap over identity prototypes, with a wider
-     neighbourhood window for cross-camera pairs (see §5).
+     neighbourhood window for cross-camera pairs (see [section 5,
+     ADR-002](#5-adr-002-why-re-ranking--verification-not-just-a-better-threshold)).
   3. **Verification** (`identity.verification.enabled`, Upgrade 2): if enabled,
      `Verifier` scores each candidate's `P(same identity)` from cosine, the
      re-ranked score, observation count, recency, and crop quality — replacing
@@ -192,7 +200,8 @@ change to the calling code**.
   since last same-camera sighting, and a crop-quality scalar.
 - Weights are calibrated so cosine ≈ 0.63 sits near the decision boundary --
   measured on this project's footage with the `osnet_x1_0_msmt17` checkpoint.
-  After swapping to `osnet_ain_x1_0` (see §6), the decision log
+  After swapping to `osnet_ain_x1_0` (see [section 6, "Known
+  limitations"](#6-known-limitations-model-not-plumbing)), the decision log
   (`logs/verification_decisions.jsonl`) showed accepted matches averaging
   cosine ~0.79 (min 0.53), rejected candidates averaging ~0.45 (p90 0.59) --
   a wider, cleaner gap. Raising `accept_threshold`/`min_prob_gap` (0.55→0.62,
@@ -273,7 +282,7 @@ correct** — raising it fixed false merges but created false splits, and vice
 versa. Switching to an OSNet/MSMT17 checkpoint substantially widened that gap
 on this footage, and a later swap to OSNet-AIN (`osnet_ain_x1_0`, same family,
 added Adaptive Instance Normalization for domain generalization) widened it
-further still (see §6) — but the underlying risk (some future camera/domain
+further still (see [section 6](#6-known-limitations-model-not-plumbing)) — but the underlying risk (some future camera/domain
 reintroducing overlap) is exactly what re-ranking and verification exist to
 guard against, not something a single "right" checkpoint permanently solves.
 
@@ -295,12 +304,19 @@ Design principles this drives:
   paths.
 
 **Deferred** (documented, not implemented): prototype confidence/variance with
-adaptive per-identity thresholds; a camera transition graph rejecting
-physically-impossible transitions; a MetaBIN training pass to reduce the
-underlying domain gap. These need either real camera topology or accumulated
-deployment data this project doesn't have yet — see
-`identity/verifier.py`'s decision log as the mechanism that starts collecting
-the latter.
+adaptive per-identity thresholds; a MetaBIN training pass to reduce the
+underlying domain gap. These need accumulated deployment data this project
+doesn't have yet — see `identity/verifier.py`'s decision log as the mechanism
+that starts collecting it.
+
+**Built, then disabled**: the camera transition graph rejecting
+physically-impossible transitions exists in the live path (`live/topology.py`,
+`live.topology.enabled: false` — see [section 8.2](#82-key-live-configuration-configyaml--live)).
+Measured transit times were entered and A100-tested; it pruned the *true*
+cross-camera match (cross-camera links 5 → 1, `topology_pruned=508`) because
+these cameras' views are adjacent or overlapping, so the minimum transit time
+is effectively zero. Transit-time vetoes need cameras with a real gap between
+fields of view.
 
 ---
 
@@ -331,9 +347,11 @@ The pipeline is correct; the **embedding model is the ceiling** on this domain.
   verifier's `accept_threshold`/`min_prob_gap` (to 0.62/0.08) to exploit it
   was tried and reverted -- it measurably hurt end-to-end accuracy (97% ->
   89%) via more false splits, so all four stay at their MSMT17-era values
-  (0.63 / 0.55 / 0.05) for now (§3, §7). The occlusion crop-quality gate
+  (0.63 / 0.55 / 0.05) for now (sections [3](#3-components) and
+  [7](#7-key-configuration-configyaml)). The occlusion crop-quality gate
   (`max_occlusion_ratio`) was also tried tighter (0.35) to fight a rare
-  occlusion-triggered false merge and reverted for the same reason -- see §7.
+  occlusion-triggered false merge and reverted for the same reason -- see
+  [section 7](#7-key-configuration-configyaml).
 - **This is footage-and-checkpoint-specific, not solved in general.** A
   different deployment (different cameras, lighting, clothing diversity)
   could easily reintroduce distribution overlap even with OSNet-AIN. Re-run
@@ -353,7 +371,8 @@ The pipeline is correct; the **embedding model is the ceiling** on this domain.
      currently disabled — you'd re-enable on-disk crops first) with a
      metric-learning loss (triplet / ArcFace) — directly targets a specific
      deployment's domain gap.
-  3. Synthetic pretraining (RandPerson) and/or MetaBIN (see §5) — the
+  3. Synthetic pretraining (RandPerson) and/or MetaBIN (see [section
+     5](#5-adr-002-why-re-ranking--verification-not-just-a-better-threshold)) — the
      "textbook" fix, but there is currently no training pipeline in this repo
      to build on (an earlier `tools/`/`notebooks/` scaffold for this was
      removed) — this would mean building one from scratch, with real GPU
@@ -368,7 +387,7 @@ The pipeline is correct; the **embedding model is the ceiling** on this domain.
 | `detector.confidence_threshold` | 0.4 | drop weak detections |
 | `tracker.config` | bytetrack.yaml | tracker |
 | `crops.interval` | 10 | crop-helper throttle (frames/crop; disk saving disabled) |
-| `reid.weights` | osnet_ain_x1_0.pth | ReID checkpoint — recalibrate everything below if this changes (§6) |
+| `reid.weights` | osnet_ain_x1_0.pth | ReID checkpoint — recalibrate everything below if this changes ([section 6](#6-known-limitations-model-not-plumbing)) |
 | `reid.interval` / `ttl` | 10 / 300 | re-embed cadence / cache eviction |
 | `reid.quality.max_occlusion_ratio` | 0.5 | reject multi-body crops |
 | `store.enabled` | true | the pipeline's own gallery — always on for the default flow |
@@ -467,4 +486,5 @@ falls back to writing the immediate (online-id) `output_<cam>.mp4`.
 > The cross-camera **merge** thresholds come from `identity.reconcile.*` (shared
 > with the file path), not from `live.identity.*` (which only tunes the
 > provisional on-screen ids). Recalibrate `identity.reconcile.*` when the ReID
-> checkpoint or camera domain changes (§6).
+> checkpoint or camera domain changes ([section
+> 6](#6-known-limitations-model-not-plumbing)).

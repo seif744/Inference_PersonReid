@@ -18,6 +18,15 @@ videos where one person carries one reid id/colour in every camera.
 > **How it works internally:** see **[ARCHITECTURE.md](ARCHITECTURE.md)** for the
 > full data flow, every component, the concurrency model, and design rationale.
 
+> **How cross-references are written in these docs.** "**section N**" on its own
+> always means the numbered section **of the file you are reading** (this README
+> has sections 1–12, listed in the [table of contents](#table-of-contents)). A
+> reference to a *different* document always names that document first — e.g.
+> "[ARCHITECTURE.md → section 6](ARCHITECTURE.md#6-known-limitations-model-not-plumbing)".
+> Every reference is a clickable link that jumps straight to the heading. (Older
+> revisions used a bare `§N`, which did not say *which* document it meant; there
+> are none left.)
+
 ---
 
 ## Quickstart
@@ -27,19 +36,21 @@ numbered sections below.
 
 ```bash
 # 1. clone
-git clone https://github.com/seif744/PersonReID.git && cd PersonReID
+git clone https://github.com/seif744/Inference_PersonReid.git && cd Inference_PersonReid
 
-# 2. OpenCV system libs (Linux/WSL/Docker only; skip on macOS/Windows) -- see §2
+# 2. OpenCV system libs (Linux/WSL/Docker only; skip on macOS/Windows)
+#    -> details in section 2 of this README
 sudo apt-get update && sudo apt-get install -y \
   libgl1 libglib2.0-0 libsm6 libice6 libxext6 libxrender1
 
-# 3. Python 3.10 env + deps (torch pin is CUDA-enabled; falls back to CPU) -- §2
+# 3. Python 3.10 env + deps (torch pin is CUDA-enabled; falls back to CPU)
+#    -> details in section 2
 python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
 
-# 4. start the Qdrant gallery (Docker) -- §4
+# 4. start the Qdrant gallery (Docker)          -> details in section 4
 docker compose up -d
 
-# 5. run it -- §6
+# 5. run it                                     -> details in section 6
 #    (a) video files (CPU is fine):
 python main.py --videos /path/cam_a.mp4 /path/cam_b.mp4
 #    (b) OR live RTSP (GPU; Ctrl-C to reconcile + write the final videos):
@@ -49,7 +60,7 @@ python main.py --mode live --videos "rtsp://USER:PASS@HOST:554/ch01/0" "rtsp://.
 Output: `output_<cam>.mp4` per camera (same person = same reid id/colour
 everywhere) + a console run summary. The ReID weight is already in the repo;
 `yolo11n.pt` auto-downloads on first run. Sanity-check your install first with
-the tests in [§2 "Verify the install"](#2-install-the-python-environment).
+the tests in [section 2, "Verify the install"](#verify-the-install).
 
 ---
 
@@ -107,7 +118,7 @@ no other service is involved. Only after **every** camera finishes does the
 re-renders the annotated videos with those final IDs, so one person carries
 the same `REID n` in every camera's output. `global_id` is still written for
 compatibility, but `reid_id` is the label the pipeline presents. Full per-stage detail:
-**[ARCHITECTURE.md §2](ARCHITECTURE.md)**.
+**[ARCHITECTURE.md → section 2, "Data flow"](ARCHITECTURE.md#2-data-flow)**.
 
 ---
 
@@ -158,17 +169,49 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-`requirements.txt` pins the exact verified versions (ultralytics, torch,
-torchvision, torchreid, qdrant-client, numpy, opencv-python, PyYAML).
+`requirements.txt` pins the exact verified versions: ultralytics, torch,
+torchvision, torchreid, qdrant-client, numpy, opencv-python, PyYAML, plus four
+packages that look optional but are **not**:
 
-> **CPU vs GPU torch:** the pinned `torch==2.12.1` default Linux wheel is
-> **CUDA-enabled** — it uses an NVIDIA GPU when present (live pipeline
-> `device: auto`) and falls back to CPU otherwise, so the *same* install works on
-> the CPU dev box **and** the A100 server (the server just needs a compatible
-> NVIDIA driver — check with `nvidia-smi`). For a specific CUDA version, install
-> `torch`/`torchvision` from the matching
-> [PyTorch wheel index](https://pytorch.org/get-started/locally/) *before*
-> `pip install -r requirements.txt`.
+| Pin | Why it must be there |
+|---|---|
+| `scipy` | torchreid's PyPI wheel declares **no runtime dependencies at all**, and `import torchreid` walks its whole dataset package — one of which does `from scipy.io import loadmat`. |
+| `gdown` | Same reason: another torchreid dataset module does a module-level `import gdown`. |
+| `tensorboard` | Same reason: torchreid's engine imports `torch.utils.tensorboard`, which imports the `tensorboard` package at module level. |
+| `lap` | ByteTrack's data association imports `lap`. Ultralytics ships it only in its optional `[solutions]` extra, so without the pin ultralytics tries to **pip-install it mid-run** — which fails on an offline/locked-down box (e.g. the GPU server). |
+
+Miss any of the first three and the ReID extractor dies with
+`ModuleNotFoundError` before it can embed a single crop. Everything those four
+need in turn (`tqdm`, `beautifulsoup4`, `filelock`, …) is declared by them and
+installs automatically.
+
+> **This list is verified, not inferred.** It was checked by building a venv
+> containing *only* `requirements.txt` and running both paths end to end
+> (file-batch and `--mode live`) on real footage: detection, pose-ensemble
+> splitting, tracking, OSNet embedding, the Qdrant gallery, reconcile, and the
+> final re-render. `scipy` was found *only* by that run — static import analysis
+> had missed it.
+
+**CPU vs GPU torch**, in three parts:
+
+> **1. One install covers both.** The pinned `torch==2.12.1` default Linux wheel
+> is **CUDA-enabled**: it uses an NVIDIA GPU when one is present (live pipeline
+> `device: auto`) and falls back to CPU otherwise. Nothing needs changing between
+> machines — the *same* `pip install -r requirements.txt` is correct on the CPU
+> dev box and on the GPU server.
+
+> **2. On the A100 server.** Same install, no extra step — the server only needs
+> a compatible NVIDIA driver for the bundled CUDA runtime to work. Check it with
+> `nvidia-smi`, and confirm torch can see the GPU with
+> `python -c "import torch; print(torch.cuda.is_available())"`. If that prints
+> `False`, the driver is the problem, not the wheel.
+
+> **3. Pinning a specific CUDA version.** Only needed when your driver or cluster
+> requires a particular CUDA build. Install `torch`/`torchvision` from the
+> matching [PyTorch wheel index](https://pytorch.org/get-started/locally/)
+> *before* running `pip install -r requirements.txt`, so the explicit build is
+> already satisfied and the requirements file doesn't pull the default wheel over
+> it.
 
 ### System libraries (Linux / WSL / Docker)
 
@@ -184,6 +227,8 @@ sudo apt-get update && sudo apt-get install -y \
 
 Not needed on macOS or Windows. (These are also required for the live OpenCV
 windows if you ever set `display.show_window: true`; the default is headless.)
+Optional: `python3-tk` — only used to size those windows to your screen; without
+it the pipeline assumes 1080p and carries on.
 
 ### Verify the install
 
@@ -200,11 +245,13 @@ Each script prints `OK` on success.
 
 ## 3. Model weights
 
-Two model files are needed:
+Three model files are used (only the ReID checkpoint is committed; both YOLO
+weights download themselves):
 
 | File | How to get it | In a fresh clone? |
 |---|---|---|
 | `yolo11n.pt` (detector) | **Auto-downloaded** by ultralytics on first run | No (gitignored; fetched automatically) |
+| `yolo11n-pose.pt` (pose ensemble) | **Auto-downloaded** by ultralytics — but only on a **file-batch** run (the live path disables the pose ensemble, so live runs never fetch it) | No (gitignored; fetched automatically) |
 | `src/reid/weights/osnet_ain_x1_0.pth` (ReID, default) | Committed to the repo | Yes — already present |
 
 The default ReID checkpoint is **OSNet-AIN x1_0** (set by `reid.weights` in
@@ -214,8 +261,10 @@ replaced a plain `osnet_x1_0` (MSMT17) checkpoint whose embeddings weren't
 discriminative enough on this project's out-of-domain CCTV footage
 (same-person cross-camera cosine ~0.72 vs. different-person ~0.55 — too
 close). On this project's footage, the AIN swap measurably widens that gap
-(see [ARCHITECTURE.md §6](ARCHITECTURE.md)). If you ever need to re-fetch it:
-it's the multi-source domain-generalization checkpoint (trained on
+(see [ARCHITECTURE.md → section 6, "Known
+limitations"](ARCHITECTURE.md#6-known-limitations-model-not-plumbing)).
+If you ever need to re-fetch it: it's the multi-source
+domain-generalization checkpoint (trained on
 DukeMTMC-reID + Market1501 + CUHK03, evaluated on MSMT17) from the official
 `deep-person-reid` MODEL_ZOO (`osnet_ain_x1_0`) — download via `gdown` from the
 Google Drive link on that page and place it at `src/reid/weights/`.
@@ -297,18 +346,20 @@ multiple concurrent runs.
 > **You must provide your own video files.** Sample footage is **not** shipped in
 > the repo (videos are gitignored). Either drop your files in and point
 > `source.videos` in `config.yaml` at them, or pass them on the command line with
-> `--videos` / `--videos-dir` (see section 6). The default `config.yaml` lists two
-> example filenames purely as a template — edit them to your paths.
+> `--videos` / `--videos-dir` (see section 6). The paths in the shipped
+> `config.yaml` (`placeholder_video/rtsp__219.avi`, `…224.avi`) are **placeholders
+> that do not exist** — a default `python main.py` will fail on them until you
+> edit them or override with `--videos`.
 
 Edit [config.yaml](config.yaml). The key sections:
 
 ```yaml
 source:
   videos:                        # one entry per camera
-    - name: cam_219
-      path: your_camera_1.avi
+    - name: cam_219              # shipped paths are PLACEHOLDERS -- replace them
+      path: placeholder_video/rtsp__219.avi
     - name: cam_224
-      path: your_camera_2.avi
+      path: placeholder_video/rtsp__224.avi
   max_frames: 0                  # 0 = whole video; N = stop early (quick test)
   resize_width: 0                # 0 = native; e.g. 1280 = faster on CPU
 
@@ -323,7 +374,9 @@ tracker:
 reid:
   enabled: true
   weights: src/reid/weights/osnet_ain_x1_0.pth
-  device: cpu                    # "cuda" if you have a GPU (file-batch path)
+  device: cpu                    # ReID model only, file-batch path. YOLO
+                                 # detection auto-picks the GPU regardless --
+                                 # see the note under this snippet.
   interval: 10                   # re-embed a track at most every N frames
 
 identity:
@@ -363,7 +416,25 @@ live:                            # real-time streaming pipeline (--mode live)
     sample_stride: 1             # store every Nth fresh embedding per track
 ```
 
-See [ARCHITECTURE.md §7](ARCHITECTURE.md) for what every knob does.
+See [ARCHITECTURE.md → section 7, "Key
+configuration"](ARCHITECTURE.md#7-key-configuration-configyaml) for what every
+knob does.
+
+> **`reid.device: cpu` does not pin the whole pipeline to the CPU.** It sets the
+> device for **one** thing: the OSNet ReID extractor on the file-batch path.
+> Specifically:
+>
+> | Component | Device it uses |
+> |---|---|
+> | YOLO detection + pose (both paths) | **whatever Ultralytics picks — CUDA automatically if a GPU is visible.** `src/detector.py` never passes a `device=`, so this ignores `reid.device` entirely. |
+> | ReID / OSNet, file-batch path | `reid.device` (`cpu` by default) |
+> | ReID / OSNet, live path (`--mode live`) | `live.run.device` (`auto` → GPU if present). `reid.device` is **not** consulted here. |
+>
+> So on a GPU box with the shipped config, a file run detects on the GPU and
+> embeds on the CPU. To force everything onto the CPU, set `reid.device: cpu`
+> **and** `live.run.device: cpu`, and hide the GPU from the process
+> (`CUDA_VISIBLE_DEVICES=""`) — that last part is what actually stops Ultralytics
+> from grabbing it.
 
 ---
 
@@ -424,6 +495,38 @@ python main.py --reset --videos-dir /path/to/footage
 Headless (`display.show_window: false`) runs to completion and prints a summary.
 With windows enabled, press `q` in a window to stop early.
 
+### Stopping a run — and why not to spam Ctrl-C
+
+**Press Ctrl-C once.** The most important work happens *after* you stop:
+
+```
+Ctrl-C  ->  stop the cameras  ->  offline reconcile  ->  re-render output_<cam>.mp4
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                                  where the correct cross-camera ids are decided
+```
+
+That finalize step takes a while and is what produces the deliverable. A second
+Ctrl-C used to land in the middle of it, so the run ended with provisional
+per-camera ids and half-written videos. Both paths now guard it:
+
+- Every run prints a `[stop]` line at startup telling you this.
+- During finalization extra Ctrl-C presses are **ignored** — you get
+  `[guard] Ctrl-C ignored -- still finalizing outputs…` on stderr, and the run
+  finishes normally with exit code 0.
+- **If you truly must abort: press Ctrl-\ (SIGQUIT)**, which the guard never
+  blocks. Don't rely on repeated Ctrl-C for this — standard signals don't queue,
+  so several presses in quick succession collapse into a single delivery.
+  Aborting means the videos keep provisional per-camera ids.
+
+Ctrl-C is still the stop mechanism (with `q` in a window as the alternative when
+`display.show_window: true`); it is now just non-destructive to lean on. The
+guard lives in [`src/interrupt_guard.py`](src/interrupt_guard.py) and works by
+blocking SIGINT for the finalize phase and consuming it in a `sigwait` watcher
+thread — a plain Python signal handler is not enough here, because OpenCV/torch
+worker threads block SIGINT and a signal that lands on one of them stays pending
+and killed the process at teardown (measured: exit `-2` *after* a completed
+run).
+
 ---
 
 ## 7. Understand the output
@@ -457,9 +560,12 @@ Cross-camera people: 1
 
 | Symptom | Cause / fix |
 |---|---|
-| `ImportError: libGL.so.1` (or `libgthread` / Qt `xcb`) on `import cv2` | Missing OpenCV system libs on Linux/WSL/Docker. Install them (see §2 "System libraries"). |
+| `ImportError: libGL.so.1` (or `libgthread` / Qt `xcb`) on `import cv2` | Missing OpenCV system libs on Linux/WSL/Docker. Install them (see [section 2, "System libraries"](#system-libraries-linux--wsl--docker)). |
 | `Connection refused` | Qdrant isn't running. `docker compose up -d`, then `curl http://localhost:6333/readyz`. |
-| Live run uses CPU / is very slow on a GPU box | torch can't see the GPU. Check `nvidia-smi` and `python -c "import torch; print(torch.cuda.is_available())"`; fix the NVIDIA driver or install a matching CUDA torch (§2). |
+| Live run uses CPU / is very slow on a GPU box | torch can't see the GPU. Check `nvidia-smi` and `python -c "import torch; print(torch.cuda.is_available())"`; fix the NVIDIA driver or install a matching CUDA torch ([section 2](#2-install-the-python-environment)). |
+| `ModuleNotFoundError: No module named 'gdown'` (or `'tensorboard'`) on `import torchreid` | You installed from an older `requirements.txt`. torchreid declares no runtime dependencies, so these must be pinned explicitly — re-run `pip install -r requirements.txt` (see [section 2](#2-install-the-python-environment)). |
+| Run stalls trying to `pip install lap>=0.5.12` when tracking starts (or fails there with no network) | `lap` missing — ultralytics only ships it in an optional extra. Re-run `pip install -r requirements.txt`; the pin is now explicit. |
+| Run stopped with Ctrl-C but `output_<cam>.mp4` has per-camera (unreconciled) ids | Ctrl-C was pressed **repeatedly**, force-quitting the finalize step (3 presses). Press it **once** and wait — see [section 6, "Stopping a run"](#stopping-a-run--and-why-not-to-spam-ctrl-c). |
 | `Unexpected checkpoint keys dropped` | Wrong/corrupt ReID weights. Re-fetch `osnet_ain_x1_0.pth` to `src/reid/weights/`. |
 | Hangs on first run for a while | `yolo11n.pt` is downloading; subsequent runs are fast. |
 | Very slow on CPU | Set `source.resize_width: 1280` and/or `source.max_frames` for tests. |
@@ -505,25 +611,36 @@ src/
 tests/live/                  deterministic logic tests (synthetic; no GPU/models needed)
 ```
 
+Also at the root: `deploy.sh` — rsyncs the code (no venv/videos/store) to a GPU
+box over SSH; set `DEPLOY_TARGET` once in a gitignored `.deploy.env`.
+
 Generated at runtime (gitignored): `output_*.mp4`, `logs/`, `qdrant_storage/`,
-`qdrant_data/`, `yolo11n.pt`.
+`qdrant_data/`, `yolo11n.pt`, `yolo11n-pose.pt`.
 
 ---
 
 ## 10. Known limitations & roadmap
 
 The pipeline is correct; the embedding model is the ceiling on this domain —
-see **[ARCHITECTURE.md §6](ARCHITECTURE.md)** for the measured same-vs-different
-score overlap and why no threshold (or hand-tuned heuristic on top of it) can
-perfectly resolve it.
+see **[ARCHITECTURE.md → section 6, "Known
+limitations"](ARCHITECTURE.md#6-known-limitations-model-not-plumbing)** for the
+measured same-vs-different score overlap and why no threshold (or hand-tuned
+heuristic on top of it) can perfectly resolve it.
 
 ADR-002's P0 items (camera-aware re-ranking, a scored verification layer) are
-implemented; the following are deferred and documented but not built:
+implemented. The following are deferred — documented but not built:
 - Prototype confidence/variance with adaptive per-identity thresholds.
-- A camera transition graph rejecting physically-impossible transitions.
 - A MetaBIN training pass to reduce the underlying domain gap.
 - Training a real classifier from `logs/verification_decisions.jsonl` once
   enough runs accumulate, to replace the current hand-set verifier weights.
+
+Built but **off by default**: the camera transition graph
+([`src/live/topology.py`](src/live/topology.py), `live.topology.enabled: false`)
+vetoes cross-camera matches that would need faster-than-possible transit between
+cameras. It was A100-tested and disabled: with these four cameras the views are
+adjacent/overlapping, so the minimum transit time is ~0 and the veto pruned true
+matches instead of false ones. Turn it on only for cameras with a real physical
+gap between their fields of view.
 
 ---
 
@@ -548,7 +665,8 @@ OpenCV; NumPy; PyYAML.
 **Dependency licenses:** Ultralytics YOLO11 is **AGPL-3.0**, torchreid is
 **MIT**, Qdrant is **Apache-2.0**. Because this project builds on AGPL-3.0 code
 (Ultralytics), the project as a whole is distributed under **AGPL-3.0** (see
-§12). Swapping to a non-AGPL detector would be a code change (not just
+[section 12, "License"](#12-license)). Swapping to a non-AGPL detector would be
+a code change (not just
 `detector.model`), since `src/detector.py` is built on the `ultralytics` API.
 
 ---
@@ -574,10 +692,11 @@ What this means in practice:
 - **Open source + public source = compliant**, and **no Ultralytics Enterprise
   license is needed** for this use.
 - Anyone who redistributes this (modified or not), **or offers it to users over a
-  network** (AGPL §13, the "Remote Network Interaction" clause), must make the
+  network** (AGPL-3.0 clause 13, "Remote Network Interaction"), must make the
   corresponding **source available under AGPL-3.0**.
 - A **closed-source / proprietary** use would instead require an Ultralytics
   Enterprise license (or removing the AGPL dependency).
 
-> Dependencies keep their own licenses (§11); AGPL-3.0 covers this project's own
+> Dependencies keep their own licenses ([section 11](#11-models--credits));
+> AGPL-3.0 covers this project's own
 > code.

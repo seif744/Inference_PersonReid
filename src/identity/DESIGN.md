@@ -7,20 +7,27 @@
 > from leaking into the ReID model or the vector database.
 
 > **⚠️ Implementation status (2026-07).** This is the original *design intent*.
-> The code implements the responsibility **boundaries** (§1, §2, §4) exactly, but
-> the decision logic is deliberately simpler than §3.2 describes:
+> The code implements the responsibility **boundaries** (sections 1, 2 and 4 of
+> this document) exactly, but the decision logic is deliberately simpler than
+> section 3.2 describes:
 >
-> - **Implemented today** (see **§3.5** for the authoritative description):
+> - **Implemented today** (see **section 3.5** for the authoritative description):
 >   appearance similarity + a per-identity feature bank, a match threshold with a
 >   runner-up margin, a same-camera time-overlap guard, and a sticky per-track
 >   decision — in `service.py` (file-batch) and `src/live/identity_engine.py`
 >   (streaming). **Cross-camera linking is done by an offline reconciliation
 >   pass** (`reconcile.py`) that BOTH paths run after all cameras finish / on stop.
-> - **NOT implemented (future work):** the temporal / camera-topology / motion
->   **constraints** described in §3.2. They remain the planned route to higher
->   accuracy but are **not in the code**. Until then, matching is appearance-only
->   and its accuracy is bounded by the embedding model (see `README.md` §10 and
->   `ARCHITECTURE.md`). Read §3.2 as a roadmap, not a description of the code.
+> - **NOT implemented (future work):** the temporal / motion **constraints**
+>   described in section 3.2. They remain the planned route to higher accuracy
+>   but are **not in the code**. The one exception is the camera-topology
+>   constraint: it *was* built for the live path (`src/live/topology.py`) and is
+>   **disabled by default** after A100 testing showed it pruning true matches on
+>   these adjacent cameras. So matching is appearance-only in practice, and its
+>   accuracy is bounded by the embedding model (see
+>   [`README.md` section 10, "Known limitations &
+>   roadmap"](../../README.md#10-known-limitations--roadmap) and
+>   [`ARCHITECTURE.md` section 6](../../ARCHITECTURE.md#6-known-limitations-model-not-plumbing)).
+>   Read section 3.2 as a roadmap, not a description of the code.
 
 ---
 
@@ -58,7 +65,9 @@ memoryless** by design, and that is exactly why it must not decide identity:
    checkpoint the same-person and different-person cosine distributions
    **overlapped outright**, so no fixed threshold on the embedding separated
    people cleanly; even with today's OSNet-AIN, where the gap is cleaner, a
-   borderline pair can still confuse a lone threshold (see `ARCHITECTURE.md` §6
+   borderline pair can still confuse a lone threshold (see [`ARCHITECTURE.md`
+   section 6, "Known
+   limitations"](../../ARCHITECTURE.md#6-known-limitations-model-not-plumbing)
    for the current measured distributions). Identity must be resolved with *more*
    signal than appearance; the model only produces the appearance signal.
 
@@ -125,7 +134,7 @@ only** — no decision yet.
 ### 3.2 Constraint filtering & scoring — ⚠️ PLANNED, NOT IMPLEMENTED
 > This section is the intended future design. **None of these constraints are in
 > the current code** — an earlier stub was removed for being unused. What the code
-> does instead is in §3.5. Treat this as the roadmap for raising accuracy once the
+> does instead is in section 3.5. Treat this as the roadmap for raising accuracy once the
 > embedding model is good enough to build on.
 
 Each candidate gets a fused score. Appearance is necessary but not sufficient;
@@ -177,8 +186,9 @@ the "averaging" concern deliberately kept **out** of TrackEmbedder.
 
 ### 3.5 What the code actually does today (authoritative)
 
-Two stages, both **appearance-driven** (no §3.2 constraints). This is the source
-of truth for the current behavior; `ARCHITECTURE.md` has the full detail.
+Two stages, both **appearance-driven** (none of the section 3.2 constraints).
+This is the source of truth for the current behavior; `ARCHITECTURE.md` has the
+full detail.
 
 **Live — `service.py`, per track, sticky.** On a track's *first* observation:
 1. **Candidates** — Qdrant top-K (K=50) nearest stored observations.
@@ -210,12 +220,13 @@ A same-camera time-overlap guard forbids fusing two co-present tracks throughout
 
 **Live streaming path — `src/live/identity_engine.py`.** The real-time pipeline
 (`--mode live`) has its own in-memory identity engine that obeys the **same
-boundaries** (§1/§2/§4): the extractor still only measures, the engine still owns
+boundaries** (sections 1, 2 and 4): the extractor still only measures, the engine still owns
 every decision. It assigns provisional on-screen ids in real time (evidence gate,
 same-camera cold reactivation, cross-camera reciprocal-best, same-camera-overlap
 hard veto, mint-when-uncertain) and, on stop, runs the **same `reconcile.py`**
 over the run's persisted observations to settle the final cross-camera ids — so
-both paths share one reconciliation. See `ARCHITECTURE.md` §8.
+both paths share one reconciliation. See [`ARCHITECTURE.md` section 8, "Live
+streaming pipeline"](../../ARCHITECTURE.md#8-live-streaming-pipeline--srclive).
 
 ---
 
@@ -231,7 +242,7 @@ both paths share one reconciliation. See `ARCHITECTURE.md` §8.
 Everything above the Identity Service produces **measurements**. The Identity
 Service is the single place that turns measurements into a **decision**, using
 context none of the other components have — today that is appearance + time
-(same-camera co-presence); topology and motion (§3.2) are the roadmap. Keep it
+(same-camera co-presence); topology and motion (section 3.2) are the roadmap. Keep it
 that way and each piece stays simple, testable, and swappable.
 
 ---
