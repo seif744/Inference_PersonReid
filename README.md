@@ -24,8 +24,8 @@ videos where one person carries one reid id/colour in every camera.
 > reference to a *different* document always names that document first — e.g.
 > "[ARCHITECTURE.md → section 6](ARCHITECTURE.md#6-known-limitations-model-not-plumbing)".
 > Every reference is a clickable link that jumps straight to the heading. (Older
-> revisions used a bare `§N`, which did not say *which* document it meant; there
-> are none left.)
+> revisions used a bare section-sign shorthand, which did not say *which*
+> document it meant; there are none left.)
 
 ---
 

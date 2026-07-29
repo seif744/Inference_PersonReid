@@ -63,13 +63,22 @@ reid:
   # Multi-source domain-generalization checkpoint (trained on Duke+Market+CUHK03,
   # evaluated on MSMT17 as the unseen domain) from the torchreid Model Zoo.
   weights: src/reid/weights/osnet_ain_x1_0.pth
-  device: cpu                # "cuda" if you have a GPU. SCOPE: this sets the
-                             # device for the OSNet ReID model on the FILE-BATCH
-                             # path only. YOLO detection/pose never receive a
-                             # device (src/detector.py), so Ultralytics picks
-                             # CUDA on its own whenever a GPU is visible -- even
-                             # with cpu here. The live path takes its ReID device
-                             # from live.run.device, not from this key.
+  device: auto               # auto | cpu | cuda | cuda:N -- same vocabulary as
+                             # live.run.device, resolved by the same helper
+                             # (src/live/capabilities.py::detect_device), so
+                             # "auto" means GPU when one is visible and CPU
+                             # otherwise, and asking for cuda on a box without
+                             # one falls back to cpu with a warning instead of
+                             # failing later mid-run.
+                             # SCOPE: this sets the device for the OSNet ReID
+                             # model on the FILE-BATCH path only. YOLO
+                             # detection/pose never receive a device
+                             # (src/detector.py), so Ultralytics picks CUDA on
+                             # its own whenever a GPU is visible. That is why
+                             # "auto" is the sensible default here: a hardcoded
+                             # cpu would put detection on the GPU and ReID on
+                             # the CPU in the same run. The live path takes its
+                             # ReID device from live.run.device, not this key.
   interval: 10               # re-embed a given track at most once every N frames
   ttl: 300                   # forget a track from the cache after N unseen frames
   warmup_embeddings: 3       # embed the first N successful observations of a new track
