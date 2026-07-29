@@ -726,10 +726,24 @@ def main():
     if reid_cfg.get("enabled"):
         from reid.extractor import ReIDExtractor
         from reid.service import TrackEmbedder
-        print("[main] Loading ReID model (shared across all cameras)...")
+        # Resolve reid.device through the SAME helper the live path uses for
+        # live.run.device, so both keys accept the same vocabulary
+        # (auto | cpu | cuda | cuda:N) and behave identically: "auto" -> GPU when
+        # one is visible else CPU, and an unavailable "cuda" degrades to CPU with
+        # a warning here instead of failing later on the first .to(device).
+        # Falling back to the raw config value keeps this non-fatal if the live
+        # package cannot be imported (ReIDExtractor auto-picks when given None).
+        try:
+            from live.capabilities import detect_device
+            reid_device = detect_device(reid_cfg.get("device", "auto"))
+        except Exception as e:
+            print(f"[main] (device auto-detect unavailable: {e})")
+            reid_device = reid_cfg.get("device")
+        print(f"[main] Loading ReID model on {reid_device} "
+              f"(shared across all cameras)...")
         extractor = ReIDExtractor(
             weights=reid_cfg["weights"],
-            device=reid_cfg.get("device"),
+            device=reid_device,
         )
         for name, _ in sources:
             embedders[name] = TrackEmbedder(

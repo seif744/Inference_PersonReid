@@ -52,3 +52,13 @@ qdrant-client==1.18.0      # embedding storage + nearest-neighbour search
 numpy==2.2.6
 opencv-python==5.0.0.93    # frame decode, crops, drawing, video writing
 PyYAML==6.0.3              # reads config.yaml
+
+# --- OS package, NOT pip-installable (optional) ---------------------------
+# tkinter: used once, in main.py, to read the screen size so the live display
+# window is scaled to fit. It is part of Python's standard library API but ships
+# as a SEPARATE OS package on Debian/Ubuntu/WSL, so a clean venv does not have
+# it and pip cannot supply it:
+#     sudo apt install python3-tk
+# Deliberately NOT a hard requirement: the import is guarded and falls back to
+# assuming 1080p, so a missing tkinter only means the display window may be
+# mis-sized on a non-1080p screen. Headless runs never touch it.

@@ -38,5 +38,17 @@ models/
 
 # Deploy target (SSH creds/path for deploy.sh) -- never commit
 .deploy.env
+# Acceptance/stage tests -- kept local. These drive the live pipeline with
+# SYNTHETIC frames (tests/live/_synth.py), so they are dev harness rather than a
+# shipped suite. Untracked with `git rm -r --cached tests` (files stay on disk).
+tests/
+
+# Local design/planning notes -- kept out of git by choice. NOTE: because these are
+# untracked, git carries no history for them, so any revision record has to live
+# inside the documents themselves (see ADR-003 section 7).
 NVIDIA_DeepStream_Adoption_Plan.md
+ADR-003-geometric-signal.md
+ADR-003A-geometry-subsystem.md
+ADR-003B-label-mining.md
+ADR-003C-identity-integration.md
 

@@ -24,8 +24,8 @@ offline reconcile** (`identity/reconcile.py`):
 > **How cross-references are written here.** "**section N**" means the numbered
 > section of **this** file (1–8 below); a reference to another document names it
 > first, e.g. "[README.md → section 6](README.md#6-run-the-pipeline)". All of
-> them are clickable links. (Bare `§N` references, which never said which
-> document they meant, have been replaced.)
+> them are clickable links. (The old bare section-sign shorthand, which never
+> said which document it meant, has been replaced everywhere.)
 
 ---
 
