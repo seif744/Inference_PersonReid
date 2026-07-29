@@ -48,6 +48,7 @@ from video_source import VideoSource, is_stream_path
 from detector import PersonDetector
 from drawing import draw_detections, draw_hud
 from crop_saver import CropSaver
+from interrupt_guard import InterruptGuard, print_stop_hint
 
 
 def load_dotenv(path=".env"):
@@ -807,6 +808,7 @@ def main():
     # we set stop_event and fall through to the reconcile + re-render below,
     # producing the saved videos just like pressing 'q' does.
     show_window = disp_cfg.get("show_window", True)
+    print_stop_hint("batch")
     try:
         if show_window:
             run_display([n for n, *_ in jobs], cfg, shared, stop_event, len(jobs))
@@ -815,9 +817,29 @@ def main():
             for t in threads:
                 t.join()
     except KeyboardInterrupt:
-        print("\n[main] Interrupted (Ctrl-C) -> stopping all sources and "
-              "finalizing outputs...")
+        print("\n[main] Interrupted (Ctrl-C) -> stopping all sources, then "
+              "reconciling + rendering the final videos. Do NOT press Ctrl-C "
+              "again; that would discard the reconciled ids.")
 
+    # ---- FINALIZATION PHASE (guarded against further Ctrl-C) ----------------
+    # From here to print_run_summary is what actually produces the deliverable:
+    # winding the workers down, deciding the correct cross-camera ids, and
+    # re-rendering the videos with them. A Ctrl-C landing anywhere in here used
+    # to abort with provisional ids and half-written MP4s, so the whole phase
+    # runs under InterruptGuard: extra presses print a warning instead of
+    # raising, and 3 in a row still force-quit (see src/interrupt_guard.py).
+    with InterruptGuard("reconciling ids + rendering the final videos"):
+        _finalize_run(threads, stop_event, shared, jobs, cfg, disp_cfg, id_cfg,
+                      store, identity, run_id)
+
+    print("[main] All done.")
+
+
+def _finalize_run(threads, stop_event, shared, jobs, cfg, disp_cfg, id_cfg,
+                  store, identity, run_id):
+    """Wind the workers down, reconcile ids across cameras, re-render the final
+    videos, print the summary. Always called inside an InterruptGuard so a
+    stray Ctrl-C can't leave the run with provisional ids."""
     # Ask workers to stop (if the user quit) and wait for them to wind down.
     stop_event.set()
     for t in threads:
@@ -850,7 +872,8 @@ def main():
         threshold = recon_cfg.get("threshold")
         if threshold is None:
             threshold = id_cfg.get("threshold", 0.85)
-        print("[main] Reconciling identities across cameras...")
+        print("[main] Reconciling identities across cameras... "
+              "(do NOT press Ctrl-C -- this is where the final ids are decided)")
         reconcile_tracklets(
             store,
             threshold=threshold,
@@ -869,10 +892,16 @@ def main():
 
     print_run_summary(store, jobs, cfg, run_id=run_id)
 
-    print("[main] All done.")
-
 
 if __name__ == "__main__":
     # This guard means main() only runs when you execute `python main.py`,
     # and is REQUIRED for threads to behave correctly.
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # Only reachable when the user force-quit through InterruptGuard (3
+        # Ctrl-C presses during finalization). Exit quietly with the standard
+        # SIGINT code instead of dumping a traceback.
+        print("\n[main] Force-quit during finalization -- the annotated videos "
+              "may be missing or keep provisional per-camera ids.")
+        sys.exit(130)

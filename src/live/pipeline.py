@@ -42,6 +42,7 @@ from live.identity_stage import IdentityStage
 from live.topology import FailOpenTopology, GraphTopology
 from live.render import RenderStage
 from live.writer import WriterStage
+from interrupt_guard import InterruptGuard, print_stop_hint
 
 
 class LivePipeline:
@@ -146,9 +147,11 @@ class LivePipeline:
             print(f"[live] offline reconcile ENABLED (run_id={self.run_id}): live "
                   f"reids are provisional; the CORRECT cross-camera ids are settled "
                   f"on Ctrl-C and re-rendered into output_<cam>.mp4.")
+            print_stop_hint("live")
         else:
             print("[live] offline reconcile OFF: writing live-annotated output "
                   "immediately (reids are the online engine's, not reconciled).")
+            print("[stop] To stop: press Ctrl-C once.")
 
         # ---- shared model (one extractor; per-camera detectors/embedders) ----
         reid_cfg = self.cfg.get("reid", {}) or {}
@@ -314,7 +317,9 @@ class LivePipeline:
                     last_log = now
                 time.sleep(0.1)
         except KeyboardInterrupt:
-            print("\n[live] Ctrl-C -> stopping and finalizing outputs...")
+            print("\n[live] Ctrl-C -> stopping and finalizing outputs. Do NOT "
+                  "press Ctrl-C again: the reconciled cross-camera ids are "
+                  "decided during this step.")
         finally:
             self._shutdown()
 
@@ -331,8 +336,19 @@ class LivePipeline:
             print(f"[live] warm-up skipped ({e}).")
 
     def _shutdown(self):
-        """Race-free shutdown (v5 §10): stop, join in pipeline order, writers
-        finalize their MP4s in their own finally-blocks."""
+        """Race-free shutdown: stop, join in pipeline order, writers finalize
+        their MP4s in their own finally-blocks, then the offline reconcile +
+        re-render produce the deliverable videos.
+
+        The whole phase runs under InterruptGuard: a second Ctrl-C here would
+        kill the writers mid-flush and skip the reconcile, so extra presses are
+        warned about instead of raising (3 in a row still force-quit)."""
+        with InterruptGuard("finalizing outputs (flushing videos, then "
+                            "reconciling ids + re-rendering)"):
+            self._shutdown_inner()
+
+    def _shutdown_inner(self):
+        """The actual shutdown sequence (always called under InterruptGuard)."""
         self.stop_event.set()
         # Join in the order data flows so downstream flushes what upstream sent.
         order = ["scheduler", "inference", "identity"]

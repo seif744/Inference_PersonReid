@@ -15,6 +15,36 @@ torch==2.12.1              # OSNet + detection inference backend (CPU or CUDA)
 torchvision==0.27.1        # required by torchreid / ultralytics
 torchreid==0.2.5           # OSNet model definition
 
+# torchreid's PyPI wheel declares NO runtime dependencies (only dev/test extras),
+# so pip installs none of what it actually imports. These three are NOT optional:
+# `import torchreid` walks its whole dataset/engine package at import time, so
+# without them the ReID extractor dies with ModuleNotFoundError before it can
+# load a single crop. Verified in a clean venv containing only this file.
+#   scipy       -> torchreid/reid/data/datasets/image/grid.py does
+#                  `from scipy.io import loadmat` at module level.
+#   gdown       -> torchreid/reid/data/datasets/image/university1652.py does a
+#                  module-level `import gdown`.
+#   tensorboard -> torchreid's engine imports torch.utils.tensorboard, which
+#                  imports the tensorboard package at module level.
+scipy==1.15.3              # hard requirement of `import torchreid` (see above)
+gdown==5.2.2               # hard requirement of `import torchreid` (see above)
+tensorboard==2.21.0        # hard requirement of `import torchreid` (see above)
+
+# ByteTrack's data association (ultralytics/trackers/utils/matching.py) imports
+# `lap`. Ultralytics ships it only in its optional [solutions] extra, so without
+# this pin ultralytics tries to pip-install lap MID-RUN -- which fails on an
+# offline/locked-down box and silently mutates the env everywhere else.
+lap==0.5.13                # ByteTrack linear assignment (tracker.enabled: true)
+
+# DELIBERATELY NOT PINNED (checked, not needed):
+#   Cython        -> only speeds up torchreid's rank-evaluation metrics, which
+#                    this pipeline never calls. Its absence prints one harmless
+#                    "Cython evaluation is unavailable" warning at import.
+#   ultralytics extras ([export], [solutions], [logging]) -> export formats,
+#                    Streamlit demos and W&B/MLflow logging: none are used here.
+# The full set above was verified by installing ONLY this file into an empty venv
+# and running both paths end to end (file-batch and --mode live) on real footage.
+
 # --- Vector store ---------------------------------------------------------
 qdrant-client==1.18.0      # embedding storage + nearest-neighbour search
 
