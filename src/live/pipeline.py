@@ -28,7 +28,7 @@ from datetime import datetime
 import numpy as np
 
 # src/ is already on sys.path (main.py inserts it); import the reused components.
-from detector import PersonDetector
+from detector import PersonDetector, resolve_detector_cfg
 from reid.extractor import ReIDExtractor
 from reid.service import TrackEmbedder
 
@@ -172,12 +172,17 @@ class LivePipeline:
 
         detectors, embedders = {}, {}
         for name, _ in self.sources:
+            # Per-camera overrides merged over the global detector block. pose_cfg
+            # stays as resolved above: the live pose toggle is a THROUGHPUT
+            # decision for the whole path, not a per-camera one.
+            cam_det_cfg = resolve_detector_cfg(det_cfg, name)
             detectors[name] = PersonDetector(
-                model_path=det_cfg["model"],
-                confidence_threshold=det_cfg["confidence_threshold"],
-                person_class_id=det_cfg["person_class_id"],
+                model_path=cam_det_cfg["model"],
+                confidence_threshold=cam_det_cfg["confidence_threshold"],
+                person_class_id=cam_det_cfg["person_class_id"],
                 tracker_config=trk_cfg.get("config", "bytetrack.yaml"),
                 pose_ensemble=pose_cfg,
+                iou=cam_det_cfg.get("iou", 0.7),
             )
             embedders[name] = TrackEmbedder(
                 extractor,

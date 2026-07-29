@@ -219,14 +219,25 @@ class VideoSource:
             ok, frame = self.capture.read()
             return frame if ok else None
 
-        # Grab (decode-and-discard) up to a small cap of queued frames quickly,
-        # then retrieve the most recent. grab() returns False when no frame is
-        # ready; the cap stops us spinning forever on a fast source.
+        # Grab (decode-and-discard) whatever is ALREADY BUFFERED, then retrieve the
+        # most recent. The cap must be a TIME budget, not a frame count: with the
+        # FFmpeg backend grab() BLOCKS waiting for the next frame instead of
+        # returning False when the buffer is empty, so a fixed `for _ in range(5)`
+        # discarded 4 of every 5 frames unconditionally -- a silent 5:1 decimation
+        # of a healthy stream, not the backlog drain it was meant to be.
+        #
+        # Budgeting ~5ms fixes that: draining a real backlog is memcpy-fast and
+        # stays inside the window, while a blocking grab on a live 25fps source
+        # takes ~40ms and so ends the loop after the one frame we actually need.
+        drain_budget = 0.005
         grabbed_any = False
-        for _ in range(5):
+        deadline = time.monotonic() + drain_budget
+        while True:
             if not self.capture.grab():
                 break
             grabbed_any = True
+            if time.monotonic() >= deadline:
+                break        # budget spent -> that grab blocked; nothing buffered
         if not grabbed_any:
             # Nothing buffered was grabbable -- fall back to a blocking read so
             # we still wait for the next frame rather than busy-spin.

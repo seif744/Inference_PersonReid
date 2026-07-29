@@ -245,6 +245,29 @@ def reconcile_tracklets(store, threshold, run_id=None,
                 return False
             return any(x[0] != y[0] for x in roots[a] for y in roots[b])
 
+        def pair_threshold(a, b):
+            """The bar THIS cluster pair must clear.
+
+            Phase 1 deliberately repairs same-camera fragmentation at the strict
+            `same_camera_threshold`, because "these two tracks in ONE camera are
+            the same person" is a much easier claim to get wrong than a genuine
+            cross-camera link (same lighting, same pose distribution, so unrelated
+            people score higher). Phase 2 used to apply the LOW cross-camera
+            `threshold` to every mergeable pair, which quietly threw that bar away:
+            as soon as a cluster had absorbed a second camera, `mergeable_cross`
+            was satisfied by that pre-existing member, and a same-camera fragment
+            could then join at the cross-camera bar. Two strangers seen in one
+            camera at different times merged at ~0.69.
+
+            So: if the two clusters SHARE a camera, merging them asserts that that
+            camera's fragments are one person -- exactly Phase 1's claim -- and it
+            must clear the same-camera bar. Only genuinely camera-disjoint clusters
+            get the lower cross-camera bar.
+            """
+            cams_a = {k[0] for k in roots[a]}
+            cams_b = {k[0] for k in roots[b]}
+            return same_camera_threshold if (cams_a & cams_b) else threshold
+
         root_scores = {}
         for i, a in enumerate(root_keys):
             for b in root_keys[i + 1:]:
@@ -255,6 +278,8 @@ def reconcile_tracklets(store, threshold, run_id=None,
         def root_score(a, b):
             return root_scores[(a, b)] if a < b else root_scores[(b, a)]
 
+        # Reciprocal-best uses the SAME per-pair bar, so a cluster never picks a
+        # partner it would then be refused, which would block a legitimate merge.
         best_partner = {}
         if require_reciprocal_best:
             for a in root_keys:
@@ -262,14 +287,14 @@ def reconcile_tracklets(store, threshold, run_id=None,
                     (root_score(a, b), b) for b in root_keys
                     if b != a
                     and ((a, b) in root_scores or (b, a) in root_scores)
-                    and root_score(a, b) >= threshold
+                    and root_score(a, b) >= pair_threshold(a, b)
                 ]
                 if candidates:
                     best_partner[a] = max(candidates)[1]
 
         cross_pairs = []
         for (a, b), s in root_scores.items():
-            if s < threshold:
+            if s < pair_threshold(a, b):
                 continue
             if require_reciprocal_best and not (
                     best_partner.get(a) == b and best_partner.get(b) == a):
@@ -281,9 +306,14 @@ def reconcile_tracklets(store, threshold, run_id=None,
             ra, rb = find(a), find(b)
             if ra == rb:
                 continue
+            bar = pair_threshold(a, b)
+            # Name the lane by the bar actually applied. The old message called
+            # every Phase 2 merge "cross-camera" even when both printed root keys
+            # were the same camera, which made the log actively misleading.
+            lane = "same-camera" if bar == same_camera_threshold else "cross-camera"
             if union(ra, rb):
-                log(f"  tracklet reconcile: cross-camera merge {a} + {b} "
-                    f"(cosine {s:.3f})")
+                log(f"  tracklet reconcile: {lane} cluster merge {a} + {b} "
+                    f"(cosine {s:.3f} >= {bar:.2f})")
                 merged_this_round = True
 
         if not merged_this_round:

@@ -45,7 +45,7 @@ import cv2
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
 from video_source import VideoSource, is_stream_path
-from detector import PersonDetector
+from detector import PersonDetector, resolve_detector_cfg
 from drawing import draw_detections, draw_hud
 from crop_saver import CropSaver
 from interrupt_guard import InterruptGuard, print_stop_hint
@@ -687,12 +687,16 @@ def main():
     # Each crop saver writes to crops/<name>/ so crops stay separate.
     jobs = []  # each: (name, path, detector, crop_saver)
     for name, path in sources:
+        # Per-camera overrides (angle/lighting differ per view) merged over the
+        # global detector block -- see detector.resolve_detector_cfg.
+        cam_det_cfg = resolve_detector_cfg(det_cfg, name)
         detector = PersonDetector(
-            model_path=det_cfg["model"],
-            confidence_threshold=det_cfg["confidence_threshold"],
-            person_class_id=det_cfg["person_class_id"],
+            model_path=cam_det_cfg["model"],
+            confidence_threshold=cam_det_cfg["confidence_threshold"],
+            person_class_id=cam_det_cfg["person_class_id"],
             tracker_config=trk_cfg["config"],
-            pose_ensemble=det_cfg.get("pose_ensemble"),
+            pose_ensemble=cam_det_cfg.get("pose_ensemble"),
+            iou=cam_det_cfg.get("iou", 0.7),
         )
         crop_saver = None
         if crop_cfg["save"]:

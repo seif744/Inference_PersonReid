@@ -76,6 +76,35 @@ class Detection:
     # and gallery inserts straightforward.
     crop_quality: Optional[dict] = None
 
+    # The IDENTITY match score (cosine, 0-1) behind reid_id -- NOT the detection
+    # confidence. `confidence` above is YOLO's "is this a person"; this is the
+    # ReID engine's "is this the SAME person as identity N". They are different
+    # questions and reading one as the other is exactly how a flipping id looks
+    # trustworthy on screen. None while a track is still gathering evidence, and
+    # None for a freshly minted identity (nothing was matched against).
+    reid_score: Optional[float] = None
+
+
+def resolve_detector_cfg(det_cfg, camera_name):
+    """
+    config `detector:` block + its `per_camera[<name>]` overrides -> one effective
+    dict for that camera.
+
+    Cameras differ in angle, distance and lighting, so one global
+    confidence_threshold is a compromise that is wrong for every camera by a
+    different amount: a wide/high-mounted view needs a LOWER floor (small, partly
+    occluded people) while a close view can afford a HIGHER one (fewer false
+    positives on bags/chairs). This is the one place that merge happens, so the
+    live path and the file-batch path can never drift apart on it.
+
+    Unknown camera names and a missing per_camera block are both no-ops, so the
+    global values stay in force until someone opts a camera in.
+    """
+    merged = dict(det_cfg or {})
+    per_camera = merged.pop("per_camera", None) or {}
+    merged.update(per_camera.get(camera_name) or {})
+    return merged
+
 
 def crop_person(frame, det, padding=0):
     """
@@ -116,7 +145,8 @@ class PersonDetector:
 
     def __init__(self, model_path="yolo11n.pt",
                  confidence_threshold=0.4, person_class_id=0,
-                 tracker_config="bytetrack.yaml", pose_ensemble=None):
+                 tracker_config="bytetrack.yaml", pose_ensemble=None,
+                 iou=0.7):
         # Loading the weights. The first time this runs, Ultralytics will
         # DOWNLOAD the yolo11n.pt file (~5 MB) automatically, then reuse it.
         print(f"[detector] Loading model '{model_path}' (first run may download it)...")
@@ -124,6 +154,20 @@ class PersonDetector:
 
         self.confidence_threshold = confidence_threshold
         self.person_class_id = person_class_id
+
+        # NMS IoU threshold. YOLO11 is NOT an NMS-free head: it emits many
+        # overlapping candidates per person on purpose (one-to-many training
+        # assignment) and Ultralytics runs non_max_suppression in postprocess to
+        # collapse them. That step always ran -- we just inherited the library
+        # default (0.7) invisibly, which is a poor thing to leave implicit in a
+        # crowded-scene pipeline.
+        #
+        # Direction is easy to get backwards: this is the IoU ABOVE WHICH an
+        # overlapping lower-confidence box is SUPPRESSED. LOWER = suppress more
+        # aggressively = fewer duplicate boxes on one person. RAISING it would
+        # produce MORE duplicates (it helps only the opposite failure, where one
+        # box merges two people -- that is the pose ensemble's job below).
+        self.iou = float(iou)
 
         # Which tracking algorithm to use. Ultralytics ships two ready-made
         # configs: "bytetrack.yaml" (fast, great default) and "botsort.yaml"
@@ -163,6 +207,7 @@ class PersonDetector:
             frame,
             classes=[self.person_class_id],  # only people, ignore other 79 classes
             conf=self.confidence_threshold,  # drop low-confidence boxes
+            iou=self.iou,                    # NMS overlap threshold (see __init__)
             verbose=False,                   # don't print a report every frame
         )
         return self._parse_results(results)
@@ -181,6 +226,7 @@ class PersonDetector:
             frame,
             classes=[self.person_class_id],
             conf=self.confidence_threshold,
+            iou=self.iou,                    # NMS overlap threshold (see __init__)
             tracker=self.tracker_config,     # which tracking algorithm
             persist=True,                    # remember tracks across calls
             verbose=False,

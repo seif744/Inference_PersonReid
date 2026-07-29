@@ -26,8 +26,33 @@ source:
 
 detector:
   model: yolo11n.pt          # small YOLO; auto-downloaded on first run
+                             # If small objects get misclassified (a bag read as a
+                             # person), that is detector CAPACITY, not a threshold:
+                             # step up to yolo11s.pt (~3x the FLOPs of 11n) before
+                             # yolo11m.pt (~10x) and re-check scheduler util% in the
+                             # live metrics summary before keeping it.
   confidence_threshold: 0.4  # drop boxes less confident than this
+  iou: 0.60                  # NMS overlap threshold. Was previously UNSET, silently
+                             # inheriting Ultralytics' 0.7 default -- a load-bearing
+                             # value that deserves to be visible. LOWER suppresses
+                             # MORE aggressively => fewer duplicate boxes on one
+                             # person. Do NOT raise this to fix duplicates; raising
+                             # it produces more of them (it only helps the opposite
+                             # failure, one box merging two people).
   person_class_id: 0         # COCO class 0 = person
+
+  # Per-camera overrides for anything above (angle, distance and lighting differ
+  # per view, so a single global floor is wrong for every camera by a different
+  # amount). Merged over the global values by detector.resolve_detector_cfg, which
+  # BOTH the live and file-batch paths call, so the two can never drift.
+  # Keys are camera names as they appear in source.videos / auto-named cam_<octet>.
+  # Empty = every camera uses the global values above. Example:
+  #   per_camera:
+  #     cam_224:
+  #       confidence_threshold: 0.50   # close view: afford a higher floor
+  #     cam_213:
+  #       confidence_threshold: 0.35   # wide/high view: small, partly-occluded people
+  per_camera: {}
   # Pose ensemble: when the box tracker merges two overlapping people into ONE
   # box (e.g. crops/id_0008), a second pose model finds one skeleton per person
   # and we split the box into individual people. Runs a 2nd model per frame.
@@ -235,7 +260,14 @@ live:
                             # processed CONCURRENTLY (one worker per camera). Still
                             # well under one frame period; adds negligible latency.
     max_inference_queue: 2
-    max_skip_cycles: 2      # scheduler starvation bound (fresh cam not skipped > N cycles)
+                            # NOTE: `max_skip_cycles` used to sit here, documented as a
+                            # "scheduler starvation bound". NOTHING in the code ever read
+                            # it -- BatchScheduler has no rotation state. Removed rather
+                            # than implemented, because the scheduler is already fair by
+                            # construction (measured 33.3/33.3/33.4% across 3 cameras at
+                            # max_batch_size=1): slot.get() CLEARS the slot, so a
+                            # just-served camera is empty on the next pass and the next
+                            # camera wins. A redundant bound would add state for nothing.
     max_workers: 0          # Stage 2 inference parallelism. 0 = one worker per camera
                             # (recommended). Each worker owns a camera's detector +
                             # ByteTrack; the shared ReID extractor is lock-serialised.
@@ -251,7 +283,7 @@ live:
                             # per-camera lane in the anti-starvation fair buffer
     assign_latency_budget_ms: 5
     min_evidence_obs: 3     # evidence gate before ASSIGNED (never assign on 1st obs)
-    same_camera_threshold: 0.85   # same-camera lane: cold reactivation of a dropped
+    same_camera_threshold: 0.70   # same-camera lane: cold reactivation of a dropped
                                   # then re-acquired track. Lowered 0.90 -> 0.85 from
                                   # A100 run #4: 29/42 same-camera reacquisitions failed
                                   # JUST under 0.90 (max 0.898) -> the person minted a new
@@ -260,6 +292,27 @@ live:
                                   # merges are separately blocked by the co-active veto, so
                                   # lowering this is safe for the on-screen case. Tune from
                                   # the same-cam reacquire histogram in the run summary.
+                                  #
+                                  # Lowered again 0.85 -> 0.70 from RTSPS run 20260729_162934
+                                  # (3 cams, 90.6s, cuda:0). The SAME failure repeated one
+                                  # notch down: attempts=22 ok=7 rejected_below_thr=15,
+                                  # max_rejected 0.841 -- just under 0.85 again. Histogram
+                                  # [<.5:1 .5-.6:1 .6-.7:2 .7-.8:8 .8-.9:4 .9+:6] puts the
+                                  # LARGEST bin at .7-.8, which identity.threshold's
+                                  # calibration note (~line 136) identifies as the genuine
+                                  # same-person range (different people top out ~0.57).
+                                  # 0.85 sat ABOVE the same-person cluster, so live minted
+                                  # 25 ids for 7 real people (offline reconcile: 35 tracklets
+                                  # -> 7 identities) and on-screen ids flipped on every turn
+                                  # and crossing. 0.70 sits below the cluster and still well
+                                  # clear of the ~0.57 different-people ceiling.
+                                  #
+                                  # Why this is stricter in effect than reconcile's 0.90:
+                                  # reconcile scores tracklet PROTOTYPES averaged over many
+                                  # observations (denoised, 0.905-0.995 in that run), while
+                                  # this lane scores a partial live aggregate off noisy
+                                  # single crops. Same 0-1 scale, different distributions --
+                                  # the two numbers are NOT comparable.
     cross_camera_threshold: 0.60  # cross-camera lane: link the same person across cams.
                                   # Lowered 0.63 -> 0.60 from A100 run #2: 9 real
                                   # cross-camera matches landed just under 0.63
