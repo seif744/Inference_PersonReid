@@ -16,6 +16,35 @@ Read Part A before proposing any threshold change. Read Part H before trusting a
 
 ### 0.1 The next thing to do
 
+> **UPDATE, later on 2026-07-30 — the threshold era is over.** Two live runs and an
+> offline sweep established that **no threshold fixes this**, from either direction:
+> cam_224 at 0.80 fused several people into one reid; at 0.90 one person shattered
+> into many. That is J.6's overlapping boundaries showing up in the product, and the
+> cause is **#45a — reconcile compared prototype MEANS**, which scores one person's
+> front-vs-back fragments *below* two strangers in similar clothing.
+>
+> Landed since: per-camera bars (#40), the first calibrated `cross_camera_threshold`
+> (#41), **offline threshold sweeps and offline re-rendering** (#23, partial — a
+> finished run can now be re-clustered *and re-rendered into watchable video* with no
+> cameras), **#45a scoring modes** (`prototype` | `max_exemplar` | `consensus`), and
+> **#28/#29** RTSP TCP + socket timeouts.
+>
+> **The next action is no longer a code change: pick the scoring mode from the
+> captured run.** `scoring` still ships as `prototype`, because changing the mode
+> voids every threshold. On the server, with a run captured under
+> `keep_frames: true`:
+>
+> ```bash
+> python tests/calibration/sweep_reconcile_thresholds.py <run_id> \
+>     --scoring prototype,consensus,max_exemplar --cross 0.60,0.70,0.80
+> python tests/calibration/rerender_from_clips.py <run_id> \
+>     --scoring prototype,consensus --cross 0.70
+> ```
+>
+> Then **watch the videos** and set the mode with its re-derived bars in one commit.
+> Expect consensus to need *lower* bars than prototype — it is a different scale, not
+> a better number on the same one.
+
 **Capture run2 and diff it against run1 (`20260730_093723`).** Two changes are staged
 in the working tree and neither has ever run on real footage:
 
@@ -60,10 +89,16 @@ Four earlier tuning attempts were reverted without learning anything — see Par
 | `5598d31` | Part J.6: the per-camera finding from the first real run |
 | *working tree* | **#40**: `resolve_same_camera_thresholds` + `strictest_same_camera_bar` in `reconcile.py`, `identity.reconcile.per_camera` in config, both call sites wired, `tests/live/test_per_camera_same_camera_bar.py` (36 checks) |
 | *working tree* | `detector.model: yolo11m.pt`, `tests/calibration/compare_detector_models.py`, `_common.DETECT_WEIGHTS` now read from config instead of hardcoded |
+| `c7cc79c` | **#41 first calibrated `cross_camera_threshold`** 0.63→0.70, and cam_224 back to 0.90 (cam_213 stays 0.80) — both chosen by offline sweep, not by a run each |
+| `3dd0107` + `680ce61` | **Offline threshold sweeps** (`sweep_reconcile_thresholds.py`): re-cluster a finished run from its stored observations in seconds, read-only, both threshold axes |
+| `e51175b` | **Offline RE-RENDER** (`rerender_from_clips.py` + `._live_src_*.annotations.json`): a captured run becomes watchable video at any reconcile setting, no cameras. `keep_frames` now defaults true |
+| `a7a042c` | **#45a scoring modes** — `prototype` \| `max_exemplar` \| `consensus`, with the front/back counterexample pinned (23 checks). Default unchanged |
+| `9f5e7fc` | **#28/#29** RTSP `rtsp_transport;tcp` + open/read socket timeouts; `VideoSource.open`/`_reopen` unified (17 checks) |
 
-Test state: **11 test files pass** (`python tests/run_all.py`), including
-`test_phase1_decision_log.py` (28 checks), `test_shutdown_reaches_reconcile.py` (14)
-and `test_per_camera_same_camera_bar.py` (36).
+Test state: **13 test files pass** (`python tests/run_all.py`), including
+`test_phase1_decision_log.py` (28 checks), `test_shutdown_reaches_reconcile.py` (14),
+`test_per_camera_same_camera_bar.py` (36), `test_reconcile_scoring_modes.py` (23) and
+`test_rtsp_options.py` (17).
 
 ### 0.3 Verify state on a fresh machine
 
@@ -194,6 +229,7 @@ These were measured and rejected. Do not revisit without new evidence.
 | Deepening `max_inference_queue` | 6 MB/frame; observed peak depth 900 ≈ 5.6 GB RAM | measured |
 | Frame-drop → fragmentation fixes | **CONFIRMED DEAD on production hardware (J.1):** real drop rate is 0.5–6.5%, not the 85–99% measured on CPU-with-file. Phase 11 solves a problem that does not exist at this crowd size | measured, field |
 | `TOP2_MARGIN` as a **gate** | Accepted and rejected margin distributions are near-identical on 163 real decisions (median 0.0224 vs 0.0186, p5 0.0017 vs 0.0016). A gate would be near-random. Compute and log it; never enforce it. See J.6 | measured, field |
+| **Any** `same_camera_threshold` as the fix for id instability | **Settled 2026-07-30 by two live runs plus an offline sweep.** cam_224 at 0.80 fused several people into one reid; at 0.90 one person shattered into many numbers. Both were observed in the rendered videos. This is J.6's overlapping boundaries reaching the product, and it is #45a (prototype MEANS), not a number. Tune bars *after* choosing a scoring mode, never instead | measured, field |
 | A **global** `same_camera_threshold` of any value | The per-subject boundaries overlap across cameras (J.6): p95 of "top different" = 0.816 exceeds p5 of "worst same" = 0.719. No single number works. **Per-camera bars landed 2026-07-30 (#40)** — so do not "fix" this by picking a better global number; tune the per-camera entries | measured, field |
 | `yolo11n` → `yolo11m` as a **no-op** | Superseded 2026-07-30. Part A previously implied detector changes buy nothing, on the strength of `imgsz`/`conf` results. Capacity is a different lever and it **does** move fragmentation: yolo11m holds one 150-frame track where yolo11n splits the same person into 64 + 37 (H.11). Shipped as a measurement; the throughput half is still unmeasured | measured |
 
@@ -350,7 +386,7 @@ every consumer filters by `run_id`.
 
 | # | Item | Evidence |
 |---|---|---|
-| 28 | **No RTSP transport or timeout options anywhere.** Set `OPENCV_FFMPEG_CAPTURE_OPTIONS` with `rtsp_transport;tcp` and a socket timeout | **measured**: 294/682 and 207/1573 broken H.265 references in project recordings; grep confirms none set |
+| 28 | ~~**No RTSP transport or timeout options anywhere.**~~ **LANDED `9f5e7fc`** (`source.rtsp`, applied before any capture opens; TCP is a sound default, not a measured fix — J.4 saw zero live decode errors). Set `OPENCV_FFMPEG_CAPTURE_OPTIONS` with `rtsp_transport;tcp` and a socket timeout | **measured**: 294/682 and 207/1573 broken H.265 references in project recordings; grep confirms none set |
 | 29 | Without a socket timeout `cap.read()` can block indefinitely; the capture thread never re-checks `stop_event`, so `Ctrl-C` cannot stop that camera | read |
 | 30 | Move credentials out of command-line URLs (visible in `ps` and shell history) into `.env` | observed |
 
@@ -437,7 +473,7 @@ pushes same-person scores toward the stranger band.
 | 43 | ~~`TOP2_MARGIN` sweep~~ — **ANSWERED, see Part A.** Accepted and rejected margin distributions are near-identical (median 0.0224 vs 0.0186), so it carries no information. Keep `threshold: null` |
 | 44 | `RECIPROCAL_BEST` — rejects 31% of decisions at up to 0.905 (J.6). Re-examine only after #40 |
 | 45 | Consensus vs `max(proto, exemplar)` scoring — consensus gave the **lowest different-person ceiling** of the three modes at both sample sizes (corrected H.2/H.3). Also the candidate fix for the front/back blurring in #34a |
-| 45a | **Reconcile compares prototype MEANS, which blurs front/back into a vector matching neither view.** The live engine's `_bank_score` documents avoiding exactly this with `max(prototype, best_exemplar)`; reconcile never got that fix. This is the structural cause behind cam_213's front/back split — #40 treats the symptom, this treats the cause |
+| 45a | ~~**Reconcile compares prototype MEANS**~~ — **LANDED `a7a042c`**, default still `prototype` because the mode voids every threshold. Measured on a front/back counterexample: prototype scores one person's two visits **0.640, BELOW two strangers at 0.800**; `max_exemplar` fixes the ordering (1.000) but one bad crop in ten fuses two people; `consensus` fixes it *and* holds that bad crop to 0.880. Original text: reconcile compares prototype MEANS, which blurs front/back into a vector matching neither view.** The live engine's `_bank_score` documents avoiding exactly this with `max(prototype, best_exemplar)`; reconcile never got that fix. This is the structural cause behind cam_213's front/back split — #40 treats the symptom, this treats the cause |
 
 **A high `TOP2_MARGIN` failure rate is a diagnostic, not evidence of under-merging.** The
 discriminator is `pair_similarity_to_best`:
