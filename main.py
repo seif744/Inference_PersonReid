@@ -291,7 +291,8 @@ def build_gid_map(store, run_id):
     return {key: counter.most_common(1)[0][0] for key, counter in votes.items()}
 
 
-def render_final_videos(jobs, cfg, shared, store, run_id):
+def render_final_videos(jobs, cfg, shared, store, run_id,
+                        gid_map=None, out_pattern="output_{name}.mp4"):
     """
     SECOND PASS -- write output_<camera>.mp4 with the FINAL (post-reconciliation)
     global ids. The live pass only captured box geometry; cross-camera identity is
@@ -300,10 +301,21 @@ def render_final_videos(jobs, cfg, shared, store, run_id):
     output videos -- the core proof the pipeline works. We re-decode the source
     frames (cheap; no model) and draw the captured boxes, so boxes/track ids match
     the live pass exactly.
+
+    gid_map / out_pattern exist so a PAST run can be re-rendered offline at
+    different reconcile settings (tests/calibration/rerender_from_clips.py):
+      * gid_map -- supply {(camera, track_id): gid} directly, which is exactly what
+        reconcile_tracklets returns. Skips build_gid_map, so a re-render never has
+        to write ids into the store first and can therefore leave the gallery
+        untouched while producing a watchable video.
+      * out_pattern -- write somewhere other than output_<cam>.mp4, so two settings
+        can be rendered side by side and compared instead of overwriting.
+    Both default to today's behaviour exactly; the live path passes neither.
     """
     from concurrent.futures import ThreadPoolExecutor
     from types import SimpleNamespace
-    gid_map = build_gid_map(store, run_id)
+    if gid_map is None:
+        gid_map = build_gid_map(store, run_id)
     resize_width = cfg["source"].get("resize_width", 0)
     fps = float(cfg["display"].get("output_fps", 20.0))
 
@@ -311,7 +323,7 @@ def render_final_videos(jobs, cfg, shared, store, run_id):
         annos = shared["annotations"].get(name)
         if not annos:
             return
-        out_path = f"output_{name}.mp4"
+        out_path = out_pattern.format(name=name)
         writer = None
         try:
             with VideoSource(path=path) as cam:
@@ -339,7 +351,13 @@ def render_final_videos(jobs, cfg, shared, store, run_id):
 
                         dets.append(
                             SimpleNamespace(
-                                x1=x1, y1=y1, x2=x2, y2=y2,
+                                # cv2.rectangle needs ints. Detection declares int
+                                # coordinates, so the live path already satisfies
+                                # this -- but these can also arrive from a
+                                # persisted .annotations.json, where a float would
+                                # otherwise fail deep inside OpenCV with an
+                                # unreadable overload-resolution error.
+                                x1=int(x1), y1=int(y1), x2=int(x2), y2=int(y2),
                                 track_id=track_id, confidence=conf,
                                 global_id=gid_map.get((name, track_id)),
                                 reid_id=gid_map.get((name, track_id)),

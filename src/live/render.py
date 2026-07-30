@@ -22,6 +22,8 @@ render_final_videos() re-renders from. Final ids are settled by the offline
 reconcile at shutdown; this stage just preserves the material to re-render with.
 """
 
+import json
+import os
 import threading
 
 import cv2
@@ -46,9 +48,11 @@ def _to_cpu_bgr(image, device):
 
 class RenderStage(threading.Thread):
     def __init__(self, cam, render_queue, writer_queue, stop_event,
-                 capture_mode=False, clip_path=None, clip_fps=20.0):
+                 capture_mode=False, clip_path=None, clip_fps=20.0,
+                 run_id=None):
         super().__init__(name=f"render-{cam}", daemon=True)
         self.cam = cam
+        self.run_id = run_id
         self.in_q = render_queue
         self.writer_queue = writer_queue
         self.stop_event = stop_event
@@ -81,6 +85,7 @@ class RenderStage(threading.Thread):
                 self._clip.release()
                 print(f"[render:{self.cam}] captured {self.rendered} processed "
                       f"frames -> {self.clip_path}")
+                self._write_annotations()
 
     def _process(self, frame):
         img = _to_cpu_bgr(frame.image, frame.device)
@@ -95,6 +100,41 @@ class RenderStage(threading.Thread):
         # Hand the annotated pixels + capture ts to the writer (pacing uses ts).
         self.writer_queue.put((img, frame.ts))
         self.rendered += 1
+
+    def annotations_path(self):
+        """Sidecar path for this camera's box geometry."""
+        return os.path.splitext(self.clip_path)[0] + ".annotations.json"
+
+    def _write_annotations(self):
+        """Persist the per-frame box geometry next to the clip.
+
+        Without this the clip alone is useless for re-rendering: `annotations`
+        lives only in this thread's memory and dies with the process, and the
+        store holds a bbox only every `reid.interval` frames. Clip + sidecar +
+        the stored embeddings together are a COMPLETE record of the run, so any
+        reconcile setting can be re-rendered offline afterwards
+        (tests/calibration/rerender_from_clips.py) instead of costing another
+        live capture with people walking the room.
+
+        Fail-soft: this runs during finalization, where nothing is allowed to
+        cost the run its ids or its video.
+        """
+        path = self.annotations_path()
+        try:
+            with open(path, "w") as f:
+                json.dump({
+                    "camera": self.cam,
+                    "run_id": self.run_id,
+                    "clip": os.path.basename(self.clip_path),
+                    "clip_fps": self.clip_fps,
+                    "frames": len(self.annotations),
+                    "annotations": self.annotations,
+                }, f)
+            print(f"[render:{self.cam}] box geometry -> {path}")
+        except (OSError, TypeError, ValueError) as e:
+            print(f"[render:{self.cam}] could not write {path}: {e} "
+                  f"(the run is unaffected; offline re-render will not be "
+                  f"possible for this camera)")
 
     def _capture(self, img, dets):
         """Record the CLEAN frame + its box geometry (both from this one Frame,

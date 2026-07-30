@@ -484,8 +484,26 @@ live:
                             # frames (they are NOT per-frame), so this is a second,
                             # optional subsample on top of that. 1 = keep every
                             # fresh observation (matches the file-batch path).
-    keep_frames: false      # delete the transient per-camera processed-frame clips
-                            # after the final render. true = keep them for audit.
+    keep_frames: true       # keep the per-camera processed-frame clips after the
+                            # final render, together with the
+                            # ._live_src_<cam>.annotations.json box geometry the
+                            # render stage writes beside each one.
+                            #
+                            # ON since 2026-07-30, and it should stay on while
+                            # reconcile is being tuned. Clip + sidecar + the run's
+                            # embeddings in Qdrant are a COMPLETE record of the run,
+                            # so reconcile and the render can be replayed offline at
+                            # any settings:
+                            #   python tests/calibration/rerender_from_clips.py <run_id> --cross 0.70,0.75
+                            # That turns "try another threshold" from a five-minute
+                            # capture with people walking the room into a local job
+                            # that produces watchable videos on the SAME footage and
+                            # the SAME track ids -- the only way two settings can
+                            # honestly be compared.
+                            #
+                            # COST: ~1.2-2.2 MB/s per camera (see plan #65), so a
+                            # 5-minute 4-camera run keeps roughly 1.8 GB. Set false
+                            # once tuning is done, or prune old ._live_src_* by hand.
   output:
     write_video: true
     video_path: output_<cam>.mp4

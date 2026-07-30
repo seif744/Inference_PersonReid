@@ -283,7 +283,7 @@ class LivePipeline:
                 self._clip_paths[name] = clip_path
                 renderer = RenderStage(name, render_q, None, self.stop_event,
                                        capture_mode=True, clip_path=clip_path,
-                                       clip_fps=fps)
+                                       clip_fps=fps, run_id=self.run_id)
                 self.renderers.append(renderer)
                 self.threads.append((f"render-{name}", renderer))
             else:
@@ -544,18 +544,31 @@ class LivePipeline:
             return {}
 
     def _cleanup_clips(self):
-        """Delete the transient processed-frame clips (unless keep_frames)."""
+        """Delete the transient processed-frame clips (unless keep_frames).
+
+        The box-geometry sidecar travels WITH its clip: either both survive or
+        both go. A clip without its geometry cannot be re-rendered, and geometry
+        without its clip has nothing to draw on, so keeping one alone is only a
+        confusing leftover.
+        """
+        pairs = [(p, os.path.splitext(p)[0] + ".annotations.json")
+                 for p in self._clip_paths.values()]
         if self._keep_frames:
-            for p in self._clip_paths.values():
-                if os.path.exists(p):
-                    print(f"[live] keeping processed-frame clip: {p}")
+            for clip, annos in pairs:
+                if os.path.exists(clip):
+                    print(f"[live] keeping processed-frame clip: {clip}"
+                          + (f" (+ {annos})" if os.path.exists(annos) else ""))
+            print("[live] re-render these at other reconcile settings with: "
+                  "python tests/calibration/rerender_from_clips.py "
+                  f"{self.run_id}")
             return
-        for p in self._clip_paths.values():
-            try:
-                if os.path.exists(p):
-                    os.remove(p)
-            except OSError as e:
-                print(f"[live] could not remove {p}: {e}")
+        for clip, annos in pairs:
+            for p in (clip, annos):
+                try:
+                    if os.path.exists(p):
+                        os.remove(p)
+                except OSError as e:
+                    print(f"[live] could not remove {p}: {e}")
 
     # ---- metrics -----------------------------------------------------------
     def _track_peaks(self):
