@@ -29,18 +29,49 @@ import time
 class BatchScheduler(threading.Thread):
     def __init__(self, slots, inference_queue, stop_event,
                  max_batch_size=1, t_batch_ms=15, max_frame_staleness_ms=100,
-                 cycle_sleep_ms=2):
+                 cycle_sleep_ms=2, staleness_periods=0.0):
         super().__init__(name="scheduler", daemon=True)
         self.slots = slots                      # {cam: NewestSlot}
         self.inference_queue = inference_queue  # DropOldestQueue of batches (list[Frame])
         self.stop_event = stop_event
         self.max_batch_size = max(1, int(max_batch_size))
+        # #48: a single absolute staleness bound is a DIFFERENT rule per camera --
+        # 100ms is 2.5 frame periods at 25 fps but only 1.5 at 15 fps, so the slow
+        # camera's frames are judged stale sooner in relative terms, which is
+        # backwards (it has fewer frames to spare). When staleness_periods > 0 the
+        # bound is computed per camera from its observed rate instead, so every
+        # camera gets the same allowance measured in ITS OWN frames.
+        self.staleness_periods = max(0.0, float(staleness_periods or 0.0))
+        self._cam_fps = {}          # {cam: measured fps}, fed by set_camera_fps
         self.t_batch = float(t_batch_ms) / 1000.0
         self.max_staleness = float(max_frame_staleness_ms) / 1000.0
         self.cycle_sleep = float(cycle_sleep_ms) / 1000.0
         self.dispatched_batches = 0
         self.dispatched_frames = 0
         self.stale_skipped = 0
+
+    def set_camera_fps(self, cam, fps):
+        """#48: tell the scheduler a camera's measured rate so the staleness bound
+        can be expressed in that camera's own frame periods."""
+        try:
+            fps = float(fps)
+        except (TypeError, ValueError):
+            return
+        if fps > 0:
+            self._cam_fps[cam] = fps
+
+    def _stale_ms(self, cam):
+        """Staleness bound for THIS camera, in ms.
+
+        Falls back to the absolute bound whenever periods are not configured or the
+        camera's rate is not known yet -- so behaviour is unchanged until both are
+        true, and a camera that never reports a rate is never treated differently.
+        """
+        if self.staleness_periods > 0:
+            fps = self._cam_fps.get(cam)
+            if fps:
+                return 1000.0 * self.staleness_periods / fps
+        return self.max_staleness * 1000.0
 
     failed = None
 
@@ -65,7 +96,7 @@ class BatchScheduler(threading.Thread):
                         if frame is None:
                             continue
                         got_any = True
-                        if frame.age_ms(time.time()) > self.max_staleness * 1000.0:
+                        if frame.age_ms(time.time()) > self._stale_ms(cam):
                             self.stale_skipped += 1     # too old -> skip, don't process late
                             continue
                         batch.append(frame)

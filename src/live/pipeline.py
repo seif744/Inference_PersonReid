@@ -95,6 +95,14 @@ class _QuietOnBrokenPipe:
         return getattr(self._stream, name)
 
 
+class _NoFps:
+    """Stand-in so the per-camera rate still reaches the scheduler when a camera
+    has no embedder (ReID disabled)."""
+
+    def set_fps(self, fps):
+        pass
+
+
 class LivePipeline:
     def __init__(self, sources, cfg):
         self.sources = sources            # [(cam_name, url_or_path), ...]  any N
@@ -268,6 +276,7 @@ class LivePipeline:
                 quality=reid_cfg.get("quality"),
                 max_embeddings_per_track=reid_cfg.get("max_embeddings_per_track", 0),
                 warmup_embeddings=reid_cfg.get("warmup_embeddings", 3),
+                warmup_spacing=reid_cfg.get("warmup_spacing", 3),
                 # #47: when set, every camera embeds at the same rate in TIME
                 # instead of the same number of FRAMES.
                 interval_sec=reid_cfg.get("interval_sec", 0.0),
@@ -358,7 +367,14 @@ class LivePipeline:
             slots, inference_queue, self.stop_event,
             max_batch_size=bs,
             t_batch_ms=float(self._g("inference", "t_batch_ms", 15)),
+            # #48: an absolute 100ms is 2.5 frame periods at 25 fps but only 1.5 at
+            # 15 fps, so the same number is a different rule per camera -- the slow
+            # camera's frames are called stale sooner in relative terms, which is
+            # backwards. `max_frame_staleness_periods` expresses it in frame periods
+            # and is converted per camera from the nominal rate.
             max_frame_staleness_ms=float(self._g("capture", "max_frame_staleness_ms", 100)),
+            staleness_periods=float(self._g("capture",
+                                            "max_frame_staleness_periods", 0) or 0),
         )
         inference = InferenceStage(detectors, embedders, inference_queue,
                                    identity_queue, self.stop_event,
@@ -551,6 +567,15 @@ class LivePipeline:
                                             resolve_covisibility,
                                             resolve_same_camera_thresholds)
             # reuse the file path's render + summary helpers (unchanged).
+            # #60: this used to be a bare `from main import ...`, which only
+            # resolves when the process was started from the project root. Run the
+            # pipeline from anywhere else and finalization raised ImportError AFTER
+            # the cameras had stopped -- the run's whole output, lost to a path.
+            # Put the project root on sys.path first, derived from this file.
+            _root = os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__))))
+            if _root not in sys.path:
+                sys.path.insert(0, _root)
             from main import render_final_videos, print_run_summary
         except Exception as e:
             print(f"[live] could not load the offline reconcile helpers ({e}); "
@@ -700,15 +725,20 @@ class LivePipeline:
         CAMERA. Without this the config key exists but has nothing to convert with,
         and the frame-count interval silently stays in force."""
         embedders = (self._m or {}).get("embedders") or {}
-        if not embedders or elapsed <= 0:
+        if elapsed <= 0:
             return
         for capt in self.captures:
             emb = embedders.get(capt.cam)
             if emb is None or not hasattr(emb, "set_fps"):
-                continue
+                emb = _NoFps()
             fps = capt.frame_index / elapsed
             if fps > 0:
                 emb.set_fps(fps)
+                # #48: the scheduler needs it too, so staleness can be expressed in
+                # each camera's own frame periods rather than one absolute ms bound.
+                sched = (self._m or {}).get("scheduler")
+                if sched is not None and hasattr(sched, "set_camera_fps"):
+                    sched.set_camera_fps(capt.cam, fps)
 
     def _track_peaks(self):
         m = self._m

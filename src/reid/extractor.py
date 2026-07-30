@@ -61,6 +61,7 @@ DIRECTION does.
 ============================================================================
 """
 
+import threading
 from typing import List, Optional
 
 import cv2
@@ -110,6 +111,14 @@ class ReIDExtractor:
                   tests/calibration/verify_embedding_contract.py. 0 = unbounded.
         """
         self.max_batch = max(0, int(max_batch))
+        # #50: the ONE thing that genuinely needs serialising across cameras is the
+        # shared model's forward pass. The lock used to live in InferenceStage and
+        # wrapped the whole of TrackEmbedder.process -- cropping, a float64
+        # Laplacian blur check, an O(N^2) occlusion loop and all preprocessing --
+        # so four cameras serialised on work that has nothing to do with the shared
+        # model, contradicting that lock's own docstring. Owning it here keeps the
+        # critical section to exactly the shared resource.
+        self._fwd_lock = threading.Lock()
         self.tap = str(tap or "post_relu")
         self._tap_warned = False
         self.device = torch.device(
@@ -206,7 +215,8 @@ class ReIDExtractor:
         batch = torch.stack([self._preprocess(c) for c in crops])
         batch = batch.to(self.device)
 
-        features = self._forward_tapped(batch)            # (N, 512), raw features
+        with self._fwd_lock:                              # #50: shared model only
+            features = self._forward_tapped(batch)        # (N, 512), raw features
 
         # L2-normalize along the feature dim. eps guards the degenerate case of
         # an all-zero feature (never seen in practice) from producing NaNs.

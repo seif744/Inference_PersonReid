@@ -212,6 +212,13 @@ reid:
   interval_sec: 0.4
   ttl: 300                   # forget a track from the cache after N unseen frames
   warmup_embeddings: 3       # embed the first N successful observations of a new track
+  # #52: frames to leave BETWEEN those warmup embeddings. They used to be taken on
+  # CONSECUTIVE frames -- near-identical crops of one instant, so a "3-view"
+  # prototype was really about one view. That hurts exactly the short tracklets
+  # that most need a strong prototype to clear the same-camera bar. 3 frames is
+  # ~0.12s at 25 fps: different enough to be a second look, far below `interval`
+  # so evidence still accrues quickly. 0 restores the back-to-back behaviour.
+  warmup_spacing: 3
   # Cap on how many embeddings ONE track_id contributes over its life (0 = off).
   # A stable track's global id is ALREADY decided once and never re-matched (see
   # identity/service.py: the (camera, track_id) -> global_id cache), so occlusion
@@ -579,6 +586,13 @@ live:
     reconnect_base_delay: 1
     reconnect_max_delay: 30
     max_frame_staleness_ms: 100   # scheduler skips frames older than this
+    # #48: when > 0 this WINS, expressing staleness in each camera's own FRAME
+    # PERIODS instead of one absolute bound. 100ms is 2.5 frame periods at 25 fps
+    # but only 1.5 at 15 fps -- the same number is a different rule per camera, and
+    # it is strictest on the camera with the fewest frames to spare, which is
+    # backwards. 2.5 periods keeps today's behaviour for the 25 fps cameras and
+    # gives cam_224 the same relative allowance. 0 = absolute bound only.
+    max_frame_staleness_periods: 2.5
   inference:
     max_batch_size: 8       # forced to 1 on CPU (device-aware)
     t_batch_ms: 40          # dispatch a batch at max_batch_size OR this timeout.
@@ -586,7 +600,16 @@ live:
                             # frame from EACH camera into one batch so they can be
                             # processed CONCURRENTLY (one worker per camera). Still
                             # well under one frame period; adds negligible latency.
-    max_inference_queue: 2
+    max_inference_queue: 4
+                            # #51: was 2. On a CPU-with-file run the queue was where
+                            # 629 of 637 dropped batches died -- but J.1 measured the
+                            # REAL rate on production hardware at 10 frames in 40s,
+                            # so this was never the production bottleneck it looked
+                            # like. Raised modestly rather than deepened: each slot
+                            # holds a full batch of frames at ~6 MB each, and an
+                            # observed peak depth of 900 would have been ~5.6 GB of
+                            # RAM. 4 absorbs a brief inference stall without letting
+                            # latency grow, which is the whole point of dropping.
                             # NOTE: `max_skip_cycles` used to sit here, documented as a
                             # "scheduler starvation bound". NOTHING in the code ever read
                             # it -- BatchScheduler has no rotation state. Removed rather

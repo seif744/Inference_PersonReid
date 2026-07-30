@@ -42,7 +42,8 @@ from detector import crop_person   # shared "box -> safe crop" primitive
 class TrackEmbedder:
     def __init__(self, extractor, interval=10, interval_sec=0.0, ttl=300,
                  quality=None,
-                 max_embeddings_per_track=0, warmup_embeddings=5):
+                 max_embeddings_per_track=0, warmup_embeddings=5,
+                 warmup_spacing=3):
         """
         extractor : a ReIDExtractor (loaded once, reused).
         interval  : recompute a track's embedding every N PROCESSED frames (>=1).
@@ -98,6 +99,7 @@ class TrackEmbedder:
         self.ttl = ttl
         self.max_per_track = max(0, int(max_embeddings_per_track or 0))
         self.warmup_embeddings = max(1, int(warmup_embeddings or 1))
+        self.warmup_spacing = max(0, int(warmup_spacing or 0))
         quality = quality or {}
         self.quality_enabled = quality.get("enabled", False)
         self.min_crop_width = quality.get("min_width", 24)
@@ -194,9 +196,16 @@ class TrackEmbedder:
             capped = (self.max_per_track > 0 and entry is not None
                       and entry.get("count", 0) >= self.max_per_track)
             warmup = entry is not None and entry.get("count", 0) < self.warmup_embeddings
-            # Warmup deliberately ignores the interval, so a NEW track still gets
-            # its first `warmup_embeddings` vectors back-to-back and the identity
-            # evidence gate (min_evidence_obs) is reached just as fast as before.
+            # #52: warmup used to ignore the interval ENTIRELY, so a new track's
+            # first N embeddings came from CONSECUTIVE frames -- near-identical
+            # crops of one instant, giving roughly ONE effective view. That is
+            # worst for exactly the short tracklets that most need a strong
+            # prototype to clear the same-camera bar. `warmup_spacing` puts a small
+            # gap between them so the warmup samples different moments, while
+            # staying far below the full interval so evidence still accrues fast.
+            if warmup and self.warmup_spacing > 0:
+                warmup = ((self._tick - entry.get("tick", 0))
+                          >= self.warmup_spacing)
             is_due = (entry is None or warmup
                       or (self._tick - entry.get("tick", 0))
                       >= self.effective_interval)

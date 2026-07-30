@@ -38,7 +38,10 @@ class InferenceStage(threading.Thread):
 
         n = max(1, len(detectors))
         self.max_workers = n if not max_workers else min(int(max_workers), n)
-        self._embed_lock = threading.Lock()   # guards the SHARED ReID extractor
+        # #50: kept only so an external caller referencing it still works; the
+        # real serialisation now lives inside ReIDExtractor, around the forward
+        # pass alone. Nothing in this class takes it any more.
+        self._embed_lock = threading.Lock()
         self._pool = None
 
     failed = None
@@ -103,11 +106,15 @@ class InferenceStage(threading.Thread):
         # Separate model instances per camera -> safe to run concurrently.
         detections = detector.track(frame.image)
         if embedder is not None:
-            # The extractor is shared across cameras; serialise its forward pass.
-            with self._embed_lock:
-                embedder.process(frame.image, detections, frame.frame_index)
-                fresh = {d.track_id for d in embedder.last_embedded
-                         if d.track_id is not None}
+            # #50: NO coarse lock here any more. Each camera has its OWN
+            # TrackEmbedder, so crops, the quality gate and preprocessing are
+            # per-camera state and safe to run concurrently. The only shared object
+            # is the extractor's model, and it now serialises its own forward pass
+            # (ReIDExtractor._fwd_lock) -- so cameras overlap on everything except
+            # the few milliseconds that genuinely cannot.
+            embedder.process(frame.image, detections, frame.frame_index)
+            fresh = {d.track_id for d in embedder.last_embedded
+                     if d.track_id is not None}
             frame.meta["fresh_track_ids"] = fresh
         else:
             frame.meta["fresh_track_ids"] = set()
