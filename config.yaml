@@ -212,7 +212,49 @@ identity:
                              # Left at 0.63 after the osnet_ain_x1_0 swap -- see
                              # identity.threshold comment above for why the raise
                              # to 0.68 was reverted.
-    same_camera_threshold: 0.90  # stricter merge for fragmented tracks in one camera
+    same_camera_threshold: 0.90  # stricter merge for fragmented tracks in one camera.
+                                 # GLOBAL DEFAULT -- per_camera below overrides it.
+
+    # PER-CAMERA same-camera bars (REMEDIATION_PLAN.md #40). Only
+    # `same_camera_threshold` is honoured here; any other key is IGNORED with a
+    # warning (see reconcile.resolve_same_camera_thresholds), because `threshold` is
+    # a property of a camera PAIR and the rest are whole-run settings. Camera names
+    # are the runtime names -- stream URLs are auto-named cam_<last-IP-octet>, so
+    # replacing a camera renames it and this block must follow. A name that produces
+    # no tracklets is reported in the reconcile log rather than silently ignored.
+    #
+    # WHY THIS IS NOT ONE GLOBAL NUMBER. Measured on run 20260730_093723 (286
+    # decisions, 4 cameras) with the analyser in tests/calibration: the per-subject
+    # same/different boundaries OVERLAP across cameras -- p95 of the "top different"
+    # score (0.816) is ABOVE p5 of the "worst same" score (0.719) -- so no single
+    # bar separates cleanly. Eligible same-camera partners per subject at 0.90:
+    #
+    #     cam_206: 9.0 (55 subjects,  6 with none)   <- 0.90 works here
+    #     cam_224: 0.5 (17 subjects, 12 with none)
+    #     cam_219: 0.3 ( 6 subjects,  4 with none)
+    #     cam_213: 0.0 (11 subjects, 11 with none)   <- ZERO merges, ever
+    #
+    # A camera with no same-camera merging cannot join one person's front-view and
+    # back-view fragments, so each fragment is absorbed cross-camera into a
+    # DIFFERENT cluster: that is the observed "reid 2 by his front, reid 7 by his
+    # back" in cam_213 and "reid 3 becomes reid 7 at a bad angle" in cam_224.
+    # 37% of all subjects had no eligible partner; the highest score the bar
+    # rejected was 0.899.
+    #
+    # cam_219 is deliberately LEFT at the global 0.90 even though it also orphans
+    # (4 of 6): it has only 7 tracklets, mean 264 observations each, so it has
+    # little fragmentation to repair and changing it would confound this run's
+    # comparison. Move it only after diffing this run against the previous one.
+    #
+    # These two values are a HYPOTHESIS from one run, not a calibration (decision
+    # D9). Change ONE thing, re-run, and diff the analyser's sections 1/2/5:
+    #   python tests/calibration/analyze_decision_log.py logs/reconcile_decisions_<run_id>.jsonl
+    per_camera:
+      cam_213:
+        same_camera_threshold: 0.80   # 11/11 subjects orphaned at 0.90
+      cam_224:
+        same_camera_threshold: 0.80   # 12/17 subjects orphaned at 0.90
+
     min_tracklet_observations: 3  # a real identity needs >= this many observations;
                                    # shorter tracks are detector noise, not people
     require_reciprocal_best: true      # merge a pair only if they are each other's best

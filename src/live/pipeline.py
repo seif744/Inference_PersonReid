@@ -468,7 +468,8 @@ class LivePipeline:
             self._cleanup_clips()
             return
         try:
-            from identity.reconcile import reconcile_tracklets
+            from identity.reconcile import (reconcile_tracklets,
+                                            resolve_same_camera_thresholds)
             # reuse the file path's render + summary helpers (unchanged).
             from main import render_final_videos, print_run_summary
         except Exception as e:
@@ -487,6 +488,10 @@ class LivePipeline:
                 threshold=threshold,
                 run_id=self.run_id,
                 same_camera_threshold=self._recon_cfg.get("same_camera_threshold", 0.90),
+                # Per-camera same-camera bars (#40). Resolved by reconcile's own
+                # helper so this path and main.py's can never disagree.
+                same_camera_thresholds=resolve_same_camera_thresholds(
+                    self._recon_cfg),
                 require_reciprocal_best=self._recon_cfg.get("require_reciprocal_best", True),
                 min_tracklet_observations=self._recon_cfg.get("min_tracklet_observations", 3),
                 **self._decision_log_kwargs(),

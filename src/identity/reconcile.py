@@ -22,7 +22,14 @@ Merging is the most destructive identity error (it fuses two people's histories)
 so this pass is conservative, matching service.py's "prefer a split" bias:
 
   * APPEARANCE GATE: two ids merge only if their prototype cosine >= threshold
-    (default: the same threshold the live service uses).
+    (default: the same threshold the live service uses). The SAME-CAMERA bar is
+    PER-CAMERA (`identity.reconcile.per_camera`), because one number is harmless
+    in one view and total in another: at a global 0.90 cam_213 achieved ZERO
+    same-camera merges across all 11 of its subjects while cam_206 saw 9.0
+    eligible partners per subject. A camera with no same-camera merging cannot
+    join one person's front-view and back-view fragments, so each is absorbed
+    cross-camera into a DIFFERENT cluster -- the "reid 2 becomes reid 7" symptom.
+    See REMEDIATION_PLAN.md J.6 and item #40.
   * PHYSICAL EXCLUSION: two ids are NEVER merged if they are co-present in the
     SAME camera (their tracks overlap in time). One body cannot be two
     simultaneous tracks in one view, so such a pair is provably two people --
@@ -53,6 +60,82 @@ import numpy as np
 
 from identity import decision_log as dlog
 from identity.decision_log import Candidate, DecisionRecord, GateResult
+
+
+# Keys `identity.reconcile.per_camera[<cam>]` is allowed to override. Anything else
+# in that block is IGNORED and warned about rather than silently doing nothing --
+# `threshold` is a property of a camera PAIR, not a camera, and the remaining
+# reconcile keys are whole-run settings. Extend this tuple (and the lookup that
+# reads it) when a second key genuinely becomes per-camera.
+PER_CAMERA_KEYS = ("same_camera_threshold",)
+
+
+def resolve_same_camera_thresholds(recon_cfg, log=print):
+    """`identity.reconcile.per_camera` -> {camera: same_camera_threshold}.
+
+    The one place this merge happens, so the live path and the file-batch path can
+    never drift apart on it -- the same argument as detector.resolve_detector_cfg.
+    Both call sites pass the result to reconcile_tracklets as
+    `same_camera_thresholds`; a camera absent from the result keeps the global
+    `same_camera_threshold`.
+
+    FAIL-SOFT AND LOUD: every malformed entry is skipped with a message and the
+    global value stays in force. A bad threshold config must never be able to cost
+    a run its identities, and must never be able to change merging silently -- an
+    unnoticed `80` where `0.80` was meant would disable same-camera merging for
+    that camera completely, which is exactly the failure this item exists to fix.
+    """
+    per_camera = (recon_cfg or {}).get("per_camera") or {}
+    out = {}
+    if not isinstance(per_camera, dict):
+        log(f"  [reconcile] identity.reconcile.per_camera must be a mapping of "
+            f"camera -> overrides, got {type(per_camera).__name__} -- ignored.")
+        return out
+    for cam, overrides in per_camera.items():
+        if not isinstance(overrides, dict):
+            log(f"  [reconcile] per_camera[{cam!r}] must be a mapping of "
+                f"key -> value, got {type(overrides).__name__} -- ignored.")
+            continue
+        unknown = [k for k in overrides if k not in PER_CAMERA_KEYS]
+        if unknown:
+            log(f"  [reconcile] per_camera[{cam!r}]: {unknown} is NOT honoured "
+                f"per-camera (only {list(PER_CAMERA_KEYS)}) -- ignored, the global "
+                f"value applies.")
+        if "same_camera_threshold" not in overrides:
+            continue
+        raw = overrides["same_camera_threshold"]
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            log(f"  [reconcile] per_camera[{cam!r}].same_camera_threshold={raw!r} "
+                f"is not a number -- ignored, the global value applies.")
+            continue
+        # Prototypes are unit vectors and the shipped embedding is post-ReLU, so a
+        # cosine bar outside [0, 1] is a typo, not a choice.
+        if not 0.0 <= value <= 1.0:
+            log(f"  [reconcile] per_camera[{cam!r}].same_camera_threshold={value} "
+                f"is outside [0, 1] (it is a cosine) -- ignored, the global value "
+                f"applies.")
+            continue
+        out[str(cam)] = value
+    return out
+
+
+def strictest_same_camera_bar(cameras, per_camera, default):
+    """The same-camera bar that applies to a claim about `cameras`.
+
+    One camera -> its own bar. SEVERAL cameras (two clusters that share more than
+    one camera) -> the STRICTEST of them, because merging asserts the same-person
+    claim separately for every shared camera and all of them have to hold. Taking
+    the minimum instead would let a camera calibrated loose (cam_213 at 0.80)
+    launder a merge past a camera calibrated tight (cam_206 at 0.90) -- a false
+    merge in the tight camera, and merging two people is the most destructive
+    identity error, so this stays on reconcile's "prefer a split" side.
+
+    An empty `cameras` cannot make a same-camera claim; callers must not rely on
+    the return value in that case, and it degrades to the global default.
+    """
+    return max((per_camera.get(c, default) for c in cameras), default=default)
 
 
 def _prototype(vectors):
@@ -142,6 +225,7 @@ def _cluster_prototype(members, protos):
 
 def reconcile_tracklets(store, threshold, run_id=None,
                         same_camera_threshold=0.90,
+                        same_camera_thresholds=None,
                         require_reciprocal_best=True,
                         min_tracklet_observations=1, log=print,
                         decision_log=None, top2_margin_threshold=None,
@@ -152,6 +236,19 @@ def reconcile_tracklets(store, threshold, run_id=None,
     It does not trust the existing global_id buckets, because a bad live
     assignment can already contain several people. The tracklet -- one camera's
     view of one track -- is the unit of evidence.
+
+    same_camera_threshold : the GLOBAL same-camera bar, used for any camera with
+        no override.
+    same_camera_thresholds : optional {camera: bar} overrides, normally built by
+        resolve_same_camera_thresholds() from `identity.reconcile.per_camera`.
+        None/{} reproduces the old single-global behaviour exactly.
+
+        Why per-camera: the per-subject same/different boundaries OVERLAP across
+        cameras, so no global value works -- p95 of the "top different" score
+        (0.816) exceeds p5 of the "worst same" score (0.719) on real field data.
+        At 0.90, cam_213 got zero eligible same-camera partners across 11 subjects
+        and cam_224 managed it for 5 of 17, while cam_206 saw 9.0 per subject.
+        See REMEDIATION_PLAN.md J.6.
 
     min_tracklet_observations : a real identity needs sustained observation. A
         tracklet with fewer stored observations than this is treated as detector
@@ -182,6 +279,38 @@ def reconcile_tracklets(store, threshold, run_id=None,
     # Stable, deterministic handles so a replay reproduces them exactly. Provisional
     # handles live in their own namespace (`U-`) and never reach a tally or a frame.
     handles = {k: f"U-{i:04d}" for i, k in enumerate(all_keys)}
+
+    # ---- per-camera same-camera bars -------------------------------------
+    per_cam_bar = {}
+    for cam, raw in (same_camera_thresholds or {}).items():
+        try:
+            per_cam_bar[cam] = float(raw)
+        except (TypeError, ValueError):
+            log(f"  tracklet reconcile: ignoring non-numeric same-camera bar "
+                f"{raw!r} for camera {cam!r}; using the global "
+                f"{same_camera_threshold}")
+
+    def cam_bar(*cameras):
+        """The same-camera bar for one camera, or the strictest over several."""
+        return strictest_same_camera_bar(cameras, per_cam_bar,
+                                        same_camera_threshold)
+
+    # A configured camera that is not in this run is almost always a typo, and a
+    # typo here is invisible in the output -- the camera just keeps the global bar
+    # and stays fragmented. Same reasoning as decision D1: a config that stops
+    # matching the hardware must be VISIBLE, never silent. Stream cameras are
+    # auto-named cam_<last-IP-octet>, so replacing a switch/camera renames them.
+    cameras_present = {k[0] for k in all_keys}
+    absent = sorted(str(c) for c in per_cam_bar if c not in cameras_present)
+    if absent:
+        log(f"  tracklet reconcile: per_camera same-camera bar configured for "
+            f"{absent}, which produced no tracklets in this run -- check the "
+            f"name(s) against {sorted(str(c) for c in cameras_present)}")
+    if per_cam_bar:
+        log("  tracklet reconcile: same-camera bars "
+            + ", ".join(f"{c}={cam_bar(c):.2f}"
+                        for c in sorted(cameras_present, key=str))
+            + f"  (global {same_camera_threshold:.2f}, cross-camera {threshold:.2f})")
 
     def _obs(k):
         return len(tracklets[k]["vectors"])
@@ -294,10 +423,10 @@ def reconcile_tracklets(store, threshold, run_id=None,
                     value=_obs(k), threshold=min_tracklet_observations,
                     passed=False),
                 dlog.ABSOLUTE_THRESHOLD: GateResult(
-                    value=None, threshold=same_camera_threshold, passed=False,
+                    value=None, threshold=cam_bar(k[0]), passed=False,
                     extra={"note": "suppressed before any candidate was scored"}),
                 dlog.TOP2_MARGIN: dlog.compute_top2_margin(
-                    [], same_camera_threshold, basis=top2_margin_basis,
+                    [], cam_bar(k[0]), basis=top2_margin_basis,
                     threshold=top2_margin_threshold)[0],
                 dlog.RECIPROCAL_BEST: _na_gate(),
                 dlog.TEMPORAL_CONFLICT_SAME_CAMERA: _na_gate(),
@@ -319,8 +448,9 @@ def reconcile_tracklets(store, threshold, run_id=None,
         return True
 
     # Phase 1: repair same-camera track fragmentation with a higher threshold.
-    # DECISION LOGIC UNCHANGED: a pair is a merge candidate iff it shares a camera,
-    # its spans are disjoint, and it clears same_camera_threshold.
+    # A pair is a merge candidate iff it shares a camera, its spans are disjoint,
+    # and it clears THAT CAMERA's bar (both tracklets are in the same camera here,
+    # so the bar is unambiguous -- a[0] == b[0]).
     same_pairs = []
     for i, a in enumerate(keys):
         for b in keys[i + 1:]:
@@ -329,7 +459,7 @@ def reconcile_tracklets(store, threshold, run_id=None,
             if not _spans_disjoint(tracklets[a]["span"], tracklets[b]["span"]):
                 continue
             s = float(protos[a] @ protos[b])
-            if s >= same_camera_threshold:
+            if s >= cam_bar(a[0]):
                 same_pairs.append((s, a, b))
     accepted_same = set()
     for s, a, b in sorted(same_pairs, reverse=True):
@@ -348,12 +478,13 @@ def reconcile_tracklets(store, threshold, run_id=None,
             peers = [b for b in keys if b != a and b[0] == a[0]]
             if not peers:
                 continue
+            bar_a = cam_bar(a[0])          # peers are same-camera, so one bar
             scored = []
             for b in peers:
                 score = float(protos[a] @ protos[b])
                 if conflict_reason({a}, {b}) is not None:
                     reason = dlog.TEMPORAL_CONFLICT_SAME_CAMERA
-                elif score < same_camera_threshold:
+                elif score < bar_a:
                     reason = dlog.BELOW_ABSOLUTE_THRESHOLD
                 else:
                     reason = None
@@ -370,7 +501,7 @@ def reconcile_tracklets(store, threshold, run_id=None,
                                              round(float(protos[b] @ protos[best_b[0]]), 6)),
                 ))
             margin_gate, best, _, _ = dlog.compute_top2_margin(
-                cands, same_camera_threshold, basis=top2_margin_basis,
+                cands, bar_a, basis=top2_margin_basis,
                 threshold=top2_margin_threshold)
             partner = None
             if best is not None:
@@ -383,7 +514,7 @@ def reconcile_tracklets(store, threshold, run_id=None,
                     passed=_obs(a) >= min_tracklet_observations),
                 dlog.ABSOLUTE_THRESHOLD: GateResult(
                     value=(None if best is None else best.score),
-                    threshold=same_camera_threshold,
+                    threshold=bar_a,
                     passed=best is not None),
                 dlog.TOP2_MARGIN: margin_gate,
                 dlog.RECIPROCAL_BEST: _na_gate(),
@@ -420,12 +551,17 @@ def reconcile_tracklets(store, threshold, run_id=None,
                 return False
             return any(x[0] != y[0] for x in roots[a] for y in roots[b])
 
+        def shared_cameras(a, b):
+            """Cameras both clusters contain -- non-empty means merging them makes a
+            SAME-CAMERA claim about each of those cameras."""
+            return {k[0] for k in roots[a]} & {k[0] for k in roots[b]}
+
         def pair_threshold(a, b):
             """The bar THIS cluster pair must clear.
 
             Phase 1 deliberately repairs same-camera fragmentation at the strict
-            `same_camera_threshold`, because "these two tracks in ONE camera are
-            the same person" is a much easier claim to get wrong than a genuine
+            same-camera bar, because "these two tracks in ONE camera are the same
+            person" is a much easier claim to get wrong than a genuine
             cross-camera link (same lighting, same pose distribution, so unrelated
             people score higher). Phase 2 used to apply the LOW cross-camera
             `threshold` to every mergeable pair, which quietly threw that bar away:
@@ -438,10 +574,22 @@ def reconcile_tracklets(store, threshold, run_id=None,
             camera's fragments are one person -- exactly Phase 1's claim -- and it
             must clear the same-camera bar. Only genuinely camera-disjoint clusters
             get the lower cross-camera bar.
+
+            With PER-CAMERA bars a cluster pair can share several cameras, each with
+            its own bar; strictest_same_camera_bar() resolves that (and says why).
+
+            NOTE the pre-existing defect this inherits unchanged (plan item #27):
+            `roots` is the snapshot taken at the start of the round, and `union`
+            updates `members`, not `roots`, so a pair merged earlier in THIS round
+            is judged on its stale camera set. Per-camera bars do not widen that
+            hole -- the worst case is still "a bar lower than the one that should
+            apply" -- but fixing #27 becomes more valuable now that the applicable
+            bar varies by camera.
             """
-            cams_a = {k[0] for k in roots[a]}
-            cams_b = {k[0] for k in roots[b]}
-            return same_camera_threshold if (cams_a & cams_b) else threshold
+            shared = shared_cameras(a, b)
+            if not shared:
+                return threshold
+            return cam_bar(*shared)
 
         root_scores = {}
         for i, a in enumerate(root_keys):
@@ -483,10 +631,14 @@ def reconcile_tracklets(store, threshold, run_id=None,
             if ra == rb:
                 continue
             bar = pair_threshold(a, b)
-            # Name the lane by the bar actually applied. The old message called
-            # every Phase 2 merge "cross-camera" even when both printed root keys
-            # were the same camera, which made the log actively misleading.
-            lane = "same-camera" if bar == same_camera_threshold else "cross-camera"
+            # Name the lane by the CLAIM being made, not by comparing the bar to a
+            # number: with per-camera bars one camera's same-camera bar can equal
+            # the cross-camera threshold, and then a bar comparison mislabels the
+            # lane. (The old message called every Phase 2 merge "cross-camera" even
+            # when both printed root keys were the same camera, which made the log
+            # actively misleading -- this keeps that fix while staying correct
+            # under per-camera bars.)
+            lane = "same-camera" if shared_cameras(a, b) else "cross-camera"
             if union(ra, rb):
                 log(f"  tracklet reconcile: {lane} cluster merge {a} + {b} "
                     f"(cosine {s:.3f} >= {bar:.2f})")
@@ -554,7 +706,11 @@ def reconcile_tracklets(store, threshold, run_id=None,
                         recip_passed = (best_partner.get(a) == bkey
                                         and best_partner.get(bkey) == a)
                 cams_a, obs_a = _cluster_meta(roots[a])
-                ctx = ("same_camera" if subj_bar == same_camera_threshold
+                # Which lane this subject's best candidate sits in -- derived from
+                # the shared-camera claim, not from a bar comparison, for the same
+                # reason as `lane` above.
+                ctx = ("same_camera"
+                       if (best_t is not None and shared_cameras(a, best_t[0]))
                        else "cross_camera")
                 _emit(cluster_handle[a], "cross_camera", round_index, roots[a],
                       cands, {

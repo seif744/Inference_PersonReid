@@ -96,11 +96,18 @@ def main():
     header("1. WHERE DOES THE THRESHOLD CUT?  (same-camera phase)")
     print("  For each subject: the highest score the bar REJECTED, and that subject's")
     print("  own natural same/different boundary (its widest score gap).\n")
-    rejected_high, gap_lo, gap_hi, thr_seen = [], [], [], set()
+    # `gap_thr` records, per bimodal subject, the bar THAT SUBJECT actually faced.
+    # Since #40 the bar is per-camera, so a run carries several. Judging every
+    # threshold against every subject would blame 0.80 for subjects in a camera
+    # that never used it. On a single-threshold log this changes nothing.
+    rejected_high, gap_lo, gap_hi, gap_thr = [], [], [], []
+    thr_seen, cams_by_thr = set(), defaultdict(set)
     for r in p1:
         thr = r["gate_detail"]["ABSOLUTE_THRESHOLD"]["threshold"]
         if thr is not None:
             thr_seen.add(thr)
+            for cam in r["cameras"]:
+                cams_by_thr[thr].add(cam)
         below = [c["score"] for c in r["candidates"]
                  if c["excluded_by"] == "BELOW_ABSOLUTE_THRESHOLD"]
         if below:
@@ -109,8 +116,12 @@ def main():
         if g and g[0] > 0.05:          # only trust a clearly bimodal subject
             gap_lo.append(g[1])
             gap_hi.append(g[2])
+            gap_thr.append(thr)
 
     print(f"  configured same_camera_threshold: {sorted(thr_seen)}")
+    if len(thr_seen) > 1:
+        for t in sorted(thr_seen):
+            print(f"    {t:.2f}: {sorted(cams_by_thr[t])}")
     if rejected_high:
         a = np.array(rejected_high)
         print(f"\n  highest score REJECTED by the bar, per subject (n={len(a)}):")
@@ -148,9 +159,12 @@ def main():
             print(f"       Check section 5 -- if eligible-set size differs sharply by")
             print(f"       camera, the threshold should be PER-CAMERA, not global.")
         for t in sorted(thr_seen):
-            above = sum(1 for x in hi if t > x)
+            # Only subjects that FACED this bar -- see the note where gap_thr is built.
+            own = [x for x, ts in zip(gap_hi, gap_thr) if ts == t]
+            above = sum(1 for x in own if t > x)
+            where = (f" in {sorted(cams_by_thr[t])}" if len(thr_seen) > 1 else "")
             print(f"    configured {t:.2f} sits above the same-person cluster on "
-                  f"{above}/{len(hi)} subjects ({pct(above, len(hi))}) "
+                  f"{above}/{len(own)} subjects ({pct(above, len(own))}){where} "
                   f"-- those lose genuine merges")
 
     # ---------------------------------------------------------------- 2

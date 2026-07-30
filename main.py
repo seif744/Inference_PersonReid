@@ -886,7 +886,8 @@ def _finalize_run(threads, stop_event, shared, jobs, cfg, disp_cfg, id_cfg,
     # populated, merge global ids that are the same person across cameras.
     recon_cfg = id_cfg.get("reconcile", {}) if id_cfg else {}
     if identity is not None and recon_cfg.get("enabled"):
-        from identity.reconcile import reconcile_tracklets
+        from identity.reconcile import (reconcile_tracklets,
+                                        resolve_same_camera_thresholds)
         threshold = recon_cfg.get("threshold")
         if threshold is None:
             threshold = id_cfg.get("threshold", 0.85)
@@ -897,6 +898,9 @@ def _finalize_run(threads, stop_event, shared, jobs, cfg, disp_cfg, id_cfg,
             threshold=threshold,
             run_id=run_id,
             same_camera_threshold=recon_cfg.get("same_camera_threshold", 0.90),
+            # Per-camera same-camera bars (#40), resolved by reconcile's own helper
+            # so this path and the live pipeline's can never disagree.
+            same_camera_thresholds=resolve_same_camera_thresholds(recon_cfg),
             require_reciprocal_best=recon_cfg.get("require_reciprocal_best", True),
             min_tracklet_observations=recon_cfg.get("min_tracklet_observations", 1),
         )
