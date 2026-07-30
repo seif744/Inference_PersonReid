@@ -24,6 +24,31 @@ source:
   # A run uses the live pipeline when run.mode is `live`, or when run.mode is
   # `auto` and ANY source is a URL. File inputs use the file-batch flow.
 
+  # RTSP transport + timeouts (REMEDIATION_PLAN.md #28/#29). Applied once at
+  # startup by video_source.rtsp_options_from_config, before any capture is
+  # opened -- FFmpeg reads its options at open time, so it cannot be set later.
+  rtsp:
+    # tcp retransmits lost packets; FFmpeg's default (UDP) does not, and a lost
+    # packet in H.265 costs a reference frame, whose smeared successors feed both
+    # the detector AND the ReID crop -- poisoning a tracklet prototype at random.
+    # HONEST SCOPE: J.4 measured ZERO decode errors across four live streams on
+    # this network, so this is a sound default, NOT a fix for anything observed
+    # here. The broken references (294/682, 207/1573) were in recorded files.
+    transport: tcp            # tcp | udp | "" to leave it to FFmpeg
+    # THIS is the one that has bitten. With no socket timeout cap.read() can block
+    # forever, and a capture thread cannot re-check stop_event while blocked
+    # inside it -- so one wedged camera makes Ctrl-C unable to stop that thread,
+    # and the interrupt that should reach reconcile never arrives. A timeout turns
+    # an indefinite block into a failed read, which the reconnect path already
+    # handles. Milliseconds here; converted to FFmpeg's microseconds internally.
+    open_timeout_ms: 5000
+    read_timeout_ms: 5000
+    # Override the generated FFmpeg option string verbatim, for a build that wants
+    # different keys (the RTSP timeout option was renamed; both `timeout` and
+    # `stimeout` are sent by default because builds disagree). Leave unset
+    # normally. Set every value above to ""/0 to restore FFmpeg's own defaults.
+    # ffmpeg_options: "rtsp_transport;tcp|timeout;5000000"
+
 detector:
   model: yolo11m.pt          # auto-downloaded on first run (already committed to the
                              # deploy rsync, so the GPU box needs no network).

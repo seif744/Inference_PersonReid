@@ -643,6 +643,12 @@ def main():
     args = parse_args()
     load_dotenv()          # pull secrets (QDRANT_API_KEY, ...) from untracked .env
     cfg = load_config()
+    # RTSP transport + socket timeouts, BEFORE anything opens a capture: FFmpeg
+    # reads its options at open time, so this cannot be done later. Applies to both
+    # the live pipeline and the file-batch flow, since both open through
+    # VideoSource. Files ignore it. See source.rtsp and plan #28/#29.
+    from video_source import rtsp_options_from_config
+    rtsp_options_from_config(cfg)
     det_cfg = cfg["detector"]
     trk_cfg = cfg["tracker"]
     crop_cfg = cfg["crops"]
