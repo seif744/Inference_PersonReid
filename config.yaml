@@ -228,13 +228,29 @@ identity:
   # which the sticky live decision cannot catch.
   reconcile:
     enabled: true
-    threshold: 0.63          # prototype cosine to merge cross-camera; blank = use
+    threshold: 0.70          # prototype cosine to merge cross-camera; blank = use
                              # identity.threshold. Set explicitly here because this
                              # runs independently of the verifier (see verifier.py) --
                              # it must be recalibrated whenever identity.threshold is.
-                             # Left at 0.63 after the osnet_ain_x1_0 swap -- see
-                             # identity.threshold comment above for why the raise
-                             # to 0.68 was reverted.
+                             #
+                             # RAISED 0.63 -> 0.70 on 2026-07-30, the first time
+                             # this value has ever been calibrated (plan #41).
+                             # Measured by the offline sweep on run
+                             # 20260730_111232: at 0.63 two accepted cross-camera
+                             # merges sat BELOW the measured different-person
+                             # ceiling of 0.661 (0.639 and 0.659), and clusters
+                             # grow by union, so two weak links in a row fuse
+                             # three strangers. At 0.70 that count is 0 while
+                             # identities spanning >1 camera are UNCHANGED -- the
+                             # only free move in the whole sweep.
+                             #
+                             # 0.75 is the open question. It additionally cleans
+                             # reid 10 (a 0.724 link) but SPLITS a 10-tracklet
+                             # cam_213+cam_219 cluster and drops cross-camera
+                             # identities 12 -> 8. Whether that cluster is one
+                             # person is unresolved; do not go to 0.75 until it is.
+                             # Above that it collapses: 0.85 leaves ONE identity
+                             # spanning cameras, which breaks the product claim.
     same_camera_threshold: 0.90  # stricter merge for fragmented tracks in one camera.
                                  # GLOBAL DEFAULT -- per_camera below overrides it.
 
@@ -272,11 +288,36 @@ identity:
     # These two values are a HYPOTHESIS from one run, not a calibration (decision
     # D9). Change ONE thing, re-run, and diff the analyser's sections 1/2/5:
     #   python tests/calibration/analyze_decision_log.py logs/reconcile_decisions_<run_id>.jsonl
+    # MEASURED on run 20260730_111232 with
+    # tests/calibration/sweep_reconcile_thresholds.py, which re-clusters a
+    # finished run's stored observations offline -- so both values below were
+    # chosen from real data, not from one live run each.
     per_camera:
       cam_213:
-        same_camera_threshold: 0.80   # 11/11 subjects orphaned at 0.90
-      cam_224:
-        same_camera_threshold: 0.80   # 12/17 subjects orphaned at 0.90
+        same_camera_threshold: 0.80
+        # KEPT at 0.80. The operator's front/back complaint in this camera is
+        # tracklets 46+51, which merge at 0.815 -- at 0.85 they split again and
+        # the symptom returns. None of the three confirmed false merges (reid 5,
+        # 6, 10) involved a cam_213 same-camera merge.
+      # cam_224 WAS 0.80 here and is deliberately NOT any more.
+      #
+      # It caused two of the three false merges the operator saw:
+      #   reid 6  <- cam_224 58+112 @ 0.823 and 58+120 @ 0.872
+      #   reid 5  <- cam_224 26+110 @ 0.845
+      # Raising it back to the global 0.90 removes exactly those tracklets and
+      # nothing else; 0.87 is NOT enough (it keeps 120 via the 0.872 merge).
+      #
+      # Why the J.6 evidence for 0.80 stopped applying: it was measured when
+      # cam_224 and cam_213 were fed by yolo11n. With yolo11m, cam_213 went from
+      # 85 observations to 1400 (mean 7.7 -> 28.6 per tracklet). Prototypes built
+      # from ~7 crops are noisy, which is WHY nothing cleared 0.90 back then. The
+      # detector change fixed the cause; the lowered bar then became pure risk.
+      # Tightening it also RAISED identities spanning >1 camera (9 -> 12), because
+      # over-merged same-camera clusters had been swallowing tracklets that should
+      # have formed their own cross-camera identity.
+      #
+      # Do not re-add cam_224 here without re-running the sweep -- and if the
+      # detector changes again, re-derive BOTH cameras.
 
     min_tracklet_observations: 3  # a real identity needs >= this many observations;
                                    # shorter tracks are detector noise, not people
