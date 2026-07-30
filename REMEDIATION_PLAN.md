@@ -96,7 +96,9 @@ These were measured and rejected. Do not revisit without new evidence.
 | `same_camera_threshold` → 0.85 **as a decision** | Evidence was n=6 fragment pairs, one camera, one clip. Stays **0.90** until the Phase 9 sweep | measured, weak sample |
 | `cross_camera_threshold` | No cross-camera data exists yet. Untouched until Phase 9 | — |
 | Deepening `max_inference_queue` | 6 MB/frame; observed peak depth 900 ≈ 5.6 GB RAM | measured |
-| Frame-drop → fragmentation fixes, unvalidated | Dropping 2 of 3 frames produced **no extra fragmentation** on available clips. The effect is real on production footage (35 tracklets → 7 identities in a prior run) but cannot be validated against footage that does not reproduce it | measured |
+| Frame-drop → fragmentation fixes | **CONFIRMED DEAD on production hardware (J.1):** real drop rate is 0.5–6.5%, not the 85–99% measured on CPU-with-file. Phase 11 solves a problem that does not exist at this crowd size | measured, field |
+| `TOP2_MARGIN` as a **gate** | Accepted and rejected margin distributions are near-identical on 163 real decisions (median 0.0224 vs 0.0186, p5 0.0017 vs 0.0016). A gate would be near-random. Compute and log it; never enforce it. See J.6 | measured, field |
+| A **global** `same_camera_threshold` of any value | The per-subject boundaries overlap across cameras (J.6): p95 of "top different" = 0.816 exceeds p5 of "worst same" = 0.719. No single number works. Must be per-camera | measured, field |
 
 ---
 
@@ -173,6 +175,19 @@ acceptance criteria 3, 4, 6 and 9.
   decision, but it still counted as a disagreement — a single-camera run reported
   **100%**. Now `None` in that case, with `no_selectable_candidate` reported
   separately, so the band interpretation stays meaningful.
+
+**Also landed:** `tests/calibration/analyze_decision_log.py` — reads a decision JSONL
+and answers the Phase 9 questions (where the bar cuts, orphan count, near-tie
+classification, reciprocity breakdown, per-camera eligible-set size, cross-camera
+merges vs the stranger ceiling). It produced J.6 on its first real run.
+
+And `tests/live/test_shutdown_reaches_reconcile.py` — 14 checks pinning the J.5 fix.
+
+**Four self-caught errors so far**, all found by building the instrumentation rather
+than by reasoning: the two Part H methodology bugs, `MIN_OBSERVATIONS` being
+unfailable, `runner_up_differs` counting non-decisions, and the analyser printing an
+inverted "clean band". Assume more remain; prefer the *direction* of a comparison over
+its magnitude.
 
 **Still open in Phase 1:** item 1 is partial (terminal states recorded; the
 `Candidate` / `merged Candidate` distinction is implicit in `phase` + `merged_from`),
@@ -299,11 +314,13 @@ pushes same-person scores toward the stranger band.
 
 | # | Item |
 |---|---|
-| 40 | `same_camera_threshold` — sweep 0.75–0.95 |
-| 41 | `cross_camera_threshold` — currently uncalibrated. With impossible competitors removed by Phase 7, a real match may win at a *higher* bar. A prediction to test, not a change to make |
-| 42 | `min_tracklet_observations` — interacts with #33 |
-| 43 | `TOP2_MARGIN` — four questions: does it reject anything reciprocal-best doesn't; disagreement rate vs the 10% bar; raw vs normalised margin; which `basis` |
-| 44 | Consensus vs `max(proto, exemplar)` scoring — consensus gave the **lowest different-person ceiling** of the three modes at both sample sizes (see corrected H.2/H.3), which is the property that matters for false merges |
+| 40 | **`same_camera_threshold` must become PER-CAMERA — it does not exist today.** Field data (J.6) shows 0.90 yields 9.0 eligible partners per subject in cam_206 but **0.0** in cam_213 and 0.5 in cam_224. No global value works: the per-subject boundaries overlap. Start cam_213 and cam_224 at ~0.80, leave cam_206 at 0.90. **This is now the highest-value change in the plan** — it is the direct cause of the observed "reid 2 becomes reid 7" |
+| 41 | `cross_camera_threshold` — still uncalibrated. Do this only AFTER #40, since fewer orphans means fewer spurious competitors and the picture will change |
+| 42 | `min_tracklet_observations` — LOW priority: only 8/97 tracklets and 0.3% of observations suppressed (J.6) |
+| 43 | ~~`TOP2_MARGIN` sweep~~ — **ANSWERED, see Part A.** Accepted and rejected margin distributions are near-identical (median 0.0224 vs 0.0186), so it carries no information. Keep `threshold: null` |
+| 44 | `RECIPROCAL_BEST` — rejects 31% of decisions at up to 0.905 (J.6). Re-examine only after #40 |
+| 45 | Consensus vs `max(proto, exemplar)` scoring — consensus gave the **lowest different-person ceiling** of the three modes at both sample sizes (corrected H.2/H.3). Also the candidate fix for the front/back blurring in #34a |
+| 45a | **Reconcile compares prototype MEANS, which blurs front/back into a vector matching neither view.** The live engine's `_bank_score` documents avoiding exactly this with `max(prototype, best_exemplar)`; reconcile never got that fix. This is the structural cause behind cam_213's front/back split — #40 treats the symptom, this treats the cause |
 
 **A high `TOP2_MARGIN` failure rate is a diagnostic, not evidence of under-merging.** The
 discriminator is `pair_similarity_to_best`:
@@ -751,7 +768,67 @@ report-raises, dead-stdout, and both-at-once cases plus the ordering invariant.
 last run succeeded. Those files are only overwritten by a completed render, so stale
 outputs from an earlier run look like success. Check their mtime against the `run_id`.
 
-### J.6 Confirmed as expected
+### J.6 Decision-log analysis — the per-camera finding that reframes Phase 9
+
+Full analysis of `logs/reconcile_decisions_20260730_093723.jsonl` (286 decisions) via
+`tests/calibration/analyze_decision_log.py`. **Operator ground truth, max concurrent
+per camera:** cam_206 ≈ 6, cam_224 ≈ 5, cam_219 ≈ 4, cam_213 ≈ 3, with people
+continuously entering and leaving, so total distinct people over the 4.5-minute run
+is higher than any single maximum — plausibly 8–15.
+
+Against that, **17 identities is roughly plausible in aggregate**, not obviously
+broken. But the specific mis-assignments the operator observed are real regardless of
+the count, and the analysis explains them exactly.
+
+**`same_camera_threshold` is a PER-CAMERA problem. A global value cannot work.**
+
+| Camera | subjects | eligible/subject @0.90 | zero eligible |
+|---|---|---|---|
+| cam_206 | 55 | **9.0** (max 21) | 6 |
+| cam_213 | 11 | **0.0** (max 0) | **11 / 11** |
+| cam_219 | 6 | 0.3 | 4 / 6 |
+| cam_224 | 17 | 0.5 (max 2) | **12 / 17** |
+
+At 0.90, **cam_213 achieves zero same-camera merges out of eleven subjects**, and
+cam_224 manages it for only 5 of 17 — while in cam_206 every fragment sees nine
+partners above the bar. The same value is harmless in one camera and total in another.
+The analyser confirms no global bar exists: p95 of the "top different" score (0.816)
+**exceeds** p5 of the "worst same" score (0.719), so the per-subject boundaries
+overlap. Median boundary sits between 0.721 and 0.856.
+
+Supporting: **50.6%** of subjects lost a candidate above 0.85, 34.5% above 0.88,
+highest rejected 0.899. **Orphans — subjects with no eligible same-camera partner —
+are 33/89 (37%)**, ten with a best candidate above 0.85.
+
+This maps directly onto the observed symptoms: cam_213's "correct by his front, reid 7
+by his back" is a camera with *no* same-camera merging, so front and back fragments
+can never join and each is absorbed cross-camera separately. cam_224's "reid 3 becomes
+reid 7 at a bad angle" is the same, with 12 of 17 orphaned. cam_206's 26-tracklet
+identity is fragmentation that *self-heals* because its scores clear 0.90.
+
+**`TOP2_MARGIN` must NOT gate — it carries no information.**
+
+```
+margins on accepted merges: median=0.0224  p5=0.0017  p95=0.1181
+margins on rejected merges: median=0.0186  p5=0.0016  p95=0.0779
+```
+
+Near-identical distributions, so a gate on it would be close to random. Note this
+supersedes an earlier read of mine: from two records I claimed fragmentation dominates
+near-ties; at scale it is 55 fragmentation vs **65 genuine ambiguity**, roughly
+balanced. The conclusion holds for a better reason than the one I first gave.
+Disagreement between the two margin definitions: **63.9%**.
+
+**`RECIPROCAL_BEST` rejects 31% of decisions**, all cross-camera, at mean 0.720 and
+**max 0.905**. Rejecting a 0.905 cross-camera match is very likely rejecting a real
+person. Concentrated in cam_206 (40) and cam_224 (35).
+
+**Cross-camera merges:** 52 accepted, min 0.639, **4 below the 0.66 stranger ceiling**
+and 10 below 0.70. Those four are the false-merge candidates worth eyeballing.
+
+**Suppression is cheap here:** 8 of 97 tracklets, 0.3% of observations.
+
+### J.7 Confirmed as expected
 
 `written=0` on every camera (#63, cosmetic). Software H.265 decode for all four streams
 and still keeping pace (#53). The store held **4157 points before this run**, and
