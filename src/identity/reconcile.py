@@ -388,7 +388,8 @@ def reconcile_tracklets(store, threshold, run_id=None,
                         scoring=PROTOTYPE, consensus_top_frac=0.25,
                         max_observations_per_side=64,
                         covisibility=None,
-                        same_camera_reciprocal_best=False):
+                        same_camera_reciprocal_best=False,
+                        quality_out=None):
     """
     Rebuild global ids from camera-local tracklets.
 
@@ -519,17 +520,19 @@ def reconcile_tracklets(store, threshold, run_id=None,
         _record_outcome(k, dlog.SUPPRESSED)
 
     keys = [k for k in all_keys if k not in set(suppressed)]
-    if len(keys) < 2:
-        # KNOWN DEFECT (REMEDIATION_PLAN.md #25): returning here stamps NO identity
-        # on the surviving tracklet, so the whole video renders as a bare
-        # "ID <track_id>". Left in place for Phase 1 (instrumentation only) but now
-        # VISIBLE in the log instead of silent.
-        for k in keys:
-            _record_outcome(k, dlog.EXPIRED_UNRESOLVED)
-        if dl is not None and keys:
-            log(f"  tracklet reconcile: only {len(keys)} tracklet(s) survived -> "
-                f"returning with NO identities assigned (known defect #25)")
+    # #25 FIXED. This used to `return {}` whenever fewer than two tracklets
+    # survived, which stamped NO identity on the survivor -- so a sparse camera
+    # rendered its whole video as a bare "ID <track_id>" with no reid at all.
+    # There is nothing to MERGE with one tracklet, but there is still an identity
+    # to ASSIGN, and the code below already handles a single-member cluster
+    # correctly: no pair clears any bar, one root survives, and it gets a gid.
+    if not keys:
+        log("  tracklet reconcile: no tracklets survived suppression -> "
+            "nothing to reconcile")
         return {}
+    if len(keys) == 1:
+        log(f"  tracklet reconcile: only 1 tracklet survived -> assigning it an "
+            f"identity (nothing to merge with)")
 
     protos = {k: _prototype(tracklets[k]["vectors"]) for k in keys}
     keys = [k for k in keys if protos[k] is not None]
@@ -837,10 +840,26 @@ def reconcile_tracklets(store, threshold, run_id=None,
                 return False
             return any(x[0] != y[0] for x in roots[a] for y in roots[b])
 
+        def live_members(x):
+            """The cluster x belongs to RIGHT NOW (post any merge already made this
+            round), as opposed to `roots[x]`, the snapshot taken when the round
+            started."""
+            return members.get(find(x), roots.get(x, {x}))
+
         def shared_cameras(a, b):
-            """Cameras both clusters contain -- non-empty means merging them makes a
-            SAME-CAMERA claim about each of those cameras."""
+            """Cameras both clusters contain in the ROUND SNAPSHOT.
+
+            Deliberately snapshot-based. This feeds scoring, reciprocal-best and the
+            decision log, all of which describe the round as it was SCORED -- mixing
+            a post-merge camera set into a pre-merge score would log a bar that never
+            applied to that number. The live view is `live_shared_cameras` and is
+            used only where a merge is actually about to happen.
+            """
             return {k[0] for k in roots[a]} & {k[0] for k in roots[b]}
+
+        def live_shared_cameras(a, b):
+            return ({k[0] for k in live_members(a)}
+                    & {k[0] for k in live_members(b)})
 
         def pair_threshold(a, b):
             """The bar THIS cluster pair must clear.
@@ -873,6 +892,24 @@ def reconcile_tracklets(store, threshold, run_id=None,
             bar varies by camera.
             """
             shared = shared_cameras(a, b)
+            if not shared:
+                return threshold
+            return cam_bar(*shared)
+
+        def pair_bar_now(a, b):
+            """The bar for this pair given the CURRENT clusters -- the #27 fix.
+
+            `roots` is the snapshot taken at the start of the round, and `union`
+            updates `members`, not `roots`. So a cluster that absorbed a second
+            camera earlier in THIS round was still judged on its stale camera set,
+            and a pair that had come to share a camera was offered the LOW
+            cross-camera bar instead of the same-camera one: two strangers seen in
+            one camera at different times could merge at 0.63.
+
+            Identical to pair_threshold until the round's first merge, which is why
+            scoring and the decision log can keep using the snapshot.
+            """
+            shared = live_shared_cameras(a, b)
             if not shared:
                 return threshold
             return cam_bar(*shared)
@@ -917,7 +954,17 @@ def reconcile_tracklets(store, threshold, run_id=None,
             ra, rb = find(a), find(b)
             if ra == rb:
                 continue
-            bar = pair_threshold(a, b)
+            # Re-read the bar from CURRENT membership (#27): an earlier merge in
+            # this same round may have given one side a camera it did not have when
+            # the round's scores were taken, which RAISES the bar this pair must
+            # clear. Re-checking here is what stops a same-camera claim sneaking
+            # through at the cross-camera threshold.
+            bar = pair_bar_now(a, b)
+            if s < bar:
+                log(f"  tracklet reconcile: SKIP {a} + {b} (cosine {s:.3f} < "
+                    f"{bar:.2f}) -- an earlier merge this round made this a "
+                    f"same-camera claim (#27)")
+                continue
             # Name the lane by the CLAIM being made, not by comparing the bar to a
             # number: with per-camera bars one camera's same-camera bar can equal
             # the cross-camera threshold, and then a bar comparison mislabels the
@@ -925,7 +972,7 @@ def reconcile_tracklets(store, threshold, run_id=None,
             # when both printed root keys were the same camera, which made the log
             # actively misleading -- this keeps that fix while staying correct
             # under per-camera bars.)
-            lane = "same-camera" if shared_cameras(a, b) else "cross-camera"
+            lane = "same-camera" if live_shared_cameras(a, b) else "cross-camera"
             if union(ra, rb):
                 log(f"  tracklet reconcile: {lane} cluster merge {a} + {b} "
                     f"(cosine {s:.3f} >= {bar:.2f})")
@@ -1053,6 +1100,32 @@ def reconcile_tracklets(store, threshold, run_id=None,
             _record_outcome(k, dlog.RESOLVED, assigned_id=survivor,
                             merged_from=[handles[m] for m in sorted(cluster)
                                          if m != k])
+
+    # #34: per-tracklet FIT and MARGIN, for the label in the final video.
+    #   fit    = this tracklet's prototype vs the prototype of the cluster it
+    #            ended up in ("does this piece look like the person it was filed as")
+    #   margin = fit minus its best score against any OTHER cluster ("how close was
+    #            the call"). Negative would mean it resembles another cluster MORE,
+    #            which is worth seeing on screen.
+    # Computed after clustering so it describes the decision that was actually made.
+    if quality_out is not None:
+        final_protos = {}
+        for root, cluster in final_roots.items():
+            proto = _cluster_prototype(cluster, protos)
+            if proto is not None:
+                final_protos[root] = proto
+        for root, cluster in final_roots.items():
+            own = final_protos.get(root)
+            if own is None:
+                continue
+            for k in cluster:
+                fit = float(protos[k] @ own)
+                others = [float(protos[k] @ p)
+                          for r, p in final_protos.items() if r != root]
+                quality_out[k] = {
+                    "fit": round(fit, 4),
+                    "margin": (round(fit - max(others), 4) if others else None),
+                }
 
     log(f"  tracklet reconcile: {len(keys)} tracklets -> "
         f"{len(set(remap.values()))} identities.")

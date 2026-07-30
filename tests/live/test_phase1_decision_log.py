@@ -231,15 +231,22 @@ supp = [o for o in log6.tracklet_outcomes.values() if o["state"] == dlog.SUPPRES
 check("a suppressed tracklet is recorded with its state", len(supp) == 1,
       f"{[o['tracklet'] for o in supp]}")
 
-# Known defect #25 is now recorded rather than silent.
+# #25 IS NOW FIXED. This check previously asserted the DEFECT -- that a lone
+# surviving tracklet was left expired_unresolved, so the whole video rendered as a
+# bare "ID <track_id>" with no reid at all. There is nothing to merge with one
+# tracklet, but there is still an identity to ASSIGN, and now it gets one.
 with tempfile.TemporaryDirectory() as td:
     log7 = DecisionLog(run_id="R")
-    run(build_store(td, SCENES["single tracklet (known defect #25)"], seed=7),
-        log=log7)
-unres = [o for o in log7.tracklet_outcomes.values()
-         if o["state"] == dlog.EXPIRED_UNRESOLVED]
-check("defect #25 surfaces as expired_unresolved, not silence", len(unres) == 1,
-      f"{[o['tracklet'] for o in unres]}")
+    remap7 = run(build_store(td, SCENES["single tracklet (known defect #25)"],
+                             seed=7), log=log7)
+resolved7 = [o for o in log7.tracklet_outcomes.values()
+             if o["state"] == dlog.RESOLVED]
+check("#25 fixed: a lone tracklet is ASSIGNED an identity, not left unresolved",
+      len(remap7) == 1 and len(resolved7) == 1,
+      f"remap={remap7}, states="
+      f"{[o['state'] for o in log7.tracklet_outcomes.values()]}")
+check("#25: and the assigned id is a real gid, not None",
+      all(v is not None for v in remap7.values()), f"{remap7}")
 
 
 # ---------------------------------------------------------------------------

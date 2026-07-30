@@ -293,7 +293,7 @@ def build_gid_map(store, run_id):
 
 def render_final_videos(jobs, cfg, shared, store, run_id,
                         gid_map=None, out_pattern="output_{name}.mp4",
-                        fps_by_camera=None):
+                        fps_by_camera=None, quality=None):
     """
     SECOND PASS -- write output_<camera>.mp4 with the FINAL (post-reconciliation)
     global ids. The live pass only captured box geometry; cross-camera identity is
@@ -325,6 +325,7 @@ def render_final_videos(jobs, cfg, shared, store, run_id,
     resize_width = cfg["source"].get("resize_width", 0)
     fps = float(cfg["display"].get("output_fps", 20.0))
     fps_by_camera = fps_by_camera or {}
+    quality = quality or {}         # {(camera, track_id): {"fit":..,"margin":..}}
 
     def render_one(name, path):
         annos = shared["annotations"].get(name)
@@ -375,6 +376,17 @@ def render_final_videos(jobs, cfg, shared, store, run_id,
                                 track_id=track_id, confidence=conf,
                                 global_id=gid_map.get((name, track_id)),
                                 reid_id=gid_map.get((name, track_id)),
+                                # #34: reconcile-scale fit/margin, so the final
+                                # video shows HOW SURE the merge was. None when
+                                # reconcile did not report them.
+                                reid_fit=(quality.get((name, track_id)) or {}
+                                          ).get("fit"),
+                                reid_margin=(quality.get((name, track_id)) or {}
+                                             ).get("margin"),
+                                # #32/#33: no id from reconcile => unresolved, so the
+                                # renderer must not print a bare track number that
+                                # reads as an identity.
+                                unresolved=(gid_map.get((name, track_id)) is None),
                             )
                         )
                     frame = draw_detections(frame, dets)
@@ -924,6 +936,9 @@ def _finalize_run(threads, stop_event, shared, jobs, cfg, disp_cfg, id_cfg,
     # matched live. Now that every camera has finished and the gallery is fully
     # populated, merge global ids that are the same person across cameras.
     recon_cfg = id_cfg.get("reconcile", {}) if id_cfg else {}
+    # #34: filled by reconcile with per-tracklet fit/margin; stays empty when
+    # reconcile does not run, in which case the labels simply carry no score.
+    reid_quality = {}
     if identity is not None and recon_cfg.get("enabled"):
         from identity.reconcile import (reconcile_tracklets,
                                         resolve_covisibility,
@@ -948,6 +963,7 @@ def _finalize_run(threads, stop_event, shared, jobs, cfg, disp_cfg, id_cfg,
             covisibility=resolve_covisibility(recon_cfg),
             same_camera_reciprocal_best=recon_cfg.get(
                 "same_camera_reciprocal_best", False),
+            quality_out=reid_quality,
             consensus_top_frac=recon_cfg.get("consensus_top_frac", 0.25),
             max_observations_per_side=recon_cfg.get("max_observations_per_side", 64),
         )
@@ -957,7 +973,8 @@ def _finalize_run(threads, stop_event, shared, jobs, cfg, disp_cfg, id_cfg,
     # colour) across every camera's output video.
     if disp_cfg.get("save_annotated"):
         print("[main] Rendering annotated videos with final global ids...")
-        render_final_videos(jobs, cfg, shared, store, run_id)
+        render_final_videos(jobs, cfg, shared, store, run_id,
+                            quality=reid_quality)
 
     print_run_summary(store, jobs, cfg, run_id=run_id)
 

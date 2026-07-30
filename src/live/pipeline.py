@@ -511,6 +511,7 @@ class LivePipeline:
             threshold = (self.cfg.get("identity", {}) or {}).get("threshold", 0.63)
         try:
             print("[live] reconciling identities across cameras...")
+            reid_quality = {}
             reconcile_tracklets(
                 self.store,
                 threshold=threshold,
@@ -530,6 +531,8 @@ class LivePipeline:
                 covisibility=resolve_covisibility(self._recon_cfg),
                 same_camera_reciprocal_best=self._recon_cfg.get(
                     "same_camera_reciprocal_best", False),
+                # #34: per-tracklet fit/margin for the on-screen label.
+                quality_out=reid_quality,
                 consensus_top_frac=self._recon_cfg.get("consensus_top_frac", 0.25),
                 max_observations_per_side=self._recon_cfg.get(
                     "max_observations_per_side", 64),
@@ -562,7 +565,8 @@ class LivePipeline:
                                   for c, v in sorted(fps_by_camera.items()))
                       + f"  (was a single global {fps:.1f} for all)")
             render_final_videos(jobs, render_cfg, shared, self.store, self.run_id,
-                                fps_by_camera=fps_by_camera)
+                                fps_by_camera=fps_by_camera,
+                                quality=reid_quality)
             print_run_summary(self.store,
                               [(name, path) for name, path in jobs],
                               {"display": {"save_annotated": True}},

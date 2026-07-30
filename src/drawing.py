@@ -39,6 +39,8 @@ LABEL_THICKNESS = 2              # id/GID label stroke weight (was 1)
 # happened. Every entry below is distinguishable from the others in BGR at video
 # scale; the ordering interleaves hues so that CONSECUTIVE ids (the common case,
 # since gids are assigned in order) are always far apart.
+UNRESOLVED_COLOR = (150, 150, 150)   # neutral grey, never an identity
+
 _PALETTE = [
     (0, 255, 0),      # green
     (255, 0, 0),      # blue
@@ -90,6 +92,14 @@ def draw_detections(frame, detections):
         # identified" for both colour and label, so the overlay shows a neutral
         # "pending" marker instead of a scary "REID -1" that then flips.
         provisional = det.reid_id is not None and det.reid_id < 0
+        # #32/#33: a tracklet reconcile could not resolve (suppressed below
+        # min_tracklet_observations, or left over) arrives with NO identity at all.
+        # It used to render as a bare "ID 47", which reads as the identity VANISHING
+        # -- and worse, as a *different person* than the same body a second earlier.
+        # Mark it as unresolved instead, and never print a number that could be
+        # mistaken for an identity.
+        unresolved = (det.reid_id is None and det.global_id is None
+                      and getattr(det, "unresolved", True))
 
         # Colour by REID id when we have one, so the same person keeps the same
         # colour ACROSS cameras (that's the whole point of ReID). Fall back to
@@ -98,7 +108,10 @@ def draw_detections(frame, detections):
         ident = (det.reid_id if (det.reid_id is not None and not provisional)
                  else det.global_id if det.global_id is not None
                  else det.track_id)
-        color = color_for_id(ident)
+        # Unresolved gets ONE fixed neutral grey, deliberately not from the palette:
+        # a palette colour would make it look like a specific identity, and two
+        # different unresolved people would look like the same one.
+        color = UNRESOLVED_COLOR if unresolved else color_for_id(ident)
 
         # 1) The rectangle. cv2.rectangle needs the two opposite corners:
         #    top-left (x1, y1) and bottom-right (x2, y2).
@@ -125,8 +138,30 @@ def draw_detections(frame, detections):
         # whose ids come from tracklet-prototype merges on a different score
         # scale. getattr because that path passes SimpleNamespace, not Detection.
         reid_score = getattr(det, "reid_score", None)
-        score_suffix = f" ({reid_score:.2f})" if reid_score is not None else ""
-        if provisional:
+        # #34: the FINAL video used to show no identity confidence whatsoever,
+        # because render_final_videos built its detections without reid_score. Two
+        # numbers are meaningful after reconcile and both come from the merge, not
+        # from YOLO:
+        #   fit    -- this tracklet's prototype against its final cluster prototype
+        #             ("how well does this piece match the person it was filed as")
+        #   margin -- gap to the nearest OTHER cluster ("how close was the call")
+        # A low margin with a high fit is the signature of a merge worth doubting.
+        # Rendered as `REID 7 (0.94 / +0.21)`. These are RECONCILE-scale and are NOT
+        # comparable to the live engine's scores -- different comparison entirely.
+        fit = getattr(det, "reid_fit", None)
+        margin = getattr(det, "reid_margin", None)
+        if fit is not None:
+            score_suffix = (f" ({fit:.2f} / {margin:+.2f})" if margin is not None
+                            else f" ({fit:.2f})")
+        elif reid_score is not None:
+            score_suffix = f" ({reid_score:.2f})"
+        else:
+            score_suffix = ""
+        if unresolved:
+            # No number at all -- see #32/#33 above. A dashed box would be better
+            # still; this at least never claims an identity it does not have.
+            label = "UNRESOLVED"
+        elif provisional:
             # Still deciding who this is -- show a pending marker, not the id.
             label = (f"REID ...  ID{det.track_id}"
                      if det.track_id is not None else "REID ...")
@@ -147,20 +182,29 @@ def draw_detections(frame, detections):
         (text_w, text_h), baseline = cv2.getTextSize(
             label, FONT, LABEL_FONT_SCALE, LABEL_THICKNESS)
 
-        # Draw the filled label background just ABOVE the box's top-left corner.
+        # #36: the label used to be drawn unconditionally ABOVE the box, so for
+        # anyone entering at the top of the frame (y1 < ~30) it landed at a negative
+        # y and was clipped away entirely -- that person had NO visible id at the
+        # exact moment identity is most in doubt. Flip it inside the box instead,
+        # and clamp x so a box at the right edge keeps its text on screen.
+        patch_h = text_h + baseline + 6
+        frame_h, frame_w = frame.shape[:2]
+        if det.y1 - patch_h >= 0:
+            top = det.y1 - patch_h
+        else:
+            top = min(det.y1, max(0, frame_h - patch_h))      # inside the box
+        left = min(det.x1, max(0, frame_w - (text_w + 4)))
         cv2.rectangle(
             frame,
-            (det.x1, det.y1 - text_h - baseline - 6),  # top-left of patch
-            (det.x1 + text_w + 4, det.y1),             # bottom-right of patch
+            (left, top),
+            (left + text_w + 4, top + patch_h),
             color,
             thickness=-1,   # -1 means "fill the rectangle solid"
         )
-
-        # Draw the text on top of that patch.
         cv2.putText(
             frame,
             label,
-            (det.x1 + 2, det.y1 - baseline - 3),  # bottom-left anchor of the text
+            (left + 2, top + text_h + 3),   # bottom-left anchor of the text
             FONT,
             LABEL_FONT_SCALE,
             TEXT_COLOR,
