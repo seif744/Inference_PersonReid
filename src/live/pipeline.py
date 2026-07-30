@@ -45,6 +45,56 @@ from live.writer import WriterStage
 from interrupt_guard import InterruptGuard, print_stop_hint
 
 
+class _QuietOnBrokenPipe:
+    """Text-stream wrapper that goes silent instead of raising on a dead consumer.
+
+    WHY THIS EXISTS (two real runs were lost to it): `python main.py ... | tee log`
+    puts python and tee in ONE foreground process group, so Ctrl-C is delivered to
+    both. tee has no SIGINT handler and dies immediately; every subsequent print in
+    python then raises BrokenPipeError. The first such print is inside the shutdown
+    sequence, and `_report(final=True)` runs BEFORE `_finalize_offline()` -- so a
+    cosmetic print failure aborted the run before the reconciled ids were ever
+    decided, and the traceback went into the same dead pipe so nothing was visible.
+    A dropped SSH session or a closed terminal does exactly the same thing.
+
+    Printing is never worth the deliverable. Installed only around finalization, so
+    normal output is untouched; once the stream breaks we stop trying.
+    """
+
+    def __init__(self, stream):
+        self._stream = stream
+        self.broken = False
+
+    def write(self, data):
+        if self.broken:
+            return len(data)
+        try:
+            return self._stream.write(data)
+        except (BrokenPipeError, OSError, ValueError):
+            self.broken = True
+            return len(data)
+
+    def flush(self):
+        if self.broken:
+            return
+        try:
+            self._stream.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            self.broken = True
+
+    def isatty(self):
+        try:
+            return self._stream.isatty()
+        except Exception:                                      # noqa: BLE001
+            return False
+
+    def fileno(self):
+        return self._stream.fileno()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
 class LivePipeline:
     def __init__(self, sources, cfg):
         self.sources = sources            # [(cam_name, url_or_path), ...]  any N
@@ -347,10 +397,21 @@ class LivePipeline:
 
         The whole phase runs under InterruptGuard: a second Ctrl-C here would
         kill the writers mid-flush and skip the reconcile, so extra presses are
-        warned about instead of raising (3 in a row still force-quit)."""
-        with InterruptGuard("finalizing outputs (flushing videos, then "
-                            "reconciling ids + re-rendering)"):
-            self._shutdown_inner()
+        warned about instead of raising (3 in a row still force-quit).
+
+        InterruptGuard covers SIGNALS. It does NOT cover a dead stdout, which is a
+        separate way to lose the same work -- see _QuietOnBrokenPipe. Both are
+        needed: the guard stops Ctrl-C aborting finalization, the stream wrapper
+        stops a failed `print` doing it."""
+        prev_out, prev_err = sys.stdout, sys.stderr
+        sys.stdout, sys.stderr = (_QuietOnBrokenPipe(prev_out),
+                                  _QuietOnBrokenPipe(prev_err))
+        try:
+            with InterruptGuard("finalizing outputs (flushing videos, then "
+                                "reconciling ids + re-rendering)"):
+                self._shutdown_inner()
+        finally:
+            sys.stdout, sys.stderr = prev_out, prev_err
 
     def _shutdown_inner(self):
         """The actual shutdown sequence (always called under InterruptGuard)."""
@@ -372,8 +433,16 @@ class LivePipeline:
                 t.join(timeout=5)
         for w in self.writers:
             w.join(timeout=10)     # writer flushes queue + releases the MP4
+        # Reporting is DIAGNOSTIC and must never be able to skip what follows it.
+        # Guarded because it sits between the joins and the reconcile: any failure
+        # here -- a dead stdout, a KeyError in the metrics dicts, a stage object
+        # that never got built -- used to abandon the run's ids.
         if self._t_start is not None:
-            self._report(time.monotonic() - self._t_start, final=True)
+            try:
+                self._report(time.monotonic() - self._t_start, final=True)
+            except Exception as e:                                 # noqa: BLE001
+                print(f"[live] final metrics report failed ({type(e).__name__}: {e}); "
+                      f"continuing to reconcile -- the ids matter, the report does not.")
         # Offline reconcile runs AFTER every stage has joined: identity has flushed
         # all observations to the store, and each render stage has finalized its
         # temp clip -- so the whole-gallery view and the re-render source are both

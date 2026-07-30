@@ -25,7 +25,8 @@ Read Part A before proposing any threshold change. Read Part H before trusting a
 9. [Part F — Acceptance criteria](#part-f--acceptance-criteria)
 10. [Part G — Design decisions log](#part-g--design-decisions-log)
 11. [Part H — Measurement reference](#part-h--measurement-reference)
-12. [Part I — Historical context](#part-i--historical-context)
+12. [Part J — Field results, 2026-07-30](#part-j--field-results-2026-07-30-a6000-4-cameras-live-rtsp)
+13. [Part I — Historical context](#part-i--historical-context)
 
 ---
 
@@ -665,6 +666,97 @@ Drops occur at the **inference queue** (`infer_q` 629 dropped, peak 900), not th
 representative of A100-on-RTSP — they locate the bottleneck, nothing more.
 
 Output timeline: 157 frames at 20 fps = 7.85 s for 42.9 s of content = **5.5× too fast**.
+
+---
+
+## Part J — Field results, 2026-07-30 (A6000, 4 cameras, live RTSP)
+
+First real production data. **Three of my hypotheses were wrong and one new P0 defect
+surfaced.** Source: `run_id 20260730_082045`, 4 cameras, 40 s of metrics, `cuda:0`,
+`nvdec_usable: False`, `decode_backend: cpu`.
+
+### J.1 Frame dropping is a NON-PROBLEM — Phase 11 largely dead
+
+| Camera | nominal | read | rendered | dropped |
+|---|---|---|---|---|
+| cam_213 | 25 fps | 24.2 | 905/968 | **6.5%** |
+| cam_224 | 15 fps | 14.2 | 551/567 | **2.8%** |
+| cam_206 | 25 fps | 21.8 | 868/872 | **0.5%** |
+| cam_219 | 25 fps | 22.7 | 877/908 | **3.4%** |
+
+`infer_q` dropped **10 frames in 40 s**. `slot_drop` ≤ 4. `stale_skipped=0`. Inference
+completed 3271 of 3315 frames read, at **44% scheduler utilisation**.
+
+My CPU-on-file measurement said 85–99% (H.10). I flagged it unrepresentative; it is
+unrepresentative by a factor of ~20. **Narrowing the ReID lock (#50), the queue depth
+(#51), `imgsz` and `conf` all solve a problem that does not exist** at this crowd size.
+Phase 11 drops to lowest priority. Caveat retained: the ReID batch scales with people
+in frame, so this could change in a genuinely crowded scene.
+
+### J.2 Cross-camera linking is 0-for-19, and the threshold is NOT why
+
+```
+x-camera: attempts=19 linked=0 rejected[thresh=0 margin=9 recip=10 topology=0]
+histogram:  <.5:0  .5-.6:0  .6-.7:9  .7-.8:10  .8-.9:0  .9+:0
+```
+
+**`thresh=0`** — not one attempt was below `cross_camera_threshold: 0.60`. All 19 scored
+0.60–0.80 and every one died on the **runner-up margin** (9, at `accept_margin: 0.03`) or
+**reciprocal-best** (10).
+
+This inverts the assumption in the config history, which lowered `cross_camera_threshold`
+0.63 → 0.60 to let real matches through. The threshold was never the obstacle. Nine
+near-ties plus ten reciprocity failures means several candidates are bunched in the same
+0.6–0.8 band — exactly the ambiguity `TOP2_MARGIN` was added to measure, and strong
+support for prioritising Phase 9's margin questions over its threshold sweeps.
+
+### J.3 Same-camera 0.70 cuts through the middle of the distribution
+
+```
+same-cam reacquire: attempts=17 ok=10 rejected_below_thr=7 max_rejected=0.690
+histogram:  .5-.6:2  .6-.7:5  .7-.8:7  .8-.9:1  .9+:2
+```
+
+Max rejected 0.690, a hair under the bar — the same pattern the config comments record at
+0.85 and 0.90. `linked=0` this run, so the two-lane leak did not fire and these 7
+rejections are genuine mints rather than double-counted.
+
+### J.4 H.265 corruption does NOT occur on the live feed
+
+**Zero** decode errors across 4 live streams. The 294/682 and 207/1573 broken references
+in `test_file.avi` / `test_v2.avi` are an artefact of however those were recorded, not
+something happening on RTSP. **Issue #28 downgrades** from "leading hypothesis for random
+identity behaviour" to "worth setting `rtsp_transport=tcp` anyway"; #29's blocking-read
+problem stands on its own merits.
+
+### J.5 NEW P0 — a failed `print` abandoned the run's ids. Twice.
+
+Two consecutive runs produced clips and metrics, then **nothing**: no final summary, no
+reconcile, no decision log, no output video. Both launched as `python main.py ... | tee
+run1.log`, which puts python and tee in one foreground process group. Ctrl-C reaches
+both; tee dies first; every subsequent `print` raises `BrokenPipeError`. And
+`_report(final=True)` runs **before** `_finalize_offline()`, so a cosmetic print failure
+skipped the reconcile — with the traceback going into the same dead pipe, so nothing was
+visible. A dropped SSH session or closed terminal breaks stdout identically.
+
+`InterruptGuard` does not help: it protects against signals and explicitly does not
+swallow exceptions.
+
+**Fixed 2026-07-30** — `_report(final=True)` is now guarded, and stdout/stderr are wrapped
+in `_QuietOnBrokenPipe` for the finalization phase so no print can raise. Pinned by
+`tests/live/test_shutdown_reaches_reconcile.py` (14 checks), including the
+report-raises, dead-stdout, and both-at-once cases plus the ordering invariant.
+
+**Diagnostic trap worth remembering:** `output_cam_*.mp4` existing does **not** mean the
+last run succeeded. Those files are only overwritten by a completed render, so stale
+outputs from an earlier run look like success. Check their mtime against the `run_id`.
+
+### J.6 Confirmed as expected
+
+`written=0` on every camera (#63, cosmetic). Software H.265 decode for all four streams
+and still keeping pace (#53). The store held **4157 points before this run**, and
+`_gather_tracklets` scrolls the whole collection filtering by `run_id` in Python — issue
+#20 now has a real number attached, and it grows every run.
 
 ---
 
