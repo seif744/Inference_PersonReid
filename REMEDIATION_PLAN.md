@@ -907,6 +907,249 @@ and still keeping pace (#53). The store held **4157 points before this run**, an
 `_gather_tracklets` scrolls the whole collection filtering by `run_id` in Python — issue
 #20 now has a real number attached, and it grows every run.
 
+### J.8 Operator observations from watching the output videos
+
+Ground truth on the *symptoms*, which no metric replaces. Recorded verbatim in substance
+because these are what "working" has to mean.
+
+| Camera | Observation | Mechanism |
+|---|---|---|
+| cam_224 | "definitely sped up" | 14.8 fps tagged at 20 → plays 1.35× fast (#45/#46) |
+| cam_224 | reid 3 → **reid 7** when the person moves at a bad angle | orphan fragment absorbed into the wrong cross-camera cluster; 12 of 17 subjects orphaned here (J.6) |
+| cam_219 | "a little slowed"; reid 2 → **reid 4** when he moves to the other side of the table | 24.2 fps tagged 20 → 1.21× slow; the id change is a track-id change that reconcile failed to re-merge |
+| cam_213 | reid 2 correct **by his front**, becomes **reid 7 by his back** | cam_213 achieves ZERO same-camera merges at 0.90, so front and back fragments can never join. Compounded by reconcile comparing prototype *means* (#45a) |
+| cam_206 | 5 people present but only 1 detected at first; "randomly starts detecting the rest" | **detection recall**, not identity. Nothing downstream can invent a box YOLO never produced. Also explains cam_206's 61 tracklets |
+
+Operator's own diagnosis, which was correct: *"this seems like a track id change so reid
+change nonsense which should not always be the case."* Final-video ids come from
+`gid_map[(camera, track_id)]`, so a new track id is looked up independently — reconcile's
+entire job is to re-merge those, and it is failing.
+
+### J.9 Raw metrics, run `20260730_093723` (final, t=+130s)
+
+The run the analysis is based on. ~4.5 min, 4 cameras, `cuda:0`, `nvdec_usable: False`.
+
+| Camera | read | rendered | dropped | slot_drop |
+|---|---|---|---|---|
+| cam_213 | 3227 (24.8 fps) | 3133 | **2.9%** | 30 |
+| cam_224 | 1923 (14.8 fps) | 1909 | **0.7%** | 0 |
+| cam_206 | 3135 (24.1 fps) | 3123 | **0.4%** | 7 |
+| cam_219 | 3163 (24.3 fps) | 3126 | **1.2%** | 10 |
+
+Even lower than the 082045 run in J.1. `scheduler: batches=3119 frames=11398
+avg_batch=3.65 util=46% stale_skipped=0`. `infer_q=7 dropped / peak 2`,
+`identity_in=0 / peak 4`, `identity_fair_drop=0`, `inference_done=11370`.
+
+**Live engine counters** (off the product path, but they characterise the score
+distributions):
+
+```
+identity: minted=16 reacquired=18 linked=2 active=16 stored=1500
+x-camera:   attempts=15 linked=2 rejected[thresh=4 margin=5 recip=4] max_subthreshold=0.599
+same-cam:   attempts=23 ok=18 rejected_below_thr=5 max_rejected=0.699
+coactive_vetoes=49   topology_pruned=0
+histograms (<.5 .5-.6 .6-.7 .7-.8 .8-.9 .9+)
+  same-cam reacquire:  0  1  4  4  2 12      <- mass well above 0.70; 0.70 works here
+  cross-camera:        0  4  7  4  0  0      <- nothing above 0.80
+```
+
+Note `max_subthreshold_score=0.599` — four cross-camera matches missed the 0.60 bar by a
+thousandth. And unlike the 082045 run (0 links from 19 attempts), this one linked 2 of 15.
+
+**Per-camera tracklets and observations** (from the reconcile diagnostics):
+
+| Camera | tracklets | total obs | min | max | mean |
+|---|---|---|---|---|---|
+| cam_206 | **61** | 1065 | 1 | 203 | 17.5 |
+| cam_213 | 11 | **85** | 3 | **13** | 7.7 |
+| cam_219 | **7** | 1848 | 1 | 722 | 264.0 |
+| cam_224 | 18 | 1211 | 2 | 355 | 67.3 |
+
+**cam_213 is starved**: it read the *most* frames of any camera yet produced the *fewest*
+observations (85, longest track 13 ≈ 4 s at `reid.interval: 10`). Either almost nobody was
+in view, or the crop-quality gate rejects nearly everything there. Untested.
+
+**Store:** 4209 observations for this run → 17 identities, 11 cross-camera.
+
+### J.10 Full analyser output, run `20260730_093723`
+
+286 decisions (8 suppressed), 97 outcomes; phase 1 = 89, phase 2 = 189.
+
+```
+gate failures : MIN_OBSERVATIONS 8, ABSOLUTE_THRESHOLD 92, RECIPROCAL_BEST 86
+exclusions    : BELOW_ABSOLUTE_THRESHOLD 5576, TEMPORAL_CONFLICT_SAME_CAMERA 1008,
+                NOT_MERGEABLE_CROSS 720
+
+1. WHERE THE BAR CUTS (same-camera, n=87 subjects)
+   highest score REJECTED per subject: mean=0.821 p50=0.853 p95=0.898 max=0.899
+     lost a candidate above 0.75: 64/87 (73.6%)
+     lost a candidate above 0.80: 55/87 (63.2%)
+     lost a candidate above 0.85: 44/87 (50.6%)
+     lost a candidate above 0.88: 30/87 (34.5%)
+   natural boundary from 77 bimodal subjects:
+     gap LOWER edge (top 'different'): mean=0.721 p95=0.816 max=0.841
+     gap UPPER edge (worst 'same')   : mean=0.856 p5=0.719  min=0.609
+   => boundaries OVERLAP: no global bar works (p95 lower 0.816 > p5 upper 0.719)
+
+2. ORPHANS: 33/89 (37.1%) with zero eligible same-camera partners
+   their best rejected candidate: mean=0.795 p95=0.903 max=0.908
+   10/33 had a best candidate above 0.85
+   by camera: cam_206 6, cam_213 11, cam_219 4, cam_224 12
+
+3. NEAR-TIES (margin <= 0.05): 120 total
+   fragmentation (runner similarity >0.85): 55 (45.8%)
+   genuine ambiguity (<=0.85)            : 65 (54.2%)
+   margins accepted: n=91 p5=0.0017 median=0.0224 p95=0.1181
+   margins rejected: n=72 p5=0.0016 median=0.0186 p95=0.0779   <- indistinguishable
+   margin-definition disagreement: 124/194 (63.9%) [+84 no selectable candidate]
+
+4. RECIPROCAL_BEST: 86/278 (30.9%), ALL cross_camera
+   scores rejected: mean=0.720 p95=0.862 max=0.905
+   by camera: cam_206 40, cam_224 35, cam_213 22, cam_219 11
+
+5. ELIGIBLE-SET SIZE @0.90
+   cam_206: 55 subjects  mean=9.0  max=21  zero=6
+   cam_213: 11 subjects  mean=0.0  max=0   zero=11
+   cam_219:  6 subjects  mean=0.3  max=1   zero=4
+   cam_224: 17 subjects  mean=0.5  max=2   zero=12
+
+6. CROSS-CAMERA ACCEPTED: n=52 min=0.639 mean=0.801 max=0.937
+   below 0.70: 10/52    below 0.66 (stranger ceiling): 4/52
+   observed accepted scores: 0.937 ... 0.733 0.721 0.704 0.692 0.690 0.688 0.655 0.639
+
+7. SUPPRESSION: 8/97 tracklets, 0.3% of observations
+   by camera: cam_206 6, cam_219 1, cam_224 1
+
+8. OUTCOME: 17 identities, tracklets/identity mean=5.24 max=26
+   distribution: [26, 10, 8, 7, 5, 5, 5, 5, 4, 3, 3, 2, 2, 1, 1, 1, 1]
+   spanning >1 camera: 11/17
+```
+
+### J.11 Worked decision-log examples
+
+Four real records, kept because they show the distributions concretely and are the
+clearest single argument for #40.
+
+**`U-0000`** (cam_206, 18 obs, frames 1–155). 54 candidates scored, **3 eligible**,
+margin 0.0689. Sorted scores:
+
+```
+0.977  0.908  0.906  |  0.897  0.876  0.875  |  0.662  0.633  0.631  0.621 ... 0.495
+       ELIGIBLE      |   REJECTED at 0.90    |    genuinely different people
+```
+
+A clean gap between **0.875 and 0.662**, with the bar cutting *inside* the same-person
+cluster and discarding three genuine merges. A bar in ~(0.68, 0.87) would be perfect here.
+
+**`U-0001`** (cam_206, 10 obs). **16 eligible candidates**, all above 0.90:
+`0.9718 0.9694 0.9623 0.9571 0.9457 0.9451 0.9447 0.9367 0.9319 0.9289 0.9213 0.9207
+0.9199 0.9185 0.9120 0.9056`. Mutual `pair_similarity_to_best` 0.92–0.97, so not a chain.
+**One person, seventeen tracklets, one camera.** Top-2 margin **0.0024** — a near-tie
+between two fragments of the same person, which is why a margin gate would be harmful.
+
+**`U-0002`** (cam_206, 23 obs). 4 eligible, margin 0.0069. `U-0000` scored **0.8757**
+against it and was rejected — yet both merge with `U-0017`, so they end up in the same
+cluster transitively anyway. The 0.90 bar blocks the direct edge but not the outcome.
+
+**`U-0003`** (cam_206, **203 obs**, frames 371–2379). Only 1 eligible candidate;
+`TEMPORAL_CONFLICT_SAME_CAMERA: 8` — eight other tracklets overlapped it in time, so the
+temporal veto is working. `margin_eligible: null`, `margin_all_scored: 0.3405`.
+
+### J.12 Identity composition, run `20260730_093723`
+
+The 11 cross-camera identities, as reconcile assigned them. Kept so a re-run can be
+diffed against it rather than re-derived.
+
+```
+GID  1: cam_206(5,8,13,79,81,93) + cam_224(185)
+GID  2: cam_206(7,19,21,30,49,54,58,66,76,83,89,96,97,131,137,138,139,140,157,162,165,210)
+        + cam_213(26) + cam_219(6) + cam_224(3,43)          <- 26 tracklets, 22 in cam_206
+GID  3: cam_206(80) + cam_213(120) + cam_219(143,173) + cam_224(126)
+GID  4: cam_206(82) + cam_213(38) + cam_219(48) + cam_224(2,52)
+GID  5: cam_206(92) + cam_213(86) + cam_224(12)
+GID  7: cam_206(99,104,107,112,114,127) + cam_213(33) + cam_224(159)
+GID  8: cam_206(108) + cam_224(132)
+GID 11: cam_206(176,192) + cam_213(180,190) + cam_224(183)
+GID 12: cam_206(195) + cam_213(116,193) + cam_224(121,189)
+GID 15: cam_213(115) + cam_219(118) + cam_224(117)
+GID 16: cam_219(4) + cam_224(1,20,202)
+```
+
+GID 2's 22 cam_206 members are all **mutually time-disjoint** (reconcile refuses to merge
+time-overlapping same-camera tracklets) and each cleared the **0.90** bar, so it is almost
+certainly one person entering and leaving that view 22 times — not a false merge.
+
+The operator-reported failures map onto this: cam_213's front/back split is GID 2's
+`cam_213(26)` versus GID 7's `cam_213(33)`; cam_224's bad-angle switch is GID 3's
+`cam_224(126)` versus GID 7's `cam_224(159)`; cam_219's across-the-table switch is GID 2's
+`cam_219(6)` versus GID 4's `cam_219(48)`.
+
+---
+
+## Part K — Library internals verified by reading source
+
+Facts established by reading the installed packages, not from documentation or memory.
+Recorded so the next session does not re-derive them. Versions: `ultralytics 8.4.89`,
+`torch 2.12.1`, `qdrant-client 1.18.0`, `opencv 5.0.0`.
+
+### K.1 ByteTrack (`ultralytics/trackers/`)
+
+`cfg/trackers/bytetrack.yaml` ships: `track_high_thresh: 0.25`, `track_low_thresh: 0.1`,
+`new_track_thresh: 0.25`, `track_buffer: 30`, `match_thresh: 0.8`, `fuse_score: True`.
+
+- `byte_tracker.py:312-315` splits detections by those two thresholds. Since the detector
+  pre-filters at `conf=0.4`, the **second-association pool (0.1–0.25) is always empty**, so
+  ByteTrack's occlusion-recovery stage never runs. Mechanism real; measured as a no-op on
+  available footage (Part A).
+- `_format_output` (`:486-488`) returns one row per track that is in `tracked_stracks`
+  **and** `is_activated`, and association is a one-to-one linear assignment. **The tracker
+  cannot invent a box** — confirmed empirically across 120 frames, 0 with more rows than
+  detections. Duplicate boxes therefore require duplicate *detections*.
+- `activate()` (`:108-109`) sets `is_activated` immediately only when `frame_id == 1`.
+  Otherwise a new track needs a **second consecutive match** before it appears in output,
+  so a one-frame duplicate detection is filtered but a persistent one is not.
+- `multi_predict` advances the Kalman filter **one step per `update` call with no `dt`**, so
+  under irregular frame gaps the predicted box is wrong by however much real time passed.
+- `on_predict_start`/`register_tracker` attach the tracker to the *predictor*, so tracker
+  state is per-`YOLO`-object. One `PersonDetector` per camera therefore isolates state
+  correctly (verified).
+
+### K.2 Ultralytics predict defaults (`cfg/default.yaml`)
+
+`imgsz: 640`, `iou: 0.7`, `max_det: 300`, `agnostic_nms: False`, `device:` unset (auto).
+The pipeline never passes `imgsz` or `device`, so 640 and auto-select apply.
+
+### K.3 torchreid OSNet feature tap
+
+`model.fc == Sequential(Linear(512,512), BatchNorm1d(512), ReLU())`, and eval-mode
+`forward()` returns `self.fc(v)` — i.e. **post-ReLU**. Measured consequence: 21.0% of dims
+exactly zero, 0% negative, so cosine between any two embeddings is ≥ 0 and the usable
+range is compressed upward. Post-BN is Phase 8; changing the tap voids every threshold.
+
+### K.4 Qdrant client
+
+`QdrantClient` accepts `prefer_grpc` (default `False`), `grpc_port` (default 6334) and
+`grpc_options`. `scroll()` accepts `scroll_filter` — **currently unused everywhere**, which
+is why `_gather_tracklets` pulls the entire collection and filters in Python (#20).
+`docker-compose.yml` **already maps 6334**, so gRPC needs no infrastructure change.
+Embedded `path=` mode is in-process and has no gRPC.
+
+### K.5 Verifier weights (batch path, `identity/verifier.py`)
+
+`w0=-13.5`, `w_cosine=11.0`, `w_rerank=7.0`, `w_observation_count=0.6`,
+`w_time_since_last=-0.01`, `w_bbox_quality=1.0`. Because the observation-count term is
+`0.6 · log1p(count)`, unbounded and never decayed, the minimum accepted cosine falls:
+
+| observations | 0 | 10 | 30 | 100 | 300 | 1000 | 3000 |
+|---|---|---|---|---|---|---|---|
+| min accepted cosine | 0.733 | 0.653 | 0.619 | **0.580** | **0.543** | **0.503** | **0.466** |
+
+Different people top out around 0.57, so past ~100 accumulated observations the busiest
+identity starts accepting strangers. Separately, `min_prob_gap: 0.05` saturates: at 300
+observations, cosine 0.90 vs 0.85 gives a probability gap of **0.0019**, so a clean winner
+is rejected and a duplicate minted. Batch path only, hence Part C — but do not reuse these
+weights anywhere without re-deriving them.
+
 ---
 
 ## Part I — Historical context
