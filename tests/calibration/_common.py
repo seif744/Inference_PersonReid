@@ -41,8 +41,33 @@ def bootstrap() -> str:
 
 
 REID_WEIGHTS = "src/reid/weights/osnet_ain_x1_0.pth"
-DETECT_WEIGHTS = "yolo11n.pt"
 POSE_WEIGHTS = "yolo11n-pose.pt"
+
+
+def detect_weights() -> str:
+    """The detector the pipeline would actually load.
+
+    Read from config.yaml (`detector.model`) rather than hardcoded, so a model swap
+    cannot leave the calibration harness silently measuring the OLD model and
+    reporting it as the shipped behaviour. `CALIB_DETECT_WEIGHTS` overrides, which
+    is how compare_detector_models.py measures more than one.
+    """
+    override = os.environ.get("CALIB_DETECT_WEIGHTS")
+    if override:
+        return override
+    try:
+        import yaml
+        with open(os.path.join(project_root(), "config.yaml")) as f:
+            cfg = yaml.safe_load(f) or {}
+        return (cfg.get("detector") or {}).get("model") or "yolo11n.pt"
+    except Exception:                                          # noqa: BLE001
+        return "yolo11n.pt"
+
+
+# Kept as a module-level name because the existing scripts read it directly. It is
+# resolved at import time, AFTER bootstrap() has chdir'd to the repo root in the
+# scripts that call it first -- project_root() is path-derived, so it does not care.
+DETECT_WEIGHTS = detect_weights()
 
 
 def pick_video(preferred: str | None = None) -> str:

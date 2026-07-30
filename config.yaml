@@ -25,12 +25,35 @@ source:
   # `auto` and ANY source is a URL. File inputs use the file-batch flow.
 
 detector:
-  model: yolo11n.pt          # small YOLO; auto-downloaded on first run
-                             # If small objects get misclassified (a bag read as a
-                             # person), that is detector CAPACITY, not a threshold:
-                             # step up to yolo11s.pt (~3x the FLOPs of 11n) before
-                             # yolo11m.pt (~10x) and re-check scheduler util% in the
-                             # live metrics summary before keeping it.
+  model: yolo11m.pt          # auto-downloaded on first run (already committed to the
+                             # deploy rsync, so the GPU box needs no network).
+                             #
+                             # 2026-07-30: RAISED from yolo11n.pt (~10x the FLOPs),
+                             # skipping yolo11s, to test whether detector CAPACITY is
+                             # what loses people -- cam_206 showed 5 people present
+                             # and only 1 detected at the start of a clip
+                             # (REMEDIATION_PLAN.md J.8). Nothing downstream can
+                             # invent a box YOLO never produced, so no threshold or
+                             # merge rule can fix a miss here.
+                             #
+                             # THIS IS A MEASUREMENT, NOT AN UPGRADE (plan 0.4). Keep
+                             # it only if the run shows BOTH:
+                             #   * more people found -- fewer "randomly starts
+                             #     detecting the rest" gaps, and per-camera tracklet
+                             #     counts that look like people rather than fragments
+                             #   * throughput still fine -- per-camera dropped% in the
+                             #     final metrics block stays near J.9's 0.4-2.9% and
+                             #     infer_q dropped stays small. 10x detector cost is
+                             #     the one change that could revive Phase 11, which
+                             #     J.1 declared dead AT yolo11n's cost.
+                             # Revert = this one line. Compare first with:
+                             #   python tests/calibration/compare_detector_models.py
+                             #
+                             # NOTE `imgsz` is never passed, so Ultralytics' 640
+                             # applies: a 4x downscale on the 2560x1440 cameras. Part A
+                             # rejected imgsz 1280 as a no-op, but that was measured on
+                             # yolo11n -- if capacity helps, resolution is the next
+                             # lever and its verdict needs re-measuring on this model.
   confidence_threshold: 0.4  # drop boxes less confident than this
   iou: 0.60                  # NMS overlap threshold. Was previously UNSET, silently
                              # inheriting Ultralytics' 0.7 default -- a load-bearing

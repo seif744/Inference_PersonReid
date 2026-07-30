@@ -11,10 +11,16 @@ python tests/calibration/verify_embedding_contract.py
 python tests/calibration/measure_score_separation.py     register_file.avi 90 6
 python tests/calibration/measure_reconcile_thresholds.py register_file.avi 90 4
 python tests/calibration/measure_detection.py            register_file.avi 50
+python tests/calibration/compare_detector_models.py      register_file.avi 150
 python tests/calibration/measure_pose_ensemble.py        register_file.avi 40 20
 python tests/calibration/characterize_known_defects.py
 python tests/calibration/audit_product_path.py           test_v2.avi 40 2
+python tests/calibration/analyze_decision_log.py         logs/reconcile_decisions_<run_id>.jsonl
 ```
+
+The detector these use is read from `config.yaml` (`detector.model`), not hardcoded, so a
+model swap cannot leave the harness measuring the old model and reporting it as shipped
+behaviour. Override with `CALIB_DETECT_WEIGHTS=yolo11n.pt`.
 
 All are CPU-safe. Nothing writes into the repo — `audit_product_path.py` runs in a temp
 directory with a distinct camera name and a local Qdrant, so it cannot overwrite a real
@@ -28,6 +34,8 @@ directory with a distinct camera name and a local Qdrant, so it cannot overwrite
 | `measure_score_separation.py` | no | H.1, H.2, H.3, H.5 | footage, ReID weights, or feature tap changes |
 | `measure_reconcile_thresholds.py` | no | H.4 | before touching any `identity.reconcile.*` threshold |
 | `measure_detection.py` | no | H.6, H.7 | before proposing any detector-side change |
+| `compare_detector_models.py` | no | H.11 | before changing `detector.model`; answers recall AND whether extra boxes become sustained tracks |
+| `analyze_decision_log.py` | no | J.6, J.10 | after every live run — it is how a threshold change is judged |
 | `measure_pose_ensemble.py` | no | — | only if the batch path comes back into use |
 | `characterize_known_defects.py` | no, always exits 0 | — | after each phase lands, to see what moved |
 | `audit_product_path.py` | no | H.10 | after any pipeline change; the only whole-path check |
@@ -60,6 +68,10 @@ time, and the corrected numbers are lower** — see the note in Part H.
 - post-BN beats post-ReLU on separation margin and lowers the different-person ceiling
 - consensus scoring lowers the different-person ceiling versus `max(prototype, exemplar)`
 - the different-person ceiling sits well above `live.identity.same_camera_threshold` (0.70)
+- yolo11m produces **fewer, longer** track ids than yolo11n on the same frames (held at
+  both 50 and 150 frames): 4 continuous tracks versus 6, where yolo11n splits one person
+  into 64 + 37 frames. The *direction* is stable; the CPU cost ratio (2.0×) is not a GPU
+  ratio, and this clip has no frame dropping, which is where the bigger model could lose
 
 **Not stable — never set a threshold from one run:**
 
