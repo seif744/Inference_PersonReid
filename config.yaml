@@ -319,6 +319,51 @@ identity:
       # Do not re-add cam_224 here without re-running the sweep -- and if the
       # detector changes again, re-derive BOTH cameras.
 
+    # HOW TWO TRACKLETS ARE COMPARED (REMEDIATION_PLAN.md #45a).
+    #   prototype     -- cosine of the two MEANS. What has always shipped.
+    #   max_exemplar  -- max(prototype, best single observation pair). What the
+    #                    live engine uses, documented there as "more robust than a
+    #                    mean alone when a person flips front/back".
+    #   consensus     -- mean of the top `consensus_top_frac` of all observation
+    #                    pairs. Needs MANY matching views, not one.
+    #
+    # WHY THIS EXISTS. A mean is the wrong summary for a person who changes
+    # appearance mode. Someone seen front-on and then from behind has two clusters
+    # of observations and their mean sits between them, matching NEITHER view -- so
+    # their own two fragments score LOW, while two different people in similar
+    # clothing, whose means both sit in the "average person" region, score HIGH.
+    # That is why J.6 found the per-subject boundaries OVERLAPPING and why no
+    # threshold worked from either direction: 0.80 in cam_224 fused strangers into
+    # one reid, 0.90 shattered one person into many.
+    #
+    # Measured on the synthetic front/back counterexample
+    # (tests/live/test_reconcile_scoring_modes.py, 23 checks):
+    #   prototype    one person's two visits 0.640, BELOW two strangers at 0.800
+    #   max_exemplar same person 1.000, strangers 0.800  -- ordering fixed, BUT one
+    #                bad crop in ten fuses two people (1.000)
+    #   consensus    same person 1.000, strangers 0.800, and the same bad crop
+    #                scores only 0.880 -- fixes the split WITHOUT that hole
+    # Part H agrees independently: consensus had the lowest different-person
+    # ceiling of the three modes at both sample sizes.
+    #
+    # STILL `prototype` HERE because CHANGING THE MODE VOIDS EVERY THRESHOLD above
+    # -- each mode has its own scale. Test on a captured run first, which needs no
+    # camera time now that clips are kept:
+    #   python tests/calibration/sweep_reconcile_thresholds.py <run_id> --scoring consensus --cross 0.60,0.70,0.80
+    #   python tests/calibration/rerender_from_clips.py <run_id> --scoring prototype,consensus
+    # then set the mode AND its re-derived bars together.
+    scoring: prototype
+    consensus_top_frac: 0.25   # what FRACTION of observation pairs must agree.
+                               # Part H's "top half" was measured on whole tracks,
+                               # where most view pairs match; between a mostly-front
+                               # fragment and a mostly-back one only a minority do
+                               # (32 of 100 in the fixture), so 0.5 averages in
+                               # mismatched pairs and buries the signal at 0.727.
+                               # Lower = closer to max_exemplar and its weakness.
+    max_observations_per_side: 64   # cap per tracklet/cluster for the pairwise
+                                    # product; evenly spaced, never random, so a
+                                    # replay reproduces the score exactly. 0 = no cap.
+
     min_tracklet_observations: 3  # a real identity needs >= this many observations;
                                    # shorter tracks are detector noise, not people
     require_reciprocal_best: true      # merge a pair only if they are each other's best

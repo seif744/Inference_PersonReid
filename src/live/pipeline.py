@@ -494,6 +494,12 @@ class LivePipeline:
                     self._recon_cfg),
                 require_reciprocal_best=self._recon_cfg.get("require_reciprocal_best", True),
                 min_tracklet_observations=self._recon_cfg.get("min_tracklet_observations", 3),
+                # Pair-scoring mode (#45a). Mode-specific thresholds: changing the
+                # mode without re-deriving the bars above is meaningless.
+                scoring=self._recon_cfg.get("scoring", "prototype"),
+                consensus_top_frac=self._recon_cfg.get("consensus_top_frac", 0.25),
+                max_observations_per_side=self._recon_cfg.get(
+                    "max_observations_per_side", 64),
                 **self._decision_log_kwargs(),
             )
         except Exception as e:

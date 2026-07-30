@@ -921,6 +921,10 @@ def _finalize_run(threads, stop_event, shared, jobs, cfg, disp_cfg, id_cfg,
             same_camera_thresholds=resolve_same_camera_thresholds(recon_cfg),
             require_reciprocal_best=recon_cfg.get("require_reciprocal_best", True),
             min_tracklet_observations=recon_cfg.get("min_tracklet_observations", 1),
+            # Pair-scoring mode (#45a); thresholds above are mode-specific.
+            scoring=recon_cfg.get("scoring", "prototype"),
+            consensus_top_frac=recon_cfg.get("consensus_top_frac", 0.25),
+            max_observations_per_side=recon_cfg.get("max_observations_per_side", 64),
         )
 
     # ---- Final render: annotated videos with the reconciled global ids ------

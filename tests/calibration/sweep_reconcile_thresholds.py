@@ -37,7 +37,7 @@ from _common import bootstrap, header
 bootstrap()
 
 from database.store import PersonVectorStore                      # noqa: E402
-from identity.reconcile import reconcile_tracklets                # noqa: E402
+from identity.reconcile import SCORING_MODES, reconcile_tracklets  # noqa: E402
 
 # Measured different-person prototype ceiling, same-camera, n=12 (Part H.4).
 # Cross-camera stranger scores run LOWER than same-camera, so a cross-camera
@@ -102,17 +102,22 @@ def _arg(flag, default=None):
     return default
 
 
-def run_once(store, run_id, cross, same_global, per_camera, min_obs, reciprocal):
+def run_once(store, run_id, cross, same_global, per_camera, min_obs, reciprocal,
+             scoring=None, top_frac=0.25):
     """One reconcile at these settings -> (remap, merge log lines)."""
     lines = []
     ro = _ReadOnlyStore(store)
+    # scoring=None means "whatever reconcile defaults to", so the baseline row is
+    # the shipped behaviour rather than a mode this script chose.
+    kw = {} if scoring is None else {"scoring": scoring,
+                                     "consensus_top_frac": top_frac}
     remap = reconcile_tracklets(
         ro, threshold=cross, run_id=run_id,
         same_camera_threshold=same_global,
         same_camera_thresholds=per_camera,
         require_reciprocal_best=reciprocal,
         min_tracklet_observations=min_obs,
-        log=lines.append)
+        log=lines.append, **kw)
     return remap, lines
 
 
@@ -157,6 +162,13 @@ def main():
     variants = _parse_same_variants(_arg("--same", "cam_213=0.80,cam_224=0.80"))
     min_obs = int(_arg("--min-obs", "3"))
     reciprocal = _arg("--no-reciprocal") is None
+    scorings = (_arg("--scoring", "") or "").split(",")
+    scorings = [m.strip() for m in scorings if m.strip()] or [None]
+    for m in scorings:
+        if m is not None and m not in SCORING_MODES:
+            raise SystemExit(f"[sweep] unknown --scoring {m!r}; "
+                             f"expected any of {list(SCORING_MODES)}")
+    top_frac = float(_arg("--top-frac", "0.25"))
 
     url = _arg("--url", "http://localhost:6333") or None
     store = PersonVectorStore(path=_arg("--path", "qdrant_data"), url=url)
@@ -193,10 +205,13 @@ def main():
     print("  " + "-" * 88)
 
     results = {}
-    for label, per_camera in variants:
+    variants = [(f"{lab}" if m is None else f"{lab} [{m}]", pc, m)
+                for m in scorings for lab, pc in variants]
+    for label, per_camera, mode in variants:
         for cross in crosses:
             remap, lines = run_once(store, run_id, cross, same_global,
-                                    per_camera, min_obs, reciprocal)
+                                    per_camera, min_obs, reciprocal,
+                                    scoring=mode, top_frac=top_frac)
             s = summarize(remap, lines)
             results[(label, cross)] = s
             shipped = (abs(cross - 0.63) < 1e-9
@@ -211,7 +226,7 @@ def main():
     print("  Check these against what you SAW. A cluster holding several people")
     print("  is a false merge; one person appearing in several clusters is a split.")
     print("  One block per combination -- keep the grid small when reading these.\n")
-    for label, _ in variants:
+    for label, _, _mode in variants:
         for cross in crosses:
             s = results[(label, cross)]
             print(f"  --- same[{label}]  cross={cross:.2f}: "

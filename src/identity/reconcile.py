@@ -138,6 +138,93 @@ def strictest_same_camera_bar(cameras, per_camera, default):
     return max((per_camera.get(c, default) for c in cameras), default=default)
 
 
+# ---------------------------------------------------------------- scoring modes
+#
+# WHY MORE THAN ONE EXISTS (plan #45/#45a). Reconcile has always compared
+# prototype MEANS, and a mean is the wrong summary for a person who changes
+# appearance mode. Someone seen front-on and then from behind has two clusters of
+# observations, and their mean sits between them, matching NEITHER view. So that
+# person's own two fragments can score LOW, while two different people in similar
+# clothing -- whose means both sit in the same "average person" region -- score
+# HIGH. The comparison is biased in exactly the wrong direction, which is why no
+# single threshold both merges one person's fragments and rejects strangers: J.6
+# measured the per-subject boundaries OVERLAPPING (p95 of the top "different"
+# score 0.816 above p5 of the worst "same" score 0.719).
+#
+# The live engine already avoids this and says so in ActiveIdentitySet.score:
+# "medoid-style ... more robust than a mean alone when a person flips front/back
+# or pose-shifts". Reconcile never got that fix.
+#
+# CHANGING THE MODE VOIDS EVERY THRESHOLD, exactly as changing the feature tap
+# does (Part H). Each mode has its own scale; re-derive the bars with
+# tests/calibration/sweep_reconcile_thresholds.py --scoring <mode> before reading
+# anything into a number.
+PROTOTYPE = "prototype"
+MAX_EXEMPLAR = "max_exemplar"
+CONSENSUS = "consensus"
+SCORING_MODES = (PROTOTYPE, MAX_EXEMPLAR, CONSENSUS)
+
+
+def _unit_rows(vectors):
+    """(N, D) of L2-normalized rows."""
+    mat = np.stack(vectors).astype(np.float32)
+    norms = np.linalg.norm(mat, axis=1, keepdims=True)
+    return mat / np.clip(norms, 1e-12, None)
+
+
+def _subsample_rows(mat, cap):
+    """At most `cap` rows, evenly spaced -- DETERMINISTIC, so a replay reproduces
+    the same score. A long tracklet can hold hundreds of observations and the
+    cross-observation product is O(n*m); evenly spaced keeps the pose/lighting
+    variety a random sample would keep, without the nondeterminism."""
+    if cap <= 0 or mat.shape[0] <= cap:
+        return mat
+    idx = np.linspace(0, mat.shape[0] - 1, cap).round().astype(int)
+    return mat[idx]
+
+
+def score_observation_sets(rows_a, rows_b, proto_a, proto_b,
+                           mode=PROTOTYPE, top_frac=0.25, cap=64):
+    """Similarity between two sets of observations, under one scoring mode.
+
+    prototype     -- cosine of the two means. What reconcile has always used.
+    max_exemplar  -- max(prototype cosine, best single observation pair). Answers
+                     "is there ANY view of these two that matches", which is what
+                     recognises a person's front against their own back. Its known
+                     risk is the mirror image: one bad crop can match a stranger
+                     at ~1.0, a defect already recorded for the live bank.
+    consensus     -- mean of the top `top_frac` of all observation pairs. A middle
+                     course: it needs MANY matching view pairs rather than one, so
+                     a single bad crop cannot carry a merge. Part H measured it
+                     with the LOWEST different-person ceiling of the three modes at
+                     both sample sizes.
+
+                     `top_frac` MATTERS MORE THAN IT LOOKS. Part H's "mean of the
+                     top half" was measured comparing whole tracks, where most
+                     view pairs match. Between a mostly-front fragment and a
+                     mostly-back one only a minority of pairs match at all -- in
+                     the test fixture, 32 of 100 -- so averaging the top HALF
+                     necessarily averages in mismatched pairs and buries the
+                     signal (0.727 where the matching pairs all sit at 1.000).
+                     Hence the 0.25 default. It is a floor on "how much of the two
+                     tracklets has to agree", so it trades directly against
+                     robustness: too low and it degenerates toward max_exemplar
+                     and its single-bad-crop failure.
+    """
+    proto = float(proto_a @ proto_b)
+    if mode == PROTOTYPE:
+        return proto
+    sims = _subsample_rows(rows_a, cap) @ _subsample_rows(rows_b, cap).T
+    if mode == MAX_EXEMPLAR:
+        return max(proto, float(sims.max()))
+    if mode == CONSENSUS:
+        flat = np.sort(sims.ravel())[::-1]
+        k = max(1, int(round(flat.size * float(top_frac))))
+        return float(flat[:k].mean())
+    raise ValueError(f"unknown reconcile scoring mode {mode!r}; "
+                     f"expected one of {list(SCORING_MODES)}")
+
+
 def _prototype(vectors):
     """Mean of L2-normalized vectors, renormalized -- the id's appearance center."""
     mat = np.stack(vectors).astype(np.float32)
@@ -229,7 +316,9 @@ def reconcile_tracklets(store, threshold, run_id=None,
                         require_reciprocal_best=True,
                         min_tracklet_observations=1, log=print,
                         decision_log=None, top2_margin_threshold=None,
-                        top2_margin_basis="eligible"):
+                        top2_margin_basis="eligible",
+                        scoring=PROTOTYPE, consensus_top_frac=0.25,
+                        max_observations_per_side=64):
     """
     Rebuild global ids from camera-local tracklets.
 
@@ -350,6 +439,38 @@ def reconcile_tracklets(store, threshold, run_id=None,
     protos = {k: _prototype(tracklets[k]["vectors"]) for k in keys}
     keys = [k for k in keys if protos[k] is not None]
 
+    # ---- pair scoring (plan #45a) -----------------------------------------
+    if scoring not in SCORING_MODES:
+        log(f"  tracklet reconcile: unknown scoring {scoring!r}; falling back to "
+            f"{PROTOTYPE!r} (expected one of {list(SCORING_MODES)})")
+        scoring = PROTOTYPE
+    if scoring != PROTOTYPE:
+        log(f"  tracklet reconcile: scoring={scoring} "
+            f"(top_frac={consensus_top_frac}, cap={max_observations_per_side}) "
+            f"-- NOTE thresholds are mode-specific; re-derive them with the sweep")
+    rows = {k: _unit_rows(tracklets[k]["vectors"]) for k in keys}
+    _rows_cache = {}
+
+    def cluster_rows(members):
+        """Observation rows for a whole cluster, capped and cached per round."""
+        key = frozenset(members)
+        cached = _rows_cache.get(key)
+        if cached is None:
+            mats = [rows[m] for m in sorted(members)]
+            cached = _subsample_rows(
+                mats[0] if len(mats) == 1 else np.concatenate(mats, axis=0),
+                max_observations_per_side)
+            _rows_cache[key] = cached
+        return cached
+
+    def pair_score(members_a, members_b, proto_a, proto_b):
+        if scoring == PROTOTYPE:            # fast path: identical to before
+            return float(proto_a @ proto_b)
+        return score_observation_sets(
+            cluster_rows(members_a), cluster_rows(members_b), proto_a, proto_b,
+            mode=scoring, top_frac=consensus_top_frac,
+            cap=max_observations_per_side)
+
     parent = {k: k for k in keys}
     members = {k: {k} for k in keys}
 
@@ -458,7 +579,7 @@ def reconcile_tracklets(store, threshold, run_id=None,
                 continue
             if not _spans_disjoint(tracklets[a]["span"], tracklets[b]["span"]):
                 continue
-            s = float(protos[a] @ protos[b])
+            s = pair_score({a}, {b}, protos[a], protos[b])
             if s >= cam_bar(a[0]):
                 same_pairs.append((s, a, b))
     accepted_same = set()
@@ -481,7 +602,7 @@ def reconcile_tracklets(store, threshold, run_id=None,
             bar_a = cam_bar(a[0])          # peers are same-camera, so one bar
             scored = []
             for b in peers:
-                score = float(protos[a] @ protos[b])
+                score = pair_score({a}, {b}, protos[a], protos[b])
                 if conflict_reason({a}, {b}) is not None:
                     reason = dlog.TEMPORAL_CONFLICT_SAME_CAMERA
                 elif score < bar_a:
@@ -498,7 +619,9 @@ def reconcile_tracklets(store, threshold, run_id=None,
                     would_fail_reciprocity=None,      # Phase 1 has no reciprocity rule
                     cameras=[b[0]], cluster_size=1, observations=_obs(b),
                     pair_similarity_to_best=(None if best_b is None else
-                                             round(float(protos[b] @ protos[best_b[0]]), 6)),
+                                             round(pair_score({b}, {best_b[0]},
+                                                              protos[b],
+                                                              protos[best_b[0]]), 6)),
                 ))
             margin_gate, best, _, _ = dlog.compute_top2_margin(
                 cands, bar_a, basis=top2_margin_basis,
@@ -596,7 +719,8 @@ def reconcile_tracklets(store, threshold, run_id=None,
             for b in root_keys[i + 1:]:
                 if not mergeable_cross(a, b):
                     continue
-                root_scores[(a, b)] = float(root_protos[a] @ root_protos[b])
+                root_scores[(a, b)] = pair_score(roots[a], roots[b],
+                                                root_protos[a], root_protos[b])
 
         def root_score(a, b):
             return root_scores[(a, b)] if a < b else root_scores[(b, a)]
@@ -655,7 +779,8 @@ def reconcile_tracklets(store, threshold, run_id=None,
             all_scores = {}
             for i, a in enumerate(root_keys):
                 for b in root_keys[i + 1:]:
-                    all_scores[(a, b)] = float(root_protos[a] @ root_protos[b])
+                    all_scores[(a, b)] = pair_score(roots[a], roots[b],
+                                                    root_protos[a], root_protos[b])
 
             def _score(a, b):
                 return all_scores[(a, b)] if (a, b) in all_scores else all_scores[(b, a)]

@@ -49,7 +49,7 @@ ROOT = bootstrap()
 sys.path.insert(0, ROOT)             # for main.render_final_videos
 
 from database.store import PersonVectorStore                      # noqa: E402
-from identity.reconcile import reconcile_tracklets                # noqa: E402
+from identity.reconcile import SCORING_MODES, reconcile_tracklets  # noqa: E402
 
 
 class _ReadOnlyStore:
@@ -114,6 +114,13 @@ def main():
     per_camera = _parse_same(_arg("--same", "cam_213=0.80"))
     min_obs = int(_arg("--min-obs", "3"))
     reciprocal = _arg("--no-reciprocal") is None
+    scorings = (_arg("--scoring", "") or "").split(",")
+    scorings = [m.strip() for m in scorings if m.strip()] or [None]
+    for m in scorings:
+        if m is not None and m not in SCORING_MODES:
+            raise SystemExit(f"[rerender] unknown --scoring {m!r}; "
+                             f"expected any of {list(SCORING_MODES)}")
+    top_frac = float(_arg("--top-frac", "0.25"))
     out_pattern = _arg("--out", "rerender_{name}_{tag}.mp4")
     fps = float(_arg("--fps", "0") or 0)
 
@@ -144,18 +151,23 @@ def main():
     jobs = [(cam, clip) for cam, clip, _ in clips]
     shared = {"annotations": {cam: blob["annotations"] for cam, _, blob in clips}}
 
-    for cross in crosses:
+    combos = [(m, c) for m in scorings for c in crosses]
+    for mode, cross in combos:
         tag = f"x{cross:.2f}".replace(".", "")
-        header(f"cross={cross:.2f}  same={per_camera or 'global only'} "
-               f"(global {same_global})")
+        if mode is not None:
+            tag += f"_{mode}"
+        header(f"scoring={mode or 'config default'}  cross={cross:.2f}  "
+               f"same={per_camera or 'global only'} (global {same_global})")
         lines = []
+        kw = {} if mode is None else {"scoring": mode,
+                                      "consensus_top_frac": top_frac}
         remap = reconcile_tracklets(
             ro, threshold=cross, run_id=run_id,
             same_camera_threshold=same_global,
             same_camera_thresholds=per_camera,
             require_reciprocal_best=reciprocal,
             min_tracklet_observations=min_obs,
-            log=lines.append)
+            log=lines.append, **kw)
         if not remap:
             print("[rerender] reconcile produced NO assignments for this run_id "
                   "-- nothing to draw. Check the run_id against the store.")
