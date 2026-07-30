@@ -400,6 +400,55 @@ identity:
                                     # product; evenly spaced, never random, so a
                                     # replay reproduces the score exactly. 0 = no cap.
 
+    # RECIPROCAL BEST in the SAME-CAMERA phase (plan item, operator's priority 3).
+    # Phase 2 has always required two clusters to be each other's best partner;
+    # Phase 1 never did, so it merged EVERY above-bar pair in score order. That is
+    # how one weak edge pulls a stranger in: in run 20260730_111232, cam_224's
+    # tracklet 58 had its best partner at 0.937 (16) and yet ALSO merged with 112
+    # at 0.823 and 120 at 0.872, fusing two people into one reid. Mutual-best
+    # refuses both without moving any threshold -- it removes the over-merge /
+    # under-merge trade instead of repositioning it.
+    #
+    # COST: someone fragmented into 3+ pieces gets only one mutual-best pair per
+    # round in Phase 1; the rest consolidate in Phase 2's rounds instead, so they
+    # arrive later rather than never.
+    #
+    # OFF by default so it changes nothing until it is tested on its own. Test with
+    # NO other change, on a captured run, and watch the video:
+    #   python tests/calibration/rerender_from_clips.py <id> --same-reciprocal
+    same_camera_reciprocal_best: true
+
+    # CROSS-CAMERA SIMULTANEITY VETO (#38, Phase 7). conflict() used to skip every
+    # cross-camera pair, so two tracklets overlapping IN TIME in cameras that
+    # cannot both see one person still merged on appearance alone. A person in
+    # cam_213 and a different person in cam_219 at the same moment is a physical
+    # impossibility no cosine can excuse -- and it is a leading candidate for the
+    # "one number on two people" symptom, which no threshold addresses.
+    #
+    # Needs wall-clock `ts`, which reconcile now reads (#26); frame indices are
+    # per-camera and not comparable at 15 vs 25 fps.
+    #
+    # `covisible` = never vetoed. A number = veto when the two tracklets overlap by
+    # MORE than that many seconds. A pair NOT listed is unconstrained (decision D1:
+    # silence loses protection rather than splitting a real person), and startup
+    # names every unlisted pair so that is visible instead of silent.
+    #
+    # Tolerances are generous on purpose: `ts` is RECEIVE time, not capture time
+    # (#15), so it carries network jitter, decode-cost differences and frame-rate
+    # quantisation. 1.0s vetoes only sustained overlap, not timing noise.
+    #
+    # OFF by default -- it has never run on real footage. Turn on ALONE.
+    covisibility:
+      enabled: true
+      default_tolerance_sec: 1.0
+      pairs:
+        - [cam_224, cam_219, covisible]   # same room, overlapping views
+        - [cam_213, cam_219, 1.0]
+        - [cam_213, cam_224, 1.0]
+        - [cam_213, cam_206, 1.0]
+        - [cam_206, cam_219, 1.0]
+        - [cam_206, cam_224, 1.0]
+
     min_tracklet_observations: 3  # a real identity needs >= this many observations;
                                    # shorter tracks are detector noise, not people
     require_reciprocal_best: true      # merge a pair only if they are each other's best

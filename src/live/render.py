@@ -66,33 +66,60 @@ class RenderStage(threading.Thread):
         self.annotations = []
         self._clip = None
         self._clip_disabled = False
+        # Wall-clock of the first/last captured frame -> this camera's MEASURED
+        # rate (#45/#46). A single global output.fps_default tagged every camera at
+        # 20, so cam_224 at a real 14.8 fps played 1.35x FAST and cam_219 at 24.2
+        # played 1.21x SLOW -- which the operator noticed immediately and which
+        # makes cross-camera comparison by eye unreliable.
+        self._first_ts = None
+        self._last_ts = None
+
+    failed = None
 
     def run(self):
-        while not self.stop_event.is_set():
-            frame = self.in_q.get(timeout=0.1)
-            if frame is None:
-                continue
-            self._process(frame)
-        # Capture mode: drain whatever is still queued so trailing frames make it
-        # into the clip (real-time-first still applies -- we don't block forever),
-        # then finalize the temp clip so it is re-decodable by the render pass.
-        if self.capture_mode:
-            frame = self.in_q.get(timeout=0.0)
-            while frame is not None:
+        # #55: no worker had an exception guard. An unhandled error killed the
+        # THREAD while the pipeline kept running -- a dead InferenceStage just
+        # produces no detections, and a dead RenderStage writes nothing, with no
+        # error anywhere. Record it loudly and set `failed` so shutdown can say
+        # which stage died instead of leaving an empty output to explain.
+        _FATAL_GUARD = True
+        try:
+            while not self.stop_event.is_set():
+                frame = self.in_q.get(timeout=0.1)
+                if frame is None:
+                    continue
                 self._process(frame)
+            # Capture mode: drain whatever is still queued so trailing frames make it
+            # into the clip (real-time-first still applies -- we don't block forever),
+            # then finalize the temp clip so it is re-decodable by the render pass.
+            if self.capture_mode:
                 frame = self.in_q.get(timeout=0.0)
-            if self._clip is not None:
-                self._clip.release()
-                print(f"[render:{self.cam}] captured {self.rendered} processed "
-                      f"frames -> {self.clip_path}")
-                self._write_annotations()
-
+                while frame is not None:
+                    self._process(frame)
+                    frame = self.in_q.get(timeout=0.0)
+                if self._clip is not None:
+                    self._clip.release()
+                    print(f"[render:{self.cam}] captured {self.rendered} processed "
+                          f"frames -> {self.clip_path}")
+                    self._write_annotations()
+        except BaseException as e:                              # noqa: BLE001
+            import traceback
+            self.failed = e
+            print(f"[RenderStage] FATAL: this stage has DIED ({type(e).__name__}: {e}). "
+                  f"The run will continue but this stage produces nothing from now on.")
+            traceback.print_exc()
+            raise
     def _process(self, frame):
         img = _to_cpu_bgr(frame.image, frame.device)
         if img is None:
             return
         dets = frame.detections or []
         if self.capture_mode:
+            ts = getattr(frame, "ts", None)
+            if ts is not None:
+                if self._first_ts is None:
+                    self._first_ts = float(ts)
+                self._last_ts = float(ts)
             self._capture(img, dets)
             return
         img = draw_detections(img, dets)
@@ -127,6 +154,10 @@ class RenderStage(threading.Thread):
                     "run_id": self.run_id,
                     "clip": os.path.basename(self.clip_path),
                     "clip_fps": self.clip_fps,
+                    # The rate to PLAY this back at. clip_fps is only what the
+                    # container was tagged with (a global default); this is what
+                    # the frames were actually produced at.
+                    "measured_fps": self.measured_fps(),
                     "frames": len(self.annotations),
                     "annotations": self.annotations,
                 }, f)
@@ -135,6 +166,21 @@ class RenderStage(threading.Thread):
             print(f"[render:{self.cam}] could not write {path}: {e} "
                   f"(the run is unaffected; offline re-render will not be "
                   f"possible for this camera)")
+
+    def measured_fps(self):
+        """Frames actually captured per wall-clock second, or None if unknowable.
+
+        This is the rate the clip's frames were really produced at, so it is the
+        rate that plays them back in real time -- unlike the nominal camera fps
+        (dropped frames make the real rate lower) or a global config default.
+        """
+        if (self._first_ts is None or self._last_ts is None
+                or self.rendered < 2):
+            return None
+        elapsed = self._last_ts - self._first_ts
+        if elapsed <= 0:
+            return None
+        return (self.rendered - 1) / elapsed
 
     def _capture(self, img, dets):
         """Record the CLEAN frame + its box geometry (both from this one Frame,

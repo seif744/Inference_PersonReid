@@ -41,33 +41,48 @@ class InferenceStage(threading.Thread):
         self._embed_lock = threading.Lock()   # guards the SHARED ReID extractor
         self._pool = None
 
-    def run(self):
-        # One reusable pool sized to the camera count. daemon threads.
-        self._pool = ThreadPoolExecutor(max_workers=self.max_workers,
-                                        thread_name_prefix="infer")
-        try:
-            while not self.stop_event.is_set():
-                batch = self.inference_queue.get(timeout=0.1)
-                if not batch:
-                    continue
-                # Group by camera, preserving per-camera order (ByteTrack needs a
-                # camera's frames in sequence, on ONE worker).
-                groups = defaultdict(list)
-                for frame in batch:
-                    groups[frame.cam].append(frame)
-                # Process cameras concurrently; wait for all before forwarding.
-                futures = [self._pool.submit(self._process_group, frames)
-                           for frames in groups.values()]
-                for fut in futures:
-                    fut.result()
-                # Forward in the original batch order -> each camera's frames keep
-                # their relative order downstream.
-                for frame in batch:
-                    self.identity_queue.put(frame)
-                    self.frames_done += 1
-        finally:
-            self._pool.shutdown(wait=False)
+    failed = None
 
+    def run(self):
+        # #55: no worker had an exception guard. An unhandled error killed the
+        # THREAD while the pipeline kept running -- a dead InferenceStage just
+        # produces no detections, and a dead RenderStage writes nothing, with no
+        # error anywhere. Record it loudly and set `failed` so shutdown can say
+        # which stage died instead of leaving an empty output to explain.
+        _FATAL_GUARD = True
+        try:
+            # One reusable pool sized to the camera count. daemon threads.
+            self._pool = ThreadPoolExecutor(max_workers=self.max_workers,
+                                            thread_name_prefix="infer")
+            try:
+                while not self.stop_event.is_set():
+                    batch = self.inference_queue.get(timeout=0.1)
+                    if not batch:
+                        continue
+                    # Group by camera, preserving per-camera order (ByteTrack needs a
+                    # camera's frames in sequence, on ONE worker).
+                    groups = defaultdict(list)
+                    for frame in batch:
+                        groups[frame.cam].append(frame)
+                    # Process cameras concurrently; wait for all before forwarding.
+                    futures = [self._pool.submit(self._process_group, frames)
+                               for frames in groups.values()]
+                    for fut in futures:
+                        fut.result()
+                    # Forward in the original batch order -> each camera's frames keep
+                    # their relative order downstream.
+                    for frame in batch:
+                        self.identity_queue.put(frame)
+                        self.frames_done += 1
+            finally:
+                self._pool.shutdown(wait=False)
+        except BaseException as e:                              # noqa: BLE001
+            import traceback
+            self.failed = e
+            print(f"[InferenceStage] FATAL: this stage has DIED ({type(e).__name__}: {e}). "
+                  f"The run will continue but this stage produces nothing from now on.")
+            traceback.print_exc()
+            raise
     def _process_group(self, frames):
         """Process ONE camera's frames sequentially (its ByteTrack state is only
         ever touched by this single worker)."""

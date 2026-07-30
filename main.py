@@ -292,7 +292,8 @@ def build_gid_map(store, run_id):
 
 
 def render_final_videos(jobs, cfg, shared, store, run_id,
-                        gid_map=None, out_pattern="output_{name}.mp4"):
+                        gid_map=None, out_pattern="output_{name}.mp4",
+                        fps_by_camera=None):
     """
     SECOND PASS -- write output_<camera>.mp4 with the FINAL (post-reconciliation)
     global ids. The live pass only captured box geometry; cross-camera identity is
@@ -310,7 +311,12 @@ def render_final_videos(jobs, cfg, shared, store, run_id,
         untouched while producing a watchable video.
       * out_pattern -- write somewhere other than output_<cam>.mp4, so two settings
         can be rendered side by side and compared instead of overwriting.
-    Both default to today's behaviour exactly; the live path passes neither.
+
+    fps_by_camera : {camera: fps} -- each camera's OWN playback rate (#45/#46). A
+        single global output_fps tagged all four cameras at 20, so cam_224 at a real
+        14.8 fps played 1.35x fast and cam_219 at 24.2 played 1.21x slow. Four videos
+        on four wrong time scales cannot be compared by eye, which is how identity is
+        actually judged. Falls back to cfg display.output_fps per camera.
     """
     from concurrent.futures import ThreadPoolExecutor
     from types import SimpleNamespace
@@ -318,10 +324,18 @@ def render_final_videos(jobs, cfg, shared, store, run_id,
         gid_map = build_gid_map(store, run_id)
     resize_width = cfg["source"].get("resize_width", 0)
     fps = float(cfg["display"].get("output_fps", 20.0))
+    fps_by_camera = fps_by_camera or {}
 
     def render_one(name, path):
         annos = shared["annotations"].get(name)
         if not annos:
+            # #64: this used to `return` silently. With four cameras, one producing
+            # no video and no message is easy to miss entirely -- and "the file is
+            # missing" is indistinguishable from "the file is stale from an earlier
+            # run", which is exactly the trap that hid two lost runs.
+            print(f"[render] {name}: NO annotations captured -> NO video written. "
+                  f"That camera contributed nothing to this run (never connected, "
+                  f"or every frame was dropped).")
             return
         out_path = out_pattern.format(name=name)
         writer = None
@@ -369,7 +383,8 @@ def render_final_videos(jobs, cfg, shared, store, run_id,
                     if writer is None:
                         h, w = frame.shape[:2]
                         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                        writer = cv2.VideoWriter(out_path, fourcc, fps, (w, h))
+                        out_fps = float(fps_by_camera.get(name) or fps)
+                        writer = cv2.VideoWriter(out_path, fourcc, out_fps, (w, h))
                     writer.write(frame)
         except Exception as e:
             print(f"[render] {name}: ERROR re-rendering: {e}")
@@ -911,6 +926,7 @@ def _finalize_run(threads, stop_event, shared, jobs, cfg, disp_cfg, id_cfg,
     recon_cfg = id_cfg.get("reconcile", {}) if id_cfg else {}
     if identity is not None and recon_cfg.get("enabled"):
         from identity.reconcile import (reconcile_tracklets,
+                                        resolve_covisibility,
                                         resolve_same_camera_thresholds)
         threshold = recon_cfg.get("threshold")
         if threshold is None:
@@ -929,6 +945,9 @@ def _finalize_run(threads, stop_event, shared, jobs, cfg, disp_cfg, id_cfg,
             min_tracklet_observations=recon_cfg.get("min_tracklet_observations", 1),
             # Pair-scoring mode (#45a); thresholds above are mode-specific.
             scoring=recon_cfg.get("scoring", "prototype"),
+            covisibility=resolve_covisibility(recon_cfg),
+            same_camera_reciprocal_best=recon_cfg.get(
+                "same_camera_reciprocal_best", False),
             consensus_top_frac=recon_cfg.get("consensus_top_frac", 0.25),
             max_observations_per_side=recon_cfg.get("max_observations_per_side", 64),
         )

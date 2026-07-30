@@ -121,6 +121,56 @@ def resolve_same_camera_thresholds(recon_cfg, log=print):
     return out
 
 
+COVISIBLE = "covisible"
+
+
+def resolve_covisibility(recon_cfg, log=print):
+    """`identity.reconcile.covisibility` -> (enabled, {frozenset(pair): tolerance}).
+
+    A tolerance of None means the pair is CO-VISIBLE: both cameras can genuinely
+    see one person at the same moment, so simultaneous tracklets prove nothing and
+    are never vetoed. A number means "veto when the two tracklets overlap in time
+    by MORE than this many seconds".
+
+    FAIL-OPEN, deliberately (decision D1): a pair that is absent from the config is
+    unconstrained. Silence loses protection rather than splitting a real person in
+    half, because a wrong veto is worse than a missing one -- it manufactures a
+    second identity for someone who only has one.
+    """
+    cfg = (recon_cfg or {}).get("covisibility") or {}
+    enabled = bool(cfg.get("enabled", False))
+    default_tol = cfg.get("default_tolerance_sec", 1.0)
+    pairs = {}
+    for entry in (cfg.get("pairs") or []):
+        try:
+            a, b, spec = entry[0], entry[1], entry[2]
+        except (TypeError, IndexError):
+            log(f"  [reconcile] covisibility: skipping malformed pair {entry!r} "
+                f"(expected [cam_a, cam_b, seconds|'covisible']).")
+            continue
+        key = frozenset((str(a), str(b)))
+        if isinstance(spec, str) and spec.strip().lower() == COVISIBLE:
+            pairs[key] = None
+            continue
+        try:
+            pairs[key] = float(spec)
+        except (TypeError, ValueError):
+            log(f"  [reconcile] covisibility: {a}<->{b} tolerance {spec!r} is "
+                f"neither a number nor {COVISIBLE!r} -- using the default "
+                f"{default_tol}s.")
+            pairs[key] = float(default_tol)
+    return enabled, pairs
+
+
+def temporal_overlap_sec(span_a, span_b):
+    """Seconds two wall-clock spans overlap (0.0 when they do not, None if either
+    span is missing). A single-observation tracklet has a zero-length span, so it
+    can never register an overlap -- consistent fail-open."""
+    if not span_a or not span_b:
+        return None
+    return min(span_a[1], span_b[1]) - max(span_a[0], span_b[0])
+
+
 def strictest_same_camera_bar(cameras, per_camera, default):
     """The same-camera bar that applies to a claim about `cameras`.
 
@@ -250,6 +300,7 @@ def _gather_tracklets(store, run_id):
         vectors: [embedding],
         points: [point ids],
         span: (min_frame, max_frame),
+        span_ts: (min_ts, max_ts) or None,
         gids: {original global ids},
     }.
     """
@@ -257,6 +308,7 @@ def _gather_tracklets(store, run_id):
         "vectors": [],
         "points": [],
         "frames": [],
+        "times": [],
         "gids": set(),
     })
 
@@ -285,6 +337,18 @@ def _gather_tracklets(store, run_id):
             data[key]["vectors"].append(np.asarray(vector, dtype=np.float32))
             data[key]["points"].append(p.id)
             data[key]["frames"].append(int(frame))
+            # WALL-CLOCK span (#26). Frame indices are per-camera and NOT
+            # comparable across cameras running at different rates -- 15 fps and
+            # 25 fps put frame 1000 forty seconds apart. Any cross-camera timing
+            # rule therefore needs `ts`, which the store has always carried and
+            # reconcile has never read. Missing/garbage ts leaves `times` short and
+            # the tracklet keeps frame-index spans only.
+            ts = pl.get("ts")
+            if ts is not None:
+                try:
+                    data[key]["times"].append(float(ts))
+                except (TypeError, ValueError):
+                    pass
             gid = pl.get("reid_id", pl.get("global_id"))
             if gid is not None:
                 data[key]["gids"].add(int(gid))
@@ -297,10 +361,14 @@ def _gather_tracklets(store, run_id):
         if not info["vectors"]:
             continue
         frames = info["frames"]
+        times = info["times"]
         out[key] = {
             "vectors": info["vectors"],
             "points": info["points"],
             "span": (min(frames), max(frames)),
+            # None when no usable ts was stored, which is the signal every
+            # ts-dependent rule uses to fail open rather than guess.
+            "span_ts": ((min(times), max(times)) if times else None),
             "gids": info["gids"],
         }
     return out
@@ -318,7 +386,9 @@ def reconcile_tracklets(store, threshold, run_id=None,
                         decision_log=None, top2_margin_threshold=None,
                         top2_margin_basis="eligible",
                         scoring=PROTOTYPE, consensus_top_frac=0.25,
-                        max_observations_per_side=64):
+                        max_observations_per_side=64,
+                        covisibility=None,
+                        same_camera_reciprocal_best=False):
     """
     Rebuild global ids from camera-local tracklets.
 
@@ -400,6 +470,31 @@ def reconcile_tracklets(store, threshold, run_id=None,
             + ", ".join(f"{c}={cam_bar(c):.2f}"
                         for c in sorted(cameras_present, key=str))
             + f"  (global {same_camera_threshold:.2f}, cross-camera {threshold:.2f})")
+
+    # ---- cross-camera simultaneity veto (#38, Phase 7) --------------------
+    covis_enabled, covis_pairs = (covisibility if covisibility is not None
+                                  else (False, {}))
+    if covis_enabled:
+        listed = {c for pair in covis_pairs for c in pair}
+        present = sorted(cameras_present, key=str)
+        missing = [f"{a}<->{b}" for i, a in enumerate(present)
+                   for b in present[i + 1:]
+                   if frozenset((a, b)) not in covis_pairs]
+        with_ts = sum(1 for k in all_keys if tracklets[k]["span_ts"])
+        log(f"  tracklet reconcile: cross-camera simultaneity veto ON over "
+            f"{len(covis_pairs)} configured pair(s); {with_ts}/{len(all_keys)} "
+            f"tracklet(s) have a wall-clock span")
+        if missing:
+            # D1: a pair nobody configured is UNCONSTRAINED. That is a deliberate
+            # fail-open, but it must be visible -- silence here means a camera pair
+            # that can never veto, which looks exactly like the veto not working.
+            log(f"  tracklet reconcile: NO covisibility entry for {missing} -- "
+                f"those pairs are unconstrained (add them to "
+                f"identity.reconcile.covisibility.pairs)")
+        unknown = sorted(str(c) for c in listed if c not in cameras_present)
+        if unknown:
+            log(f"  tracklet reconcile: covisibility names {unknown}, absent from "
+                f"this run")
 
     def _obs(k):
         return len(tracklets[k]["vectors"])
@@ -484,16 +579,49 @@ def reconcile_tracklets(store, threshold, run_id=None,
         """None when the two clusters may merge, else the blocking gate name.
 
         Returns a REASON rather than a bool so the decision log can attribute the
-        exclusion. Today the only reason is a same-camera time overlap; Phase 7
-        adds TEMPORAL_CONFLICT_CROSS_CAMERA here for non-co-visible camera pairs,
-        which is why this is shaped to carry more than one.
+        exclusion.
+
+        TWO physical impossibilities are checked, and both are HARD -- no appearance
+        score can override them, because they are statements about where one body
+        can be, not about how alike two crops look:
+
+        SAME CAMERA: two tracklets overlapping in time in ONE view are provably two
+        people. One body cannot be two simultaneous detections.
+
+        CROSS CAMERA (#38, Phase 7): two tracklets overlapping in time in cameras
+        that CANNOT both see one person are equally provably two people. Until now
+        this check did not exist -- `conflict()` skipped every cross-camera pair
+        outright -- so a person in cam_213 and a different person in cam_219 at the
+        same moment merged on appearance alone. That is the "one number on two
+        people" the operator kept reporting, and no threshold addresses it: the
+        pair's cosine can be perfectly high and the merge still be impossible.
+
+        Fail-open everywhere it is unsure: disabled by config, an unlisted camera
+        pair, a co-visible pair, or a missing wall-clock span all mean "no veto".
+        A wrong veto is worse than a missing one -- it manufactures a second
+        identity for someone who only has one.
         """
         for a in set_a:
             for b in set_b:
-                if a[0] != b[0]:
+                if a[0] == b[0]:
+                    if not _spans_disjoint(tracklets[a]["span"],
+                                           tracklets[b]["span"]):
+                        return dlog.TEMPORAL_CONFLICT_SAME_CAMERA
                     continue
-                if not _spans_disjoint(tracklets[a]["span"], tracklets[b]["span"]):
-                    return dlog.TEMPORAL_CONFLICT_SAME_CAMERA
+                if not covis_enabled:
+                    continue
+                pair = frozenset((a[0], b[0]))
+                if pair not in covis_pairs:
+                    continue                      # unlisted -> unconstrained (D1)
+                tol = covis_pairs[pair]
+                if tol is None:
+                    continue                      # co-visible -> never vetoed
+                overlap = temporal_overlap_sec(tracklets[a]["span_ts"],
+                                               tracklets[b]["span_ts"])
+                if overlap is None:
+                    continue                      # no wall clock -> cannot judge
+                if overlap > tol:
+                    return dlog.TEMPORAL_CONFLICT_CROSS_CAMERA
         return None
 
     def conflict(set_a, set_b):
@@ -582,12 +710,47 @@ def reconcile_tracklets(store, threshold, run_id=None,
             s = pair_score({a}, {b}, protos[a], protos[b])
             if s >= cam_bar(a[0]):
                 same_pairs.append((s, a, b))
+
+    # RECIPROCAL BEST in Phase 1 (opt-in). Phase 2 has always required mutual
+    # nearest-neighbour; Phase 1 never did, so it merged EVERY above-bar pair in
+    # score order. That is how one weak edge drags a stranger into a cluster: in
+    # cam_224, tracklet 58's best partner was 16 at 0.937, yet 58+112 (0.823) and
+    # 58+120 (0.872) merged anyway and fused two people into one reid. Mutual-best
+    # refuses both WITHOUT moving any threshold, which is why it is worth more than
+    # another bar sweep -- it removes the trade instead of repositioning it.
+    #
+    # The cost is the mirror image: a person genuinely fragmented into three or
+    # more pieces has only ONE mutual-best pair per round here, so the rest wait
+    # for Phase 2's rounds to consolidate them. Phase 2 re-scores from scratch each
+    # round, so chains still close, just later.
+    same_best = {}
+    if same_camera_reciprocal_best:
+        for s, a, b in same_pairs:
+            if s > same_best.get(a, (-1.0, None))[0]:
+                same_best[a] = (s, b)
+            if s > same_best.get(b, (-1.0, None))[0]:
+                same_best[b] = (s, a)
+
+    def same_pair_mutual(a, b):
+        if not same_camera_reciprocal_best:
+            return True
+        return (same_best.get(a, (None, None))[1] == b
+                and same_best.get(b, (None, None))[1] == a)
+
     accepted_same = set()
+    rejected_not_mutual = 0
     for s, a, b in sorted(same_pairs, reverse=True):
+        if not same_pair_mutual(a, b):
+            rejected_not_mutual += 1
+            continue
         if union(a, b):
             log(f"  tracklet reconcile: same-camera merge {a} + {b} "
                 f"(cosine {s:.3f})")
             accepted_same.add((a, b))
+    if same_camera_reciprocal_best:
+        log(f"  tracklet reconcile: same-camera reciprocal-best ON -- "
+            f"{len(accepted_same)} merged, {rejected_not_mutual} above-bar pair(s) "
+            f"refused for not being each other's best")
 
     # ---- Phase 1 instrumentation, subject-centric so the margin is meaningful.
     # Runs AFTER the merges above and reads only `protos` / `tracklets`, so it

@@ -42,30 +42,46 @@ class BatchScheduler(threading.Thread):
         self.dispatched_frames = 0
         self.stale_skipped = 0
 
-    def run(self):
-        while not self.stop_event.is_set():
-            batch = []
-            deadline = time.monotonic() + self.t_batch
-            # Accumulate fresh frames until the batch is full or the timer fires.
-            while (len(batch) < self.max_batch_size
-                   and time.monotonic() < deadline
-                   and not self.stop_event.is_set()):
-                got_any = False
-                for cam, slot in self.slots.items():
-                    frame = slot.get()
-                    if frame is None:
-                        continue
-                    got_any = True
-                    if frame.age_ms(time.time()) > self.max_staleness * 1000.0:
-                        self.stale_skipped += 1     # too old -> skip, don't process late
-                        continue
-                    batch.append(frame)
-                    if len(batch) >= self.max_batch_size:
-                        break
-                if not got_any:
-                    time.sleep(self.cycle_sleep)     # nothing ready; yield briefly
+    failed = None
 
-            if batch:
-                self.inference_queue.put(batch)
-                self.dispatched_batches += 1
-                self.dispatched_frames += len(batch)
+    def run(self):
+        # #55: no worker had an exception guard. An unhandled error killed the
+        # THREAD while the pipeline kept running -- a dead InferenceStage just
+        # produces no detections, and a dead RenderStage writes nothing, with no
+        # error anywhere. Record it loudly and set `failed` so shutdown can say
+        # which stage died instead of leaving an empty output to explain.
+        _FATAL_GUARD = True
+        try:
+            while not self.stop_event.is_set():
+                batch = []
+                deadline = time.monotonic() + self.t_batch
+                # Accumulate fresh frames until the batch is full or the timer fires.
+                while (len(batch) < self.max_batch_size
+                       and time.monotonic() < deadline
+                       and not self.stop_event.is_set()):
+                    got_any = False
+                    for cam, slot in self.slots.items():
+                        frame = slot.get()
+                        if frame is None:
+                            continue
+                        got_any = True
+                        if frame.age_ms(time.time()) > self.max_staleness * 1000.0:
+                            self.stale_skipped += 1     # too old -> skip, don't process late
+                            continue
+                        batch.append(frame)
+                        if len(batch) >= self.max_batch_size:
+                            break
+                    if not got_any:
+                        time.sleep(self.cycle_sleep)     # nothing ready; yield briefly
+
+                if batch:
+                    self.inference_queue.put(batch)
+                    self.dispatched_batches += 1
+                    self.dispatched_frames += len(batch)
+        except BaseException as e:                              # noqa: BLE001
+            import traceback
+            self.failed = e
+            print(f"[BatchScheduler] FATAL: this stage has DIED ({type(e).__name__}: {e}). "
+                  f"The run will continue but this stage produces nothing from now on.")
+            traceback.print_exc()
+            raise

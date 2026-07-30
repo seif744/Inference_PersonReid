@@ -178,7 +178,11 @@ def main():
         # re-render does not inherit the single global output fps that makes
         # cam_224 play fast and cam_219 slow (plan #45/#46).
         for cam, clip, blob in clips:
-            cam_fps = fps or float(blob.get("clip_fps") or 20.0)
+            # measured_fps is the rate the frames were really produced at;
+            # clip_fps is only what the container was tagged with (the old global
+            # default), which is why an earlier re-render still played cam_224 fast.
+            cam_fps = fps or float(blob.get("measured_fps")
+                                   or blob.get("clip_fps") or 20.0)
             render_final_videos(
                 [(cam, clip)],
                 {"source": {"resize_width": 0},

@@ -71,37 +71,52 @@ class IdentityStage(threading.Thread):
         self.frames_done = 0
 
     # ---- thread loop -------------------------------------------------------
+    failed = None
+
     def run(self):
-        last_sweep = time.monotonic()
-        while not self.stop_event.is_set():
-            # 1) block briefly for one frame, then DRAIN the rest of the input so
-            #    the fair queue can interleave a burst across cameras.
-            frame = self.in_q.get(timeout=0.1)
-            if frame is not None:
-                self.fair.push(frame.cam, frame)
-                while True:
-                    f = self.in_q.get_nowait()
+        # #55: no worker had an exception guard. An unhandled error killed the
+        # THREAD while the pipeline kept running -- a dead InferenceStage just
+        # produces no detections, and a dead RenderStage writes nothing, with no
+        # error anywhere. Record it loudly and set `failed` so shutdown can say
+        # which stage died instead of leaving an empty output to explain.
+        _FATAL_GUARD = True
+        try:
+            last_sweep = time.monotonic()
+            while not self.stop_event.is_set():
+                # 1) block briefly for one frame, then DRAIN the rest of the input so
+                #    the fair queue can interleave a burst across cameras.
+                frame = self.in_q.get(timeout=0.1)
+                if frame is not None:
+                    self.fair.push(frame.cam, frame)
+                    while True:
+                        f = self.in_q.get_nowait()
+                        if f is None:
+                            break
+                        self.fair.push(f.cam, f)
+
+                # 2) process the fair buffer round-robin (anti-starvation order).
+                while not self.stop_event.is_set():
+                    f = self.fair.pop()
                     if f is None:
                         break
-                    self.fair.push(f.cam, f)
+                    self._resolve_frame(f)
+                    rq = self.render_queues.get(f.cam)
+                    if rq is not None:
+                        rq.put(f)
+                    self.frames_done += 1
 
-            # 2) process the fair buffer round-robin (anti-starvation order).
-            while not self.stop_event.is_set():
-                f = self.fair.pop()
-                if f is None:
-                    break
-                self._resolve_frame(f)
-                rq = self.render_queues.get(f.cam)
-                if rq is not None:
-                    rq.put(f)
-                self.frames_done += 1
-
-            # 3) periodic eviction on the wall clock (TTLs are in seconds).
-            now = time.monotonic()
-            if now - last_sweep >= self.sweep_interval:
-                self.engine.sweep(time.time())
-                last_sweep = now
-
+                # 3) periodic eviction on the wall clock (TTLs are in seconds).
+                now = time.monotonic()
+                if now - last_sweep >= self.sweep_interval:
+                    self.engine.sweep(time.time())
+                    last_sweep = now
+        except BaseException as e:                              # noqa: BLE001
+            import traceback
+            self.failed = e
+            print(f"[IdentityStage] FATAL: this stage has DIED ({type(e).__name__}: {e}). "
+                  f"The run will continue but this stage produces nothing from now on.")
+            traceback.print_exc()
+            raise
     def _resolve_frame(self, frame):
         """Stamp reid_id / global_id on every detection in the frame, and (in the
         offline-reconcile flow) persist fresh observations to the store."""

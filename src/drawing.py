@@ -33,15 +33,33 @@ LABEL_THICKNESS = 2              # id/GID label stroke weight (was 1)
 # A fixed palette of distinct, bright BGR colours. Each track id is mapped to
 # one of these so the SAME person keeps the SAME colour frame to frame, which
 # makes it easy to follow someone with your eyes.
+# 20 colours, not 8 (plan #35). With 8, `id % 8` made ids 3 and 11 the same colour,
+# and across several camera videos the check an operator actually performs is "did
+# this person keep their colour" -- so a collision READS AS a false merge that never
+# happened. Every entry below is distinguishable from the others in BGR at video
+# scale; the ordering interleaves hues so that CONSECUTIVE ids (the common case,
+# since gids are assigned in order) are always far apart.
 _PALETTE = [
-    (0, 255, 0),     # green
-    (255, 0, 0),     # blue
-    (0, 0, 255),     # red
-    (0, 255, 255),   # yellow
-    (255, 0, 255),   # magenta
-    (255, 255, 0),   # cyan
-    (0, 165, 255),   # orange
-    (128, 0, 255),   # pink/red
+    (0, 255, 0),      # green
+    (255, 0, 0),      # blue
+    (0, 0, 255),      # red
+    (0, 255, 255),    # yellow
+    (255, 0, 255),    # magenta
+    (255, 255, 0),    # cyan
+    (0, 165, 255),    # orange
+    (128, 0, 255),    # pink
+    (0, 128, 0),      # dark green
+    (255, 128, 0),    # azure
+    (0, 0, 128),      # maroon
+    (128, 255, 255),  # pale yellow
+    (203, 192, 255),  # light pink
+    (0, 215, 255),    # gold
+    (139, 61, 72),    # plum
+    (170, 178, 32),   # olive
+    (255, 191, 0),    # deep sky
+    (147, 20, 255),   # deep pink
+    (79, 79, 47),     # dark slate
+    (212, 255, 127),  # aquamarine
 ]
 
 

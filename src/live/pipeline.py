@@ -192,7 +192,19 @@ class LivePipeline:
         if self.reconcile_enabled:
             self.store = self._build_store()
             if self.store is None:
+                # #59: reconcile silently switching itself off produces a
+                # live-annotated video that LOOKS like a normal result -- provisional
+                # per-camera ids, no cross-camera identity, and nothing saying so.
+                # An operator cannot tell that from a successful run.
                 self.reconcile_enabled = False
+                print("=" * 72)
+                print("[live] WARNING: the gallery store is unavailable, so the "
+                      "OFFLINE RECONCILE IS DISABLED.")
+                print("[live] Output videos will carry PROVISIONAL per-camera ids "
+                      "with NO cross-camera identity.")
+                print("[live] That is almost certainly not what you want. Start "
+                      "Qdrant (docker compose up -d) and re-run.")
+                print("=" * 72)
         if self.reconcile_enabled:
             print(f"[live] offline reconcile ENABLED (run_id={self.run_id}): live "
                   f"reids are provisional; the CORRECT cross-camera ids are settled "
@@ -214,7 +226,11 @@ class LivePipeline:
         # ByteTrack -> less identity fragmentation. Scoped to the live path only via
         # live.inference.pose_ensemble; the file-batch path (main.py) still reads
         # detector.pose_ensemble unchanged (regression gate intact).
-        live_pose = self._g("inference", "pose_ensemble", True)
+        # #66: defaults FALSE. It used to default True, so DELETING one config
+        # line silently enabled a second detection model per frame -- measured
+        # to CREATE duplicate boxes (0 overlapping pairs without it, 2 with)
+        # and to mint synthetic track ids whose "primary" flips between people.
+        live_pose = self._g("inference", "pose_ensemble", False)
         pose_cfg = det_cfg.get("pose_ensemble") if live_pose else None
         if not live_pose:
             print("[live] pose ensemble DISABLED for the live path "
@@ -433,6 +449,17 @@ class LivePipeline:
                 t.join(timeout=5)
         for w in self.writers:
             w.join(timeout=10)     # writer flushes queue + releases the MP4
+        # #55 second half: a stage that died left an empty output with no
+        # explanation anywhere. Name it here, where the operator is already looking.
+        dead = [nm for nm, t in self.threads
+                if getattr(t, "failed", None) is not None]
+        if dead:
+            print("=" * 72)
+            print(f"[live] WARNING: {len(dead)} stage(s) DIED during this run: "
+                  f"{sorted(set(dead))}")
+            print("[live] Their output is missing or incomplete -- the traceback is "
+                  "above, earlier in this log.")
+            print("=" * 72)
         # Reporting is DIAGNOSTIC and must never be able to skip what follows it.
         # Guarded because it sits between the joins and the reconcile: any failure
         # here -- a dead stdout, a KeyError in the metrics dicts, a stage object
@@ -469,6 +496,7 @@ class LivePipeline:
             return
         try:
             from identity.reconcile import (reconcile_tracklets,
+                                            resolve_covisibility,
                                             resolve_same_camera_thresholds)
             # reuse the file path's render + summary helpers (unchanged).
             from main import render_final_videos, print_run_summary
@@ -497,6 +525,11 @@ class LivePipeline:
                 # Pair-scoring mode (#45a). Mode-specific thresholds: changing the
                 # mode without re-deriving the bars above is meaningless.
                 scoring=self._recon_cfg.get("scoring", "prototype"),
+                # Physical vetoes and the Phase 1 mutual-best guard. Both
+                # default OFF; neither voids a threshold when enabled.
+                covisibility=resolve_covisibility(self._recon_cfg),
+                same_camera_reciprocal_best=self._recon_cfg.get(
+                    "same_camera_reciprocal_best", False),
                 consensus_top_frac=self._recon_cfg.get("consensus_top_frac", 0.25),
                 max_observations_per_side=self._recon_cfg.get(
                     "max_observations_per_side", 64),
@@ -515,14 +548,36 @@ class LivePipeline:
         shared = {"annotations": {r.cam: r.annotations for r in self.renderers}}
         try:
             print("[live] rendering final annotated videos with reconciled ids...")
-            render_final_videos(jobs, render_cfg, shared, self.store, self.run_id)
+            # Each camera at ITS OWN measured rate (#45/#46), so the four videos
+            # share one time scale and can be compared by eye. Falls back to the
+            # configured default for any camera whose rate could not be measured.
+            fps_by_camera = {}
+            for r in self.renderers:
+                measured = r.measured_fps()
+                if measured and measured > 0:
+                    fps_by_camera[r.cam] = measured
+            if fps_by_camera:
+                print("[live] output fps per camera: "
+                      + ", ".join(f"{c}={v:.1f}"
+                                  for c, v in sorted(fps_by_camera.items()))
+                      + f"  (was a single global {fps:.1f} for all)")
+            render_final_videos(jobs, render_cfg, shared, self.store, self.run_id,
+                                fps_by_camera=fps_by_camera)
             print_run_summary(self.store,
                               [(name, path) for name, path in jobs],
                               {"display": {"save_annotated": True}},
                               run_id=self.run_id)
+            render_ok = True
         except Exception as e:
+            # #58: the cleanup used to run in a `finally`, so a failed render
+            # DELETED the only copy of the footage it failed on -- destroying the
+            # one artefact needed to diagnose or retry it.
+            render_ok = False
             print(f"[live] final render/summary error: {e}")
-        finally:
+            print(f"[live] KEEPING the processed-frame clips because the render "
+                  f"failed -- they are the only copy. Re-render with: "
+                  f"python tests/calibration/rerender_from_clips.py {self.run_id}")
+        if render_ok:
             self._cleanup_clips()
 
     def _decision_log_kwargs(self):
