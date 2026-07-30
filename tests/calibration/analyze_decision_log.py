@@ -128,13 +128,30 @@ def main():
         print(f"    gap UPPER edge (worst 'same')   : mean={hi.mean():.3f} "
               f"p5={np.percentile(hi, 5):.3f}  min={hi.min():.3f}")
         band_lo, band_hi = np.percentile(lo, 95), np.percentile(hi, 5)
-        print(f"\n    => a bar in ({band_lo:.3f}, {band_hi:.3f}) separates cleanly "
-              f"on 90% of subjects")
+        if band_lo < band_hi:
+            print(f"\n    => a bar in ({band_lo:.3f}, {band_hi:.3f}) separates cleanly "
+                  f"on 90% of subjects")
+            for t in sorted(thr_seen):
+                where = ("INSIDE the clean band" if band_lo < t < band_hi else
+                         "ABOVE it -- rejecting genuine merges" if t >= band_hi else
+                         "BELOW it -- admitting different people")
+                print(f"    configured {t:.2f} is {where}")
+        else:
+            # p95(lower) exceeds p5(upper): the per-subject boundaries OVERLAP, so no
+            # single global threshold can separate cleanly. That is itself the finding
+            # -- it argues for a PER-CAMERA threshold rather than a better global one.
+            print(f"\n    => NO SINGLE GLOBAL BAR separates cleanly: the per-subject")
+            print(f"       boundaries OVERLAP (p95 of 'top different' = {band_lo:.3f} is")
+            print(f"       above p5 of 'worst same' = {band_hi:.3f}).")
+            print(f"       Median picture: boundary sits between {np.median(lo):.3f} "
+                  f"and {np.median(hi):.3f}.")
+            print(f"       Check section 5 -- if eligible-set size differs sharply by")
+            print(f"       camera, the threshold should be PER-CAMERA, not global.")
         for t in sorted(thr_seen):
-            where = ("INSIDE the clean band" if band_lo < t < band_hi else
-                     "ABOVE it -- rejecting genuine merges" if t >= band_hi else
-                     "BELOW it -- admitting different people")
-            print(f"    configured {t:.2f} is {where}")
+            above = sum(1 for x in hi if t > x)
+            print(f"    configured {t:.2f} sits above the same-person cluster on "
+                  f"{above}/{len(hi)} subjects ({pct(above, len(hi))}) "
+                  f"-- those lose genuine merges")
 
     # ---------------------------------------------------------------- 2
     header("2. ORPHANS -- fragments with nowhere to go")
