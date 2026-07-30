@@ -38,7 +38,10 @@ class CaptureThread(threading.Thread):
         self.device = device
         self.frame_index = 0
         self.reconnects = 0
-        self.dead = False          # source permanently unavailable
+        self.dead = False          # source unavailable (see #57: not permanent)
+        # #57: keep trying on a slow cadence after the fast retry budget is spent.
+        self.retry_forever = True
+        self.dead_retry_sec = 30.0
         self.finished = False      # file ended, or dead, or stopped
 
     def _sleep_interruptible(self, seconds):
@@ -82,6 +85,22 @@ class CaptureThread(threading.Thread):
             # Stream hiccup -> bounded, interruptible reconnect.
             consecutive_failures += 1
             if consecutive_failures > self.reconnect_attempts:
+                # #57: death used to be PERMANENT after ~15s of retries, so a 20s
+                # switch reboot or a brief network blip killed that camera for the
+                # rest of the session -- and if every camera hit it, the whole run
+                # ended. Retry forever on a slow cadence instead: a camera that
+                # comes back rejoins the run. `dead` still gates the metrics and
+                # the offline-overlay, so a genuinely gone camera is still visible.
+                if self.retry_forever:
+                    self.dead = True
+                    print(f"{tag} unavailable after {self.reconnect_attempts} "
+                          f"reconnects -> marked DEAD, but still retrying every "
+                          f"{self.dead_retry_sec:.0f}s in case it comes back "
+                          f"(#57).")
+                    consecutive_failures = 0
+                    if self.stop_event.wait(self.dead_retry_sec):
+                        break
+                    continue
                 print(f"{tag} unavailable after {self.reconnect_attempts} "
                       f"reconnects -> marking camera dead.")
                 self.dead = True

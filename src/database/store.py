@@ -56,7 +56,9 @@ class PersonVectorStore:
                  collection: str = DEFAULT_COLLECTION,
                  dim: int = EMBEDDING_DIM,
                  read_only: bool = False,
-                 ensure_collection: bool = True):
+                 ensure_collection: bool = True,
+                 prefer_grpc: bool = False,
+                 grpc_port: int = 6334):
         """
         path       : folder for persistent local storage. Use ":memory:" for a
                      throwaway in-process store (tests).
@@ -74,20 +76,69 @@ class PersonVectorStore:
                             Use this for read-only lookup against an existing
                             collection so the wrapper does not write anything.
 
+        prefer_grpc / grpc_port : #19. gRPC ships one 512-d vector as 2048 B of
+                     binary against 11265 B of JSON over REST -- 5.5x, plus
+                     0.114 ms/vector of json.loads. At 50k observations that is
+                     102 MB versus 563 MB and ~5.7 s of pure parsing, all of it in
+                     finalization where the operator is waiting. docker-compose
+                     already maps 6334, so this needs no infrastructure change.
+                     Ignored for embedded `path=` mode, which is in-process and has
+                     no gRPC at all.
+
         Precedence: client > url > path. Exactly one backend is chosen.
         """
         if client is not None:
             self.client = client
+            self.transport = "injected client"
         else:
             if url:
-                self.client = QdrantClient(url=url, api_key=api_key)
+                if prefer_grpc:
+                    self.client = QdrantClient(url=url, api_key=api_key,
+                                               prefer_grpc=True,
+                                               grpc_port=int(grpc_port))
+                    self.transport = f"gRPC {url} (port {grpc_port})"
+                else:
+                    self.client = QdrantClient(url=url, api_key=api_key)
+                    self.transport = f"REST {url}"
             else:
                 self.client = QdrantClient(path=path)
+                self.transport = f"embedded {path}"
         self.collection = collection
         self.dim = dim
         self.read_only = read_only
+        # #21: say which transport is live. A gRPC/REST mix-up is otherwise
+        # invisible until someone wonders why finalization is slow.
+        print(f"[store] transport: {self.transport}  collection={collection}")
         if ensure_collection and not self.read_only:
             self._ensure_collection()
+        else:
+            self._validate_collection()
+
+    def _validate_collection(self):
+        """#22: check an EXISTING collection's dimensionality against ours.
+
+        Nothing validated this before. A collection created at another dim, or with
+        another distance metric, accepts writes and returns scores that are silently
+        meaningless -- the worst possible failure for an identity system, because
+        every number downstream still looks like a number.
+        """
+        try:
+            if not self.client.collection_exists(self.collection):
+                return
+            info = self.client.get_collection(self.collection)
+            params = info.config.params.vectors
+            dim = getattr(params, "size", None)
+            metric = getattr(params, "distance", None)
+            if dim is not None and int(dim) != int(self.dim):
+                print(f"[store] WARNING: collection {self.collection!r} has "
+                      f"dim={dim} but this build embeds at {self.dim}. Scores "
+                      f"from it are meaningless; use a different collection.")
+            if metric is not None and str(metric).upper().find("COSINE") < 0:
+                print(f"[store] WARNING: collection {self.collection!r} uses "
+                      f"{metric}, not COSINE. Every threshold in this project "
+                      f"assumes cosine similarity.")
+        except Exception as e:                                  # noqa: BLE001
+            print(f"[store] could not validate collection: {e}")
 
     def _ensure_collection(self):
         """
@@ -95,6 +146,8 @@ class PersonVectorStore:
         to construct the store on every process start / restart without wiping or
         crashing on existing data.
         """
+        if self.client.collection_exists(self.collection):
+            self._validate_collection()
         if not self.client.collection_exists(self.collection):
             self.client.create_collection(
                 collection_name=self.collection,

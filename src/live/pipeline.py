@@ -118,6 +118,10 @@ class LivePipeline:
         self.reconcile_enabled = bool(live_recon.get("enabled", False))
         self._sample_stride = int(live_recon.get("sample_stride", 1) or 1)
         self._keep_frames = bool(live_recon.get("keep_frames", False))
+        # #65: a per-camera ceiling on the transient clip. 0 = unlimited (the old
+        # behaviour). Measured growth is ~1.2-2.2 MB/s per camera, so four cameras
+        # fill ~21 GB/hour with nothing stopping them.
+        self._clip_cap_bytes = int(float(live_recon.get("max_clip_gb", 0) or 0) * 1e9)
         self.store = None                 # built in run() when reconcile is on
         self._clip_paths = {}             # {cam: transient processed-frame clip}
         self.identity_stage = None        # ref for the final store-count report
@@ -257,7 +261,30 @@ class LivePipeline:
                 quality=reid_cfg.get("quality"),
                 max_embeddings_per_track=reid_cfg.get("max_embeddings_per_track", 0),
                 warmup_embeddings=reid_cfg.get("warmup_embeddings", 3),
+                # #47: when set, every camera embeds at the same rate in TIME
+                # instead of the same number of FRAMES.
+                interval_sec=reid_cfg.get("interval_sec", 0.0),
             )
+
+        # #65: check free space BEFORE a run, not after it fails. Four cameras
+        # write ~5.9 MB/s of transient clip, and with keep_frames they are never
+        # deleted -- so a long run on a small volume silently fills the disk.
+        if self.reconcile_enabled:
+            try:
+                import shutil as _shutil
+                free_gb = _shutil.disk_usage(".").free / 1e9
+                need = 5.9e6 * 3600 / 1e9        # one hour, four cameras
+                if free_gb < 5:
+                    print(f"[live] WARNING: only {free_gb:.1f} GB free. Clips are "
+                          f"written at ~5.9 MB/s across four cameras (~{need:.0f} "
+                          f"GB/hour) and keep_frames="
+                          f"{self._keep_frames}. Free space or set "
+                          f"live.reconcile.max_clip_gb.")
+                else:
+                    print(f"[live] disk: {free_gb:.1f} GB free "
+                          f"(~{need:.0f} GB/hour of clips at four cameras).")
+            except Exception:                                   # noqa: BLE001
+                pass
 
         # ---- WARM-UP before opening any source (v5 §12) ----------------------
         self._warmup(detectors, extractor)
@@ -300,6 +327,7 @@ class LivePipeline:
                 renderer = RenderStage(name, render_q, None, self.stop_event,
                                        capture_mode=True, clip_path=clip_path,
                                        clip_fps=fps, run_id=self.run_id)
+                renderer.clip_bytes_cap = self._clip_cap_bytes
                 self.renderers.append(renderer)
                 self.threads.append((f"render-{name}", renderer))
             else:
@@ -361,11 +389,28 @@ class LivePipeline:
             "identity_queue": identity_queue, "render_queues": render_queues,
             "writer_queues": writer_queues, "scheduler": scheduler,
             "inference": inference, "identity": identity, "max_batch": bs,
+            "embedders": embedders,
         }
 
         # ---- start (consumers already ordered before captures) --------------
-        for _, t in self.threads:
-            t.start()
+        # #61: the start loop used to sit OUTSIDE the try/finally, so an exception
+        # while starting the Nth thread left the first N-1 running with nothing to
+        # join them -- identity never drained and the run's observations were lost.
+        started = []
+        try:
+            for _, t in self.threads:
+                t.start()
+                started.append(t)
+        except BaseException:                                   # noqa: BLE001
+            print(f"[live] FAILED while starting threads ({len(started)} of "
+                  f"{len(self.threads)} up) -- stopping them cleanly.")
+            self.stop_event.set()
+            for t in started:
+                try:
+                    t.join(timeout=5)
+                except Exception:                               # noqa: BLE001
+                    pass
+            raise
 
         # ---- supervise until stop -------------------------------------------
         max_dur = float(self._g("run", "max_duration_sec", 0) or 0)
@@ -544,8 +589,14 @@ class LivePipeline:
         # Re-render each camera from its captured processed-frame clip. A minimal
         # cfg keeps render_final_videos from re-resizing (box geometry was captured
         # at the clip's resolution) and sets the output fps.
-        fps = float((self.live_cfg.get("output", {}) or {}).get("fps_default", 20))
-        render_cfg = {"source": {"resize_width": 0}, "display": {"output_fps": fps}}
+        _out = (self.live_cfg.get("output", {}) or {})
+        fps = float(_out.get("fps_default", 20))
+        out_cfg_codec = _out.get("codec", "mp4v")
+        render_cfg = {"source": {"resize_width": 0},
+                      "display": {"output_fps": fps,
+                                  # #63: the configured codec now reaches the
+                                  # product path instead of being ignored.
+                                  "codec": out_cfg_codec}}
         jobs = [(name, self._clip_paths[name]) for name, _ in self.sources
                 if name in self._clip_paths]
         shared = {"annotations": {r.cam: r.annotations for r in self.renderers}}
@@ -636,6 +687,22 @@ class LivePipeline:
                     print(f"[live] could not remove {p}: {e}")
 
     # ---- metrics -----------------------------------------------------------
+    def _push_measured_fps(self, elapsed):
+        """#47: tell each camera's embedder the rate that camera is really running
+        at, so `reid.interval_sec` converts to the right frame count FOR THAT
+        CAMERA. Without this the config key exists but has nothing to convert with,
+        and the frame-count interval silently stays in force."""
+        embedders = (self._m or {}).get("embedders") or {}
+        if not embedders or elapsed <= 0:
+            return
+        for capt in self.captures:
+            emb = embedders.get(capt.cam)
+            if emb is None or not hasattr(emb, "set_fps"):
+                continue
+            fps = capt.frame_index / elapsed
+            if fps > 0:
+                emb.set_fps(fps)
+
     def _track_peaks(self):
         m = self._m
         if not m:
@@ -656,6 +723,7 @@ class LivePipeline:
         if not m or elapsed <= 0:
             return
         self._track_peaks()
+        self._push_measured_fps(elapsed)
         sched = m["scheduler"]
         avg_batch = sched.dispatched_frames / max(1, sched.dispatched_batches)
         util = 100.0 * avg_batch / max(1, m["max_batch"])

@@ -76,6 +76,24 @@ def load_config(path="config.yaml"):
         return yaml.safe_load(f)
 
 
+def _run_filter(run_id):
+    """#20: a server-side `run_id` filter, or None when it cannot be built.
+
+    Every gallery read used to pull the WHOLE collection and drop other runs in
+    Python. That cost grows with every run forever, and it is paid during
+    finalization while the operator waits. None means "no filter" and the callers
+    keep their existing Python-side check, so this is safe on any client.
+    """
+    if run_id is None:
+        return None
+    try:
+        from qdrant_client import models as qmodels
+        return qmodels.Filter(must=[qmodels.FieldCondition(
+            key="run_id", match=qmodels.MatchValue(value=run_id))])
+    except Exception:                                          # noqa: BLE001
+        return None
+
+
 def print_run_summary(store, jobs, cfg, run_id=None):
     """
     Print WHAT the run produced -- CONSOLE ONLY, no files written. Reads the
@@ -99,6 +117,7 @@ def print_run_summary(store, jobs, cfg, run_id=None):
             while True:
                 pts, offset = store.client.scroll(
                     store.collection, limit=1000, offset=offset,
+                    scroll_filter=_run_filter(run_id),
                     with_payload=True, with_vectors=False)
                 for p in pts:
                     pl = p.payload or {}
@@ -213,6 +232,31 @@ def normalize_sources(videos):
     return result
 
 
+def _env_url_sources(cfg):
+    """#30: stream URLs (with credentials) from environment variables.
+
+    A URL on the command line is visible in `ps` to every user on the machine and
+    is written to shell history. Naming the env var in config and keeping the
+    secret in the untracked .env keeps it out of both.
+    """
+    names = ((cfg or {}).get("source", {}) or {}).get("env_urls") or []
+    out, missing = [], []
+    for name in names:
+        value = os.environ.get(str(name))
+        if value:
+            out.append(value)
+        else:
+            missing.append(str(name))
+    if missing:
+        print(f"[main] source.env_urls names {missing} but they are not set in the "
+              f"environment or .env -- those cameras are SKIPPED. (Set them in "
+              f".env as NAME=rtsp://user:pass@host/path.)")
+    if out:
+        print(f"[main] {len(out)} camera URL(s) taken from the environment "
+              f"(credentials kept out of `ps` and shell history).")
+    return out
+
+
 def resolve_sources(args, cfg):
     """
     Decide which videos to process, dynamically. Precedence:
@@ -237,8 +281,16 @@ def resolve_sources(args, cfg):
         sources = normalize_sources(files)
         origin = f"--videos-dir {args.videos_dir}"
     else:
-        sources = normalize_sources(cfg.get("source", {}).get("videos", []))
-        origin = "config.yaml (source.videos)"
+        # #30: env-provided stream URLs take precedence over source.videos, so a
+        # deployment keeps its credentials in .env and never types them into a
+        # command line that `ps` and shell history both record.
+        env_urls = _env_url_sources(cfg)
+        if env_urls:
+            sources = normalize_sources(env_urls)
+            origin = "source.env_urls (credentials from the environment)"
+        else:
+            sources = normalize_sources(cfg.get("source", {}).get("videos", []))
+            origin = "config.yaml (source.videos)"
 
     missing = [p for _, p in sources if not _is_url(p) and not os.path.exists(p)]
     if missing:
@@ -277,6 +329,7 @@ def build_gid_map(store, run_id):
     while True:
         pts, offset = store.client.scroll(
             store.collection, limit=1000, offset=offset,
+            scroll_filter=_run_filter(run_id),       # #20: server-side
             with_payload=True, with_vectors=False)
         for p in pts:
             pl = p.payload or {}
@@ -394,9 +447,23 @@ def render_final_videos(jobs, cfg, shared, store, run_id,
 
                     if writer is None:
                         h, w = frame.shape[:2]
-                        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
                         out_fps = float(fps_by_camera.get(name) or fps)
+                        # #63: output.codec was accepted in config and then ignored
+                        # here -- mp4v was hardcoded, so `codec: h264` did nothing.
+                        # Try the configured codec, fall back to mp4v (which always
+                        # works) rather than silently producing no video.
+                        want = str(cfg.get("display", {}).get("codec")
+                                   or "mp4v").lower()
+                        fourcc_name = {"h264": "avc1", "avc1": "avc1",
+                                       "mp4v": "mp4v"}.get(want, "mp4v")
+                        fourcc = cv2.VideoWriter_fourcc(*fourcc_name)
                         writer = cv2.VideoWriter(out_path, fourcc, out_fps, (w, h))
+                        if not writer.isOpened() and fourcc_name != "mp4v":
+                            print(f"[render] {name}: codec {want!r} unavailable in "
+                                  f"this OpenCV build; falling back to mp4v.")
+                            writer = cv2.VideoWriter(
+                                out_path, cv2.VideoWriter_fourcc(*"mp4v"),
+                                out_fps, (w, h))
                     writer.write(frame)
         except Exception as e:
             print(f"[render] {name}: ERROR re-rendering: {e}")
@@ -804,6 +871,7 @@ def main():
             embedders[name] = TrackEmbedder(
                 extractor,
                 interval=reid_cfg.get("interval", 10),
+            interval_sec=reid_cfg.get("interval_sec", 0.0),
                 ttl=reid_cfg.get("ttl", 300),
                 quality=reid_cfg.get("quality"),
                 max_embeddings_per_track=reid_cfg.get("max_embeddings_per_track", 0),

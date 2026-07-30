@@ -7,11 +7,27 @@ source:
   # crops folder). These are just the DEFAULTS -- override them at runtime with
   #   python main.py --videos a.mp4 b.mp4        (or)   --videos-dir /path
   # so you never have to edit this file to process different footage.
+  # #67: these used to point at placeholder_video/, which does not exist -- so a
+  # bare `python main.py` failed on a fresh checkout with a confusing error. They
+  # now point at footage that ships with the repo. Override at runtime with
+  # --videos / --videos-dir; for cameras use --mode live with rtsp:// URLs, or
+  # SOURCE_VIDEOS in .env (see source.env_urls below).
   videos:
-    - name: cam_219
-      path: placeholder_video/rtsp__219.avi
-    - name: cam_224
-      path: placeholder_video/rtsp__224.avi
+    - name: register_file
+      path: register_file.avi
+
+  # #30: credentials in an rtsp:// URL on the command line are visible to every
+  # user on the box via `ps`, and land in shell history. Put them in the untracked
+  # .env instead and reference them here:
+  #
+  #   .env:     CAM_213=rtsp://admin:secret@192.168.0.213:554/1/1
+  #             CAM_224=rtsp://admin:secret@192.168.0.224:554/ch01/0
+  #   config:   env_urls: [CAM_213, CAM_224]
+  #
+  # Each name is looked up in the environment at startup; a missing one is
+  # reported and skipped rather than silently dropping a camera. Empty = off, and
+  # --videos still overrides everything.
+  env_urls: []
   # 0 = process the whole video. Set e.g. 60 for a quick CPU smoke test.
   max_frames: 0
   # 0 = native resolution. Positive width downscales every frame (keeps aspect)
@@ -153,6 +169,14 @@ reid:
                              # the CPU in the same run. The live path takes its
                              # ReID device from live.run.device, not this key.
   interval: 10               # re-embed a given track at most once every N frames
+  # #47: when > 0 this WINS over `interval`, converting to a per-camera frame count
+  # from that camera's own measured rate. `interval` counts PROCESSED FRAMES, so a
+  # slower camera gets proportionally fewer embeddings per SECOND: cam_224 at
+  # 14.8 fps accumulated ~40% fewer observations per second than the 24.8 fps
+  # cameras, handing the weakest prototypes to the camera with the hardest matching
+  # job. 0.4s matches interval:10 at 25 fps, so this is the same rate for the fast
+  # cameras and MORE evidence for the slow one.
+  interval_sec: 0.4
   ttl: 300                   # forget a track from the cache after N unseen frames
   warmup_embeddings: 3       # embed the first N successful observations of a new track
   # Cap on how many embeddings ONE track_id contributes over its life (0 = off).
@@ -614,6 +638,12 @@ live:
                             # frames (they are NOT per-frame), so this is a second,
                             # optional subsample on top of that. 1 = keep every
                             # fresh observation (matches the file-batch path).
+    # #65: per-camera ceiling on the transient clip, in GB. 0 = unlimited, which
+    # is what shipped -- clips grew at ~1.2-2.2 MB/s each with no cap, no rotation
+    # and no free-space check, so four cameras fill ~21 GB/hour until the disk dies
+    # and takes the run with it. Hitting the cap stops RECORDING for that camera;
+    # the run's identities are unaffected, only the offline re-render is truncated.
+    max_clip_gb: 4.0
     keep_frames: true       # keep the per-camera processed-frame clips after the
                             # final render, together with the
                             # ._live_src_<cam>.annotations.json box geometry the

@@ -73,6 +73,10 @@ class RenderStage(threading.Thread):
         # makes cross-camera comparison by eye unreliable.
         self._first_ts = None
         self._last_ts = None
+        self._clip_size = None          # (h, w) latched from the first frame (#62)
+        self._size_warned = False
+        self.clip_bytes_cap = 0         # #65: 0 = unlimited
+        self._clip_stopped_for_space = False
 
     failed = None
 
@@ -194,10 +198,25 @@ class RenderStage(threading.Thread):
             }
             for d in dets
         ])
+        # #62: the writer latches the FIRST frame's size. A mid-run resolution
+        # change (reconnect at a different profile) then silently desynchronises
+        # the clip from the box geometry FOREVER -- boxes drawn at the wrong scale
+        # on every later frame. Resize to the latched size instead, so geometry and
+        # pixels stay aligned, and say so once.
+        if self._clip is not None and self._clip_size is not None:
+            h0, w0 = self._clip_size
+            if img.shape[:2] != (h0, w0):
+                if not self._size_warned:
+                    print(f"[render:{self.cam}] frame size changed "
+                          f"{img.shape[1]}x{img.shape[0]} != {w0}x{h0}; resizing to "
+                          f"the clip's size so boxes stay aligned (#62).")
+                    self._size_warned = True
+                img = cv2.resize(img, (w0, h0), interpolation=cv2.INTER_AREA)
         if self._clip is None and not self._clip_disabled:
             h, w = img.shape[:2]
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
             self._clip = cv2.VideoWriter(self.clip_path, fourcc, self.clip_fps, (w, h))
+            self._clip_size = (h, w)
             if not self._clip.isOpened():
                 print(f"[render:{self.cam}] ERROR: could not open temp clip "
                       f"{self.clip_path}; final re-render for this camera DISABLED.")
@@ -206,4 +225,24 @@ class RenderStage(threading.Thread):
                 self._clip_disabled = True
         if self._clip is not None:
             self._clip.write(img)
+            # #65: clips grew without ANY bound -- measured 51.0 KB/frame at
+            # 1920x1080, ~5.9 MB/s across four cameras, ~21 GB/hour, with no cap, no
+            # rotation and no free-space check. Filling the disk mid-run loses the
+            # run AND whatever else lives on that volume. Stop writing the clip when
+            # the cap is hit; the run itself continues, only the re-render material
+            # stops growing.
+            if self.clip_bytes_cap and not self._clip_stopped_for_space:
+                try:
+                    if os.path.getsize(self.clip_path) > self.clip_bytes_cap:
+                        self._clip_stopped_for_space = True
+                        self._clip.release()
+                        self._clip = None
+                        print(f"[render:{self.cam}] clip hit the "
+                              f"{self.clip_bytes_cap / 1e9:.1f} GB cap -> no more "
+                              f"frames recorded for this camera. The RUN and its "
+                              f"identities are unaffected; only the offline "
+                              f"re-render is truncated. Raise "
+                              f"live.reconcile.max_clip_gb to keep more.")
+                except OSError:
+                    pass
         self.rendered += 1

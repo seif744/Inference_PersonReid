@@ -40,7 +40,8 @@ from detector import crop_person   # shared "box -> safe crop" primitive
 
 
 class TrackEmbedder:
-    def __init__(self, extractor, interval=10, ttl=300, quality=None,
+    def __init__(self, extractor, interval=10, interval_sec=0.0, ttl=300,
+                 quality=None,
                  max_embeddings_per_track=0, warmup_embeddings=5):
         """
         extractor : a ReIDExtractor (loaded once, reused).
@@ -86,6 +87,14 @@ class TrackEmbedder:
         """
         self.extractor = extractor
         self.interval = max(1, interval)
+        # #47: `interval` counts PROCESSED FRAMES, so a camera running slower gets
+        # proportionally fewer embeddings per SECOND. cam_224 at 14.8 fps accumulated
+        # ~40% fewer observations per second than the 24.8 fps cameras -- giving the
+        # weakest prototypes to a camera that already has the hardest matching job.
+        # `interval_sec` converts to a per-camera frame interval from that camera's
+        # own measured rate, so every camera embeds at the same RATE IN TIME.
+        self.interval_sec = float(interval_sec) if interval_sec else 0.0
+        self._fps_hint = None
         self.ttl = ttl
         self.max_per_track = max(0, int(max_embeddings_per_track or 0))
         self.warmup_embeddings = max(1, int(warmup_embeddings or 1))
@@ -132,6 +141,30 @@ class TrackEmbedder:
         # Quality-gate monitoring for the last process() call.
         self.last_quality_rejected = []
 
+
+    def set_fps(self, fps):
+        """Tell this embedder its camera's measured rate, so `interval_sec` can be
+        honoured (#47). Called by the live pipeline once the rate is known; until
+        then the frame-count `interval` applies unchanged."""
+        try:
+            fps = float(fps)
+        except (TypeError, ValueError):
+            return
+        if fps > 0:
+            self._fps_hint = fps
+
+    @property
+    def effective_interval(self):
+        """Frames between embeddings for THIS camera.
+
+        With interval_sec set and a known rate, every camera embeds at the same rate
+        in TIME rather than in frames -- which is the thing that actually determines
+        how much evidence a prototype is built from.
+        """
+        if self.interval_sec > 0 and self._fps_hint:
+            return max(1, int(round(self.interval_sec * self._fps_hint)))
+        return self.interval
+
     def process(self, frame, detections, frame_index):
         """
         Attach det.embedding for every tracked detection in `detections`, in
@@ -165,7 +198,8 @@ class TrackEmbedder:
             # its first `warmup_embeddings` vectors back-to-back and the identity
             # evidence gate (min_evidence_obs) is reached just as fast as before.
             is_due = (entry is None or warmup
-                      or (self._tick - entry.get("tick", 0)) >= self.interval)
+                      or (self._tick - entry.get("tick", 0))
+                      >= self.effective_interval)
 
             if capped or not is_due:
                 if entry is not None:

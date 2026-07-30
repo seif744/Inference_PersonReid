@@ -93,14 +93,23 @@ class ReIDExtractor:
         emb = extractor.extract(person_crop)     # (512,) float32, ||emb|| == 1
     """
 
-    def __init__(self, weights: str, device: Optional[str] = None):
+    def __init__(self, weights: str, device: Optional[str] = None,
+                 max_batch: int = 32):
         """
         weights : path to a person-ReID OSNet checkpoint (.pth). NOT ImageNet
                   weights -- those do not separate identities.
         device  : "cuda", "cpu", or None to auto-pick. Kept explicit so the
                   same code runs on the CPU dev box and a GPU deployment box
                   without edits.
+        max_batch : #56. Largest number of crops in ONE forward pass; more are
+                  processed in chunks. The batch used to be sized by however many
+                  people happened to be in view, which is an OOM on a smaller GPU
+                  exactly when the scene is busiest. BatchNorm is frozen in eval
+                  mode (running stats, not per-batch), so chunking cannot change a
+                  single embedding -- verified by the batch-invariance check in
+                  tests/calibration/verify_embedding_contract.py. 0 = unbounded.
         """
+        self.max_batch = max(0, int(max_batch))
         self.device = torch.device(
             device if device is not None
             else ("cuda" if torch.cuda.is_available() else "cpu")
@@ -180,6 +189,17 @@ class ReIDExtractor:
             # Explicit empty case: return a well-shaped (0, 512) array so callers
             # can concatenate results without special-casing.
             return np.empty((0, EMBEDDING_DIM), dtype=np.float32)
+
+        # #56: the batch was unbounded in the number of PEOPLE. A crowded frame
+        # (or a burst across four cameras) built one tensor sized by whatever
+        # happened to be in view, which is an OOM on a smaller GPU at exactly the
+        # moment the system is most useful. Chunking keeps peak memory flat and
+        # costs nothing when the crowd is small -- one chunk is the old path.
+        if self.max_batch and len(crops) > self.max_batch:
+            outs = []
+            for i in range(0, len(crops), self.max_batch):
+                outs.append(self.extract_batch(crops[i:i + self.max_batch]))
+            return np.concatenate(outs, axis=0)
 
         batch = torch.stack([self._preprocess(c) for c in crops])
         batch = batch.to(self.device)

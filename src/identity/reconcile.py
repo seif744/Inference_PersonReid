@@ -312,11 +312,34 @@ def _gather_tracklets(store, run_id):
         "gids": set(),
     })
 
+    # #20: filter run_id SERVER-SIDE. This used to scroll the ENTIRE collection
+    # with_vectors=True and discard other runs in Python -- so every run paid to
+    # download every previous run's 512-d vectors. The store held 4157 points
+    # before one run and 15892 a few runs later; that cost grows forever and lands
+    # squarely in finalization, where the operator is waiting. Falls back to the
+    # old client-side filter if the server rejects the filter (embedded mode, or a
+    # client version without it), so this can never cost a run its identities.
+    scroll_filter = None
+    if run_id is not None:
+        try:
+            from qdrant_client import models as _qmodels
+            scroll_filter = _qmodels.Filter(must=[_qmodels.FieldCondition(
+                key="run_id", match=_qmodels.MatchValue(value=run_id))])
+        except Exception:                                       # noqa: BLE001
+            scroll_filter = None
+
     offset = None
     while True:
-        pts, offset = store.client.scroll(
-            store.collection, limit=1000, offset=offset,
-            with_payload=True, with_vectors=True)
+        try:
+            pts, offset = store.client.scroll(
+                store.collection, limit=1000, offset=offset,
+                scroll_filter=scroll_filter,
+                with_payload=True, with_vectors=True)
+        except Exception:                                       # noqa: BLE001
+            scroll_filter = None
+            pts, offset = store.client.scroll(
+                store.collection, limit=1000, offset=offset,
+                with_payload=True, with_vectors=True)
         for p in pts:
             pl = p.payload or {}
             if run_id is not None and pl.get("run_id") != run_id:
