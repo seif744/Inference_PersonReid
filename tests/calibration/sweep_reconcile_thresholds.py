@@ -74,6 +74,28 @@ def _parse_same(text):
     return out
 
 
+def _parse_same_variants(text):
+    """Several same-camera settings at once, separated by ';':
+
+        "cam_213=0.80,cam_224=0.80 ; cam_213=0.87,cam_224=0.87"
+
+    Both axes matter and they fail differently: the cross-camera bar governs
+    whether one person follows themselves BETWEEN cameras, the same-camera bar
+    whether two people get fused WITHIN one. A cluster welded together inside a
+    camera cannot be separated by any cross-camera bar, so sweeping only the
+    cross axis can miss the defect entirely.
+    """
+    variants = []
+    for chunk in (text or "").split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        parsed = _parse_same(chunk)
+        label = ", ".join(f"{c}={v:.2f}" for c, v in sorted(parsed.items()))
+        variants.append((label or "global only", parsed))
+    return variants or [("global only", {})]
+
+
 def _arg(flag, default=None):
     if flag in sys.argv:
         return sys.argv[sys.argv.index(flag) + 1]
@@ -132,8 +154,7 @@ def main():
 
     crosses = [float(x) for x in _arg("--cross", "0.63,0.70,0.75,0.80").split(",")]
     same_global = float(_arg("--same-global", "0.90"))
-    base_same = _parse_same(_arg("--same", "cam_213=0.80,cam_224=0.80"))
-    also_same = _parse_same(_arg("--also-same", ""))
+    variants = _parse_same_variants(_arg("--same", "cam_213=0.80,cam_224=0.80"))
     min_obs = int(_arg("--min-obs", "3"))
     reciprocal = _arg("--no-reciprocal") is None
 
@@ -162,13 +183,6 @@ def main():
                                                         key=lambda kv: str(kv[0]))))
     print(f"[sweep] run_id={run_id}: {runs[run_id]} observation(s)")
 
-    variants = [("as configured", base_same)]
-    if also_same:
-        merged = dict(base_same)
-        merged.update(also_same)
-        variants.append((f"+ {', '.join(f'{k}={v}' for k, v in also_same.items())}",
-                         merged))
-
     header("SWEEP -- identities and cluster shape per setting")
     print("  'below ceiling' counts accepted CROSS-camera merges under "
           f"{STRANGER_CEILING} (the measured")
@@ -185,30 +199,33 @@ def main():
                                     per_camera, min_obs, reciprocal)
             s = summarize(remap, lines)
             results[(label, cross)] = s
-            mark = "  <-- shipped" if (label == "as configured"
-                                       and abs(cross - 0.63) < 1e-9) else ""
+            shipped = (abs(cross - 0.63) < 1e-9
+                       and per_camera == {"cam_213": 0.80, "cam_224": 0.80})
+            mark = "  <-- shipped" if shipped else ""
             print(f"  {label:<38}{cross:>7.2f}{s['identities']:>6}{s['max']:>6}"
                   f"{s['multi_camera']:>7}{s['cross_merges']:>9}"
                   f"{s['below_ceiling']:>7}"
                   f"{(s['min_cross'] if s['min_cross'] else 0):>8.3f}{mark}")
 
-    header("CLUSTER COMPOSITION at each cross-camera bar (as configured)")
+    header("CLUSTER COMPOSITION for every setting swept")
     print("  Check these against what you SAW. A cluster holding several people")
-    print("  is a false merge; one person appearing in several clusters is a split.\n")
-    for cross in crosses:
-        s = results[("as configured", cross)]
-        print(f"  --- cross={cross:.2f}: {s['identities']} identities, "
-              f"sizes {s['sizes']}")
-        for gid, keys in sorted(s["clusters"].items()):
-            if len(keys) < 2:
-                continue
-            by_cam = defaultdict(list)
-            for cam, tid in sorted(keys):
-                by_cam[cam].append(tid)
-            desc = "  ".join(f"{c}({','.join(str(t) for t in sorted(v))})"
-                             for c, v in sorted(by_cam.items()))
-            print(f"      GID {gid:>3}: {desc}")
-        print()
+    print("  is a false merge; one person appearing in several clusters is a split.")
+    print("  One block per combination -- keep the grid small when reading these.\n")
+    for label, _ in variants:
+        for cross in crosses:
+            s = results[(label, cross)]
+            print(f"  --- same[{label}]  cross={cross:.2f}: "
+                  f"{s['identities']} identities, sizes {s['sizes']}")
+            for gid, keys in sorted(s["clusters"].items()):
+                if len(keys) < 2:
+                    continue
+                by_cam = defaultdict(list)
+                for cam, tid in sorted(keys):
+                    by_cam[cam].append(tid)
+                desc = "  ".join(f"{c}({','.join(str(t) for t in sorted(v))})"
+                                 for c, v in sorted(by_cam.items()))
+                print(f"      GID {gid:>3}: {desc}")
+            print()
 
     header("HOW TO READ THIS")
     print("""  Raising the cross-camera bar can only SPLIT clusters, never merge more, so
