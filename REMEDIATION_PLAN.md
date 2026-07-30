@@ -1,7 +1,7 @@
 # Pipeline Remediation Plan
 
-**Status:** agreed, not yet implemented
-**Created:** 2026-07-30
+**Status:** Phase 1 largely landed. One production run captured and analysed.
+**Created:** 2026-07-30 · **Last updated:** 2026-07-30 (after run `20260730_093723`)
 **Scope:** detection, tracking, embedding, reconciliation, and the final rendered output
 
 This document is the reference plan for fixing identity instability in the live RTSP →
@@ -12,8 +12,80 @@ Read Part A before proposing any threshold change. Read Part H before trusting a
 
 ---
 
+## 0. START HERE — current state and next action
+
+### 0.1 The next thing to do
+
+**Make `identity.reconcile.same_camera_threshold` per-camera, and set cam_213 and
+cam_224 to ~0.80 while leaving cam_206 at 0.90.** This is plan item **#40**.
+
+Why it is first: at the global 0.90, cam_213 achieves **zero** same-camera merges across
+all 11 of its subjects and cam_224 manages it for only 5 of 17, while cam_206 gets 9.0
+eligible partners per subject. A camera with no same-camera merging cannot join a
+person's front-view and back-view fragments, so each is absorbed cross-camera into a
+*different* cluster — which is exactly the "reid 2 becomes reid 7" the operator observed
+in cam_213 and cam_224. Full evidence in [J.6](#j6-decision-log-analysis--the-per-camera-finding-that-reframes-phase-9).
+
+Per-camera reconcile thresholds **do not exist yet** — `detector.per_camera` covers
+detection only. This needs a config block plus a lookup in `pair_threshold()`.
+
+Then, in order: **#45a** (reconcile compares prototype *means*, which blurs front/back
+into a vector matching neither view — the structural cause behind cam_213; #40 treats
+only the symptom), then **#44** (`RECIPROCAL_BEST` rejects 31% of decisions at up to
+0.905, but fewer orphans will change that picture).
+
+**Method, non-negotiable:** change ONE thing, re-run, and diff the analyser output.
+Four earlier tuning attempts were reverted without learning anything — see Part I.
+
+### 0.2 What has landed
+
+| Commit | What |
+|---|---|
+| `182c677` | Phase 1: `src/identity/decision_log.py`, reconcile instrumented additively, config keys, `LivePipeline` wiring, `tests/calibration/` (8 scripts) |
+| `e05c476` | **J.5 fix:** finalization survives a failed `print`. Two production runs had been lost to it |
+| `286e06a` + `c977f57` | `tests/calibration/analyze_decision_log.py` and a fix to its inverted band report |
+| `5598d31` | Part J.6: the per-camera finding from the first real run |
+
+Test state: **10 test files pass** (`python tests/run_all.py`), including
+`test_phase1_decision_log.py` (28 checks) and `test_shutdown_reaches_reconcile.py` (14).
+
+### 0.3 Verify state on a fresh machine
+
+```bash
+python tests/run_all.py                                    # expect 10 files pass
+python tests/calibration/verify_embedding_contract.py      # expect 15 checks pass
+python tests/calibration/characterize_known_defects.py     # shows which defects remain
+python tests/calibration/analyze_decision_log.py <log>     # re-derive J.6
+```
+
+Artefacts from run `20260730_093723` live on the A6000 at
+`~/seifer_work/Inference_PersonReid`: `run1.log`,
+`logs/reconcile_decisions_20260730_093723.jsonl` (286 decisions), and the four
+`._live_src_cam_*.mp4` frozen clips. **Those clips are the replay corpus** — they
+reproduce every symptom and nothing local does.
+
+### 0.4 Still unanswered
+
+- Does raising `imgsz` or lowering `conf` recover the people cam_206 misses at the start
+  of a clip? Measured as no-ops on other footage; **untested on cam_206's own clip**,
+  which is a crowded room with a table and is a different problem.
+- `cross_camera_threshold` remains uncalibrated. Do not touch it before #40.
+- Whether `yolo11s`/`yolo11m` is needed — treat as a measurement, not an upgrade.
+
+### 0.5 Reading order for a fresh session
+
+Section 0 (this) → **Part A** (what not to retry, with the evidence) → **Part J** (field
+data from the real run) → **Part B Phase 9** (the calibration items) → Part G (design
+decisions and why) → Part H (measurements, with their caveats).
+
+Parts C and D exist to stop rediscovery: C is deferred/out-of-scope defects, D is what
+was verified clean and should not be re-audited.
+
+---
+
 ## Contents
 
+0. [START HERE — current state and next action](#0-start-here--current-state-and-next-action)
 1. [Product scope](#1-product-scope)
 2. [Camera inventory](#2-camera-inventory)
 3. [Evidence conventions](#3-evidence-conventions)
