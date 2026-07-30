@@ -219,6 +219,40 @@ identity:
                                        # match -- stops look-alike over-merging on
                                        # weak/out-of-domain models. See reconcile.py.
 
+    # ---- Phase 1 instrumentation (REMEDIATION_PLAN.md) ----------------------
+    # Records EVERY merge decision -- accepted and rejected alike -- with all six
+    # gates evaluated independently (no short-circuiting) and the full annotated
+    # candidate vector. Purely diagnostic: it changes no decision, which
+    # tests/live/test_phase1_decision_log.py asserts by comparing the reconciled
+    # result with and without a log attached.
+    #
+    # Before this existed reconcile emitted four log lines, all of them successes,
+    # so "why did this merge NOT happen" was unanswerable -- which is why four
+    # rounds of threshold tuning were reverted without learning anything.
+    #
+    # <run_id> is substituted with the run timestamp. Blank/null disables logging.
+    decision_log: logs/reconcile_decisions_<run_id>.jsonl
+
+    top2_margin:
+      # Runner-up margin: "is there a UNIQUELY plausible match", which is a
+      # different question from the absolute threshold's "is there a plausible
+      # match". Reconcile has never had this rule (reciprocal-best fills the role),
+      # so it ships INERT and is enabled only once the logged distribution shows it
+      # rejects something reciprocal-best does not. See REMEDIATION_PLAN.md Phase 9.
+      threshold: null        # null = computed and logged, ENFORCES NOTHING
+      # Which variant would gate if a threshold were set. Exactly one can ever
+      # gate -- there is no way to express "both" -- because gating on two margins
+      # at once makes the system much harder to reason about and tune.
+      #   eligible    -- runner-up over candidates that survived the
+      #                  ranking-independent hard constraints (selection safety:
+      #                  a candidate that can never be picked should not suppress
+      #                  a good merge)
+      #   all_scored  -- runner-up over everything above the floor (evidence
+      #                  quality: a near-tie means the embedding cannot separate
+      #                  the two, whether or not the runner-up is available)
+      # Both are ALWAYS logged regardless; this only picks the one that could gate.
+      basis: eligible
+
 display:
   show_window: false         # true = OpenCV windows; false = headless. Only the
                              # file-batch flow uses this; the live pipeline is

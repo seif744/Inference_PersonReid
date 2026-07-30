@@ -51,6 +51,9 @@ from collections import defaultdict
 
 import numpy as np
 
+from identity import decision_log as dlog
+from identity.decision_log import Candidate, DecisionRecord, GateResult
+
 
 def _prototype(vectors):
     """Mean of L2-normalized vectors, renormalized -- the id's appearance center."""
@@ -140,7 +143,9 @@ def _cluster_prototype(members, protos):
 def reconcile_tracklets(store, threshold, run_id=None,
                         same_camera_threshold=0.90,
                         require_reciprocal_best=True,
-                        min_tracklet_observations=1, log=print):
+                        min_tracklet_observations=1, log=print,
+                        decision_log=None, top2_margin_threshold=None,
+                        top2_margin_basis="eligible"):
     """
     Rebuild global ids from camera-local tracklets.
 
@@ -153,9 +158,41 @@ def reconcile_tracklets(store, threshold, run_id=None,
         noise / an unusable fragment: it is marked UNIDENTIFIED (its global_id is
         cleared) rather than becoming its own person, so it does not inflate the
         head-count. Its vectors stay in the gallery. 1 = keep everything.
+
+    decision_log : optional identity.decision_log.DecisionLog. When supplied,
+        EVERY merge decision -- accepted and rejected alike -- is recorded with
+        all gates evaluated independently (no short-circuiting) and the full
+        annotated candidate vector. Purely additive: the merge decisions below are
+        computed exactly as before and the log only observes them, which
+        tests/live/test_phase1_decision_log.py asserts by comparing the returned
+        remap with and without a log attached.
+
+    top2_margin_threshold : None (the default) means TOP2_MARGIN is COMPUTED AND
+        LOGGED BUT ENFORCES NOTHING. Reconcile has never had a runner-up margin
+        rule -- reciprocal-best fills that role -- so this ships inert until the
+        logged distribution says whether it rejects anything reciprocal-best does
+        not. See REMEDIATION_PLAN.md Phase 9.
+    top2_margin_basis : "eligible" | "all_scored" -- which margin variant would
+        gate if a threshold were set. Exactly one can ever gate, by construction.
     """
+    dl = decision_log
     tracklets = _gather_tracklets(store, run_id)
     all_keys = sorted(tracklets)
+
+    # Stable, deterministic handles so a replay reproduces them exactly. Provisional
+    # handles live in their own namespace (`U-`) and never reach a tally or a frame.
+    handles = {k: f"U-{i:04d}" for i, k in enumerate(all_keys)}
+
+    def _obs(k):
+        return len(tracklets[k]["vectors"])
+
+    def _record_outcome(k, state, assigned_id=None, merged_from=()):
+        if dl is None:
+            return
+        dl.set_outcome(k, state=state, assigned_id=assigned_id,
+                       handle=handles[k], merged_from=merged_from,
+                       observations=_obs(k), cameras=[k[0]],
+                       frame_range=list(tracklets[k]["span"]))
 
     # Suppress spurious tracklets before clustering. One- or two-frame tracks are
     # almost always a missed/duplicate detection, too short to embed reliably;
@@ -166,9 +203,19 @@ def reconcile_tracklets(store, threshold, run_id=None,
         store.clear_global_id(tracklets[k]["points"])
         log(f"  tracklet reconcile: suppressed {k} "
             f"({len(tracklets[k]['vectors'])} obs < {min_tracklet_observations})")
+        _record_outcome(k, dlog.SUPPRESSED)
 
     keys = [k for k in all_keys if k not in set(suppressed)]
     if len(keys) < 2:
+        # KNOWN DEFECT (REMEDIATION_PLAN.md #25): returning here stamps NO identity
+        # on the surviving tracklet, so the whole video renders as a bare
+        # "ID <track_id>". Left in place for Phase 1 (instrumentation only) but now
+        # VISIBLE in the log instead of silent.
+        for k in keys:
+            _record_outcome(k, dlog.EXPIRED_UNRESOLVED)
+        if dl is not None and keys:
+            log(f"  tracklet reconcile: only {len(keys)} tracklet(s) survived -> "
+                f"returning with NO identities assigned (known defect #25)")
         return {}
 
     protos = {k: _prototype(tracklets[k]["vectors"]) for k in keys}
@@ -183,14 +230,80 @@ def reconcile_tracklets(store, threshold, run_id=None,
             k = parent[k]
         return k
 
-    def conflict(set_a, set_b):
+    def conflict_reason(set_a, set_b):
+        """None when the two clusters may merge, else the blocking gate name.
+
+        Returns a REASON rather than a bool so the decision log can attribute the
+        exclusion. Today the only reason is a same-camera time overlap; Phase 7
+        adds TEMPORAL_CONFLICT_CROSS_CAMERA here for non-co-visible camera pairs,
+        which is why this is shaped to carry more than one.
+        """
         for a in set_a:
             for b in set_b:
                 if a[0] != b[0]:
                     continue
                 if not _spans_disjoint(tracklets[a]["span"], tracklets[b]["span"]):
-                    return True
-        return False
+                    return dlog.TEMPORAL_CONFLICT_SAME_CAMERA
+        return None
+
+    def conflict(set_a, set_b):
+        return conflict_reason(set_a, set_b) is not None
+
+    # ---- decision-log helpers (no effect on any decision) ----------------
+    def _na_gate():
+        """A gate that does not apply to this phase. Recorded anyway so every
+        record carries every gate and analysis never has to special-case."""
+        return GateResult(value=None, threshold=None, passed=True,
+                          extra={"applies": False})
+
+    def _cluster_meta(members_set):
+        cams = sorted({m[0] for m in members_set})
+        obs = sum(_obs(m) for m in members_set)
+        return cams, obs
+
+    def _emit(subject_handle, phase, round_index, subject_members, cands,
+              gates, accepted_partner=None, context="same_camera"):
+        """Build + register one DecisionRecord. Returns None when logging is off."""
+        if dl is None:
+            return None
+        cams, obs = _cluster_meta(subject_members)
+        spans = [tracklets[m]["span"] for m in subject_members]
+        rec = DecisionRecord(
+            handle=subject_handle,
+            state=(dlog.RESOLVED if accepted_partner else dlog.EXPIRED_UNRESOLVED),
+            phase=phase, round_index=round_index,
+            accepted_partner=accepted_partner,
+            observations=obs, cameras=cams,
+            frame_range=[min(s[0] for s in spans), max(s[1] for s in spans)],
+            context=context,
+            gates=gates, candidates=cands,
+            scored_count=len(cands),
+            eligible_count=sum(1 for c in cands if c.eligible),
+        )
+        return dl.add(rec)
+
+    # A SUPPRESSED tracklet is a decision too, and the only place MIN_OBSERVATIONS
+    # can actually fail: every tracklet that survives suppression passes that gate
+    # by construction, since suppression uses the same threshold. Recording them
+    # here is what makes the gate-failure histogram answer "how much am I losing to
+    # min_tracklet_observations", which was previously invisible.
+    if dl is not None:
+        for k in suppressed:
+            _emit(handles[k], "same_camera", 0, {k}, [], {
+                dlog.MIN_OBSERVATIONS: GateResult(
+                    value=_obs(k), threshold=min_tracklet_observations,
+                    passed=False),
+                dlog.ABSOLUTE_THRESHOLD: GateResult(
+                    value=None, threshold=same_camera_threshold, passed=False,
+                    extra={"note": "suppressed before any candidate was scored"}),
+                dlog.TOP2_MARGIN: dlog.compute_top2_margin(
+                    [], same_camera_threshold, basis=top2_margin_basis,
+                    threshold=top2_margin_threshold)[0],
+                dlog.RECIPROCAL_BEST: _na_gate(),
+                dlog.TEMPORAL_CONFLICT_SAME_CAMERA: _na_gate(),
+                dlog.TEMPORAL_CONFLICT_CROSS_CAMERA: _na_gate(),
+            }, accepted_partner=None, context="suppressed")
+            dl.records[-1].state = dlog.SUPPRESSED
 
     def union(a, b):
         ra, rb = find(a), find(b)
@@ -206,6 +319,8 @@ def reconcile_tracklets(store, threshold, run_id=None,
         return True
 
     # Phase 1: repair same-camera track fragmentation with a higher threshold.
+    # DECISION LOGIC UNCHANGED: a pair is a merge candidate iff it shares a camera,
+    # its spans are disjoint, and it clears same_camera_threshold.
     same_pairs = []
     for i, a in enumerate(keys):
         for b in keys[i + 1:]:
@@ -216,10 +331,69 @@ def reconcile_tracklets(store, threshold, run_id=None,
             s = float(protos[a] @ protos[b])
             if s >= same_camera_threshold:
                 same_pairs.append((s, a, b))
+    accepted_same = set()
     for s, a, b in sorted(same_pairs, reverse=True):
         if union(a, b):
             log(f"  tracklet reconcile: same-camera merge {a} + {b} "
                 f"(cosine {s:.3f})")
+            accepted_same.add((a, b))
+
+    # ---- Phase 1 instrumentation, subject-centric so the margin is meaningful.
+    # Runs AFTER the merges above and reads only `protos` / `tracklets`, so it
+    # cannot influence anything. Every same-camera peer is scored (including
+    # time-overlapping ones, which the decision loop skips before scoring) so the
+    # candidate vector can carry an exclusion reason for each.
+    if dl is not None:
+        for a in keys:
+            peers = [b for b in keys if b != a and b[0] == a[0]]
+            if not peers:
+                continue
+            scored = []
+            for b in peers:
+                score = float(protos[a] @ protos[b])
+                if conflict_reason({a}, {b}) is not None:
+                    reason = dlog.TEMPORAL_CONFLICT_SAME_CAMERA
+                elif score < same_camera_threshold:
+                    reason = dlog.BELOW_ABSOLUTE_THRESHOLD
+                else:
+                    reason = None
+                scored.append((b, score, reason))
+            best_b = max((t for t in scored if t[2] is None),
+                         key=lambda t: t[1], default=None)
+            cands = []
+            for b, score, reason in scored:
+                cands.append(Candidate(
+                    handle=handles[b], score=round(score, 6), excluded_by=reason,
+                    would_fail_reciprocity=None,      # Phase 1 has no reciprocity rule
+                    cameras=[b[0]], cluster_size=1, observations=_obs(b),
+                    pair_similarity_to_best=(None if best_b is None else
+                                             round(float(protos[b] @ protos[best_b[0]]), 6)),
+                ))
+            margin_gate, best, _, _ = dlog.compute_top2_margin(
+                cands, same_camera_threshold, basis=top2_margin_basis,
+                threshold=top2_margin_threshold)
+            partner = None
+            if best is not None:
+                bkey = next(b for b in peers if handles[b] == best.handle)
+                partner = (best.handle if ((a, bkey) in accepted_same
+                                           or (bkey, a) in accepted_same) else None)
+            _emit(handles[a], "same_camera", 0, {a}, cands, {
+                dlog.MIN_OBSERVATIONS: GateResult(
+                    value=_obs(a), threshold=min_tracklet_observations,
+                    passed=_obs(a) >= min_tracklet_observations),
+                dlog.ABSOLUTE_THRESHOLD: GateResult(
+                    value=(None if best is None else best.score),
+                    threshold=same_camera_threshold,
+                    passed=best is not None),
+                dlog.TOP2_MARGIN: margin_gate,
+                dlog.RECIPROCAL_BEST: _na_gate(),
+                dlog.TEMPORAL_CONFLICT_SAME_CAMERA: GateResult(
+                    value=sum(1 for _, _, r in scored
+                              if r == dlog.TEMPORAL_CONFLICT_SAME_CAMERA),
+                    threshold=0, passed=True,
+                    extra={"note": "count of peers excluded for time overlap"}),
+                dlog.TEMPORAL_CONFLICT_CROSS_CAMERA: _na_gate(),
+            }, accepted_partner=partner, context="same_camera")
 
     def current_roots():
         roots = defaultdict(set)
@@ -235,6 +409,7 @@ def reconcile_tracklets(store, threshold, run_id=None,
     # rule allows, it just gets to re-check after each merge updates the
     # clusters. A round that merges nothing ends the loop; every merge strictly
     # reduces the number of roots by one, so this always terminates.
+    round_index = 0
     while True:
         roots = current_roots()
         root_protos = {r: _cluster_prototype(ms, protos) for r, ms in roots.items()}
@@ -302,6 +477,7 @@ def reconcile_tracklets(store, threshold, run_id=None,
             cross_pairs.append((s, a, b))
 
         merged_this_round = False
+        accepted_pairs = set()
         for s, a, b in sorted(cross_pairs, reverse=True):
             ra, rb = find(a), find(b)
             if ra == rb:
@@ -315,7 +491,94 @@ def reconcile_tracklets(store, threshold, run_id=None,
                 log(f"  tracklet reconcile: {lane} cluster merge {a} + {b} "
                     f"(cosine {s:.3f} >= {bar:.2f})")
                 merged_this_round = True
+                accepted_pairs.add((a, b))
+                accepted_pairs.add((b, a))
 
+        # ---- Phase 2 instrumentation. Runs after the round's merges and reads
+        # only this round's scores, so it cannot alter the outcome. Unlike the
+        # decision path it scores EVERY root pair, so a candidate excluded by a
+        # hard constraint carries a reason instead of silently vanishing.
+        if dl is not None:
+            cluster_handle = {r: f"C-{i:04d}" for i, r in enumerate(root_keys)}
+            all_scores = {}
+            for i, a in enumerate(root_keys):
+                for b in root_keys[i + 1:]:
+                    all_scores[(a, b)] = float(root_protos[a] @ root_protos[b])
+
+            def _score(a, b):
+                return all_scores[(a, b)] if (a, b) in all_scores else all_scores[(b, a)]
+
+            for a in root_keys:
+                peers = [b for b in root_keys if b != a]
+                if not peers:
+                    continue
+                scored = []
+                for b in peers:
+                    sc, bar_b = _score(a, b), pair_threshold(a, b)
+                    reason = conflict_reason(roots[a], roots[b])
+                    if reason is None and not any(x[0] != y[0]
+                                                  for x in roots[a] for y in roots[b]):
+                        reason = dlog.NOT_MERGEABLE_CROSS
+                    if reason is None and sc < bar_b:
+                        reason = dlog.BELOW_ABSOLUTE_THRESHOLD
+                    scored.append((b, sc, bar_b, reason))
+                best_t = max((t for t in scored if t[3] is None),
+                             key=lambda t: t[1], default=None)
+                cands = []
+                for b, sc, bar_b, reason in scored:
+                    cams_b, obs_b = _cluster_meta(roots[b])
+                    cands.append(Candidate(
+                        handle=cluster_handle[b], score=round(sc, 6),
+                        excluded_by=reason,
+                        # ANNOTATION ONLY -- reciprocity never excludes a candidate
+                        # from the eligible set (see decision_log's module docstring).
+                        would_fail_reciprocity=(None if not require_reciprocal_best
+                                                else best_partner.get(b) != a),
+                        cameras=cams_b, cluster_size=len(roots[b]), observations=obs_b,
+                        pair_similarity_to_best=(None if best_t is None else
+                                                 round(_score(b, best_t[0]), 6)
+                                                 if b != best_t[0] else 1.0),
+                    ))
+                # The floor differs per candidate here, so pass the SUBJECT's best
+                # applicable bar for the recorded threshold.
+                subj_bar = best_t[2] if best_t else threshold
+                margin_gate, best, _, _ = dlog.compute_top2_margin(
+                    cands, subj_bar, basis=top2_margin_basis,
+                    threshold=top2_margin_threshold)
+                partner = None
+                recip_passed = True
+                if best is not None:
+                    bkey = next(b for b in peers if cluster_handle[b] == best.handle)
+                    partner = best.handle if (a, bkey) in accepted_pairs else None
+                    if require_reciprocal_best:
+                        recip_passed = (best_partner.get(a) == bkey
+                                        and best_partner.get(bkey) == a)
+                cams_a, obs_a = _cluster_meta(roots[a])
+                ctx = ("same_camera" if subj_bar == same_camera_threshold
+                       else "cross_camera")
+                _emit(cluster_handle[a], "cross_camera", round_index, roots[a],
+                      cands, {
+                    dlog.MIN_OBSERVATIONS: GateResult(
+                        value=obs_a, threshold=min_tracklet_observations,
+                        passed=obs_a >= min_tracklet_observations),
+                    dlog.ABSOLUTE_THRESHOLD: GateResult(
+                        value=(None if best is None else best.score),
+                        threshold=subj_bar, passed=best is not None),
+                    dlog.TOP2_MARGIN: margin_gate,
+                    dlog.RECIPROCAL_BEST: GateResult(
+                        value=(None if best is None else best.handle),
+                        threshold="mutual-best" if require_reciprocal_best else None,
+                        passed=recip_passed,
+                        extra={"applies": bool(require_reciprocal_best)}),
+                    dlog.TEMPORAL_CONFLICT_SAME_CAMERA: GateResult(
+                        value=sum(1 for _, _, _, r in scored
+                                  if r == dlog.TEMPORAL_CONFLICT_SAME_CAMERA),
+                        threshold=0, passed=True,
+                        extra={"note": "count of peers excluded for time overlap"}),
+                    dlog.TEMPORAL_CONFLICT_CROSS_CAMERA: _na_gate(),
+                }, accepted_partner=partner, context=ctx)
+
+        round_index += 1
         if not merged_this_round:
             break
 
@@ -341,7 +604,17 @@ def reconcile_tracklets(store, threshold, run_id=None,
             point_ids = tracklets[k]["points"]
             store.set_global_id(point_ids, survivor)
             remap[k] = survivor
+            # merged_from records the OTHER tracklets this identity absorbed, so a
+            # merge decision can be audited independently of the id it produced.
+            _record_outcome(k, dlog.RESOLVED, assigned_id=survivor,
+                            merged_from=[handles[m] for m in sorted(cluster)
+                                         if m != k])
 
     log(f"  tracklet reconcile: {len(keys)} tracklets -> "
         f"{len(set(remap.values()))} identities.")
+    if dl is not None:
+        dl.print_summary(log=log)
+        written = dl.write()
+        if written:
+            log(f"  tracklet reconcile: decision log -> {written}")
     return remap

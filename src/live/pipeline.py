@@ -420,6 +420,7 @@ class LivePipeline:
                 same_camera_threshold=self._recon_cfg.get("same_camera_threshold", 0.90),
                 require_reciprocal_best=self._recon_cfg.get("require_reciprocal_best", True),
                 min_tracklet_observations=self._recon_cfg.get("min_tracklet_observations", 3),
+                **self._decision_log_kwargs(),
             )
         except Exception as e:
             print(f"[live] reconcile failed ({e}); rendering with unreconciled ids.")
@@ -443,6 +444,30 @@ class LivePipeline:
             print(f"[live] final render/summary error: {e}")
         finally:
             self._cleanup_clips()
+
+    def _decision_log_kwargs(self):
+        """Build the reconcile decision-log arguments from identity.reconcile.*.
+
+        Guarded and fail-soft: if anything here is misconfigured we reconcile
+        WITHOUT diagnostics rather than losing the run's ids. Diagnostics are worth
+        a lot, but never worth the deliverable.
+        """
+        try:
+            from identity.decision_log import DecisionLog
+            margin_cfg = self._recon_cfg.get("top2_margin") or {}
+            path = self._recon_cfg.get("decision_log")
+            log = None
+            if path:
+                path = str(path).replace("<run_id>", self.run_id)
+                log = DecisionLog(path=path, run_id=self.run_id)
+            return {
+                "decision_log": log,
+                "top2_margin_threshold": margin_cfg.get("threshold"),
+                "top2_margin_basis": margin_cfg.get("basis", "eligible"),
+            }
+        except Exception as e:                                    # noqa: BLE001
+            print(f"[live] decision log disabled ({e}); reconciling without it.")
+            return {}
 
     def _cleanup_clips(self):
         """Delete the transient processed-frame clips (unless keep_frames)."""

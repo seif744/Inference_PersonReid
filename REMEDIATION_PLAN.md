@@ -143,9 +143,41 @@ footage, and the H.265 corruption answer.
 | 15 | `ts` is **receive time** (stamped after `cap.read()` returns), not capture time; no PTS ever read. Quantify per-camera jitter vs nominal 40/66.7 ms; probe `CAP_PROP_POS_MSEC` | verified |
 | 16 | Measure 224↔219 offset **as a bound on apparent disagreement**, never as a timestamp-error estimate — see decision D2 | decision D2 |
 | 17 | Per non-co-visible pair, negative-gap distribution for high-confidence same-person transitions (prototype cosine ≥ 0.85). Report sample sizes | decision D2 |
-| 18 | Fold the verification scripts used to produce Part H into `tests/` as a calibration harness, so the numbers regenerate per clip | housekeeping |
+| 18 | ~~Fold the verification scripts used to produce Part H into `tests/` as a calibration harness~~ — **DONE 2026-07-30**, see [`tests/calibration/`](tests/calibration/). Building it immediately caught two methodological errors in Part H (see the note there) | housekeeping |
 
 **Gate:** existing 8 test files pass; outputs byte-identical.
+
+#### Phase 1 progress — 2026-07-30
+
+**Landed.** `src/identity/decision_log.py` (new: gates, annotated candidate vector,
+both margin variants, aggregates, JSONL writer, summary-consistency verifier) and
+`reconcile.py` instrumented additively. Config under `identity.reconcile`:
+`decision_log`, `top2_margin.threshold` (null = inert), `top2_margin.basis`. Wired
+into `LivePipeline._decision_log_kwargs`, fail-soft so a bad log config never costs
+the run's ids. Covers items **2–12, 18**.
+
+`tests/live/test_phase1_decision_log.py` — **28/28 checks**, auto-discovered by
+`run_all.py` (now 9 files, all passing). The load-bearing check is that reconcile
+returns an **identical remap with and without a log attached**, across 7 scenarios
+including time-overlap, suppression, and the single-tracklet defect. Also covers
+acceptance criteria 3, 4, 6 and 9.
+
+**Two things building it caught:**
+
+- `MIN_OBSERVATIONS` could never fail, because suppression uses the same threshold, so
+  every surviving tracklet passes by construction. Suppressed tracklets now get a
+  decision record too — which is the only place that gate can fail, and it makes
+  "how much am I losing to `min_tracklet_observations`" visible for the first time.
+- `runner_up_differs` was degenerate. With no selectable candidate there is no margin
+  decision, but it still counted as a disagreement — a single-camera run reported
+  **100%**. Now `None` in that case, with `no_selectable_candidate` reported
+  separately, so the band interpretation stays meaningful.
+
+**Still open in Phase 1:** item 1 is partial (terminal states recorded; the
+`Candidate` / `merged Candidate` distinction is implicit in `phase` + `merged_from`),
+and items **13** (label-free correctness counters — these need the rendered output and
+gid map, not reconcile), **14** (per-camera timing), and **15–17** (timestamp
+diagnostics, which live in capture/pipeline) are not started.
 
 ### Phase 2 — Store transport + query hygiene
 
@@ -250,9 +282,12 @@ metrics so it is not mistaken for the veto working.
 |---|---|---|
 | 39 | `fc = Sequential(Linear, BatchNorm1d, ReLU)` and eval-mode `forward` returns `self.fc(v)` — the shipped embedding is **post-ReLU**, confined to the non-negative orthant. Add post-BN behind a config flag; record the tap in the run config; refuse to compare score logs across taps | **measured** |
 
-Measured effect (bank scoring, 14 proven-distinct pairs): separation margin **+0.047 → +0.071**,
-stranger ceiling **0.828 → 0.772**. But at matched false-accept rates recall is identical
-(89% / 0% either way). **Buys calibration robustness, not accuracy** on available footage.
+Measured effect (bank scoring, 14 proven-distinct pairs — see the corrected H.2/H.3):
+post-BN improves the separation margin in **every** scoring mode at **both** sample sizes,
+e.g. `+0.055 → +0.086` at 48 frames and `+0.108 → +0.157` at 90, and lowers the
+different-person ceiling (`0.845 → 0.782`, `0.892 → 0.858`). The *direction* is the stable
+result; the magnitudes are not. At matched false-accept rates recall was comparable, so this
+**buys calibration robustness rather than accuracy** on available footage.
 
 Untested hypothesis: the benefit may be larger cross-camera, where post-ReLU compression
 pushes same-person scores toward the stranger band.
@@ -267,7 +302,7 @@ pushes same-person scores toward the stranger band.
 | 41 | `cross_camera_threshold` — currently uncalibrated. With impossible competitors removed by Phase 7, a real match may win at a *higher* bar. A prediction to test, not a change to make |
 | 42 | `min_tracklet_observations` — interacts with #33 |
 | 43 | `TOP2_MARGIN` — four questions: does it reject anything reciprocal-best doesn't; disagreement rate vs the 10% bar; raw vs normalised margin; which `basis` |
-| 44 | Consensus vs `max(proto, exemplar)` scoring — measured margin +0.070 vs +0.047; modest |
+| 44 | Consensus vs `max(proto, exemplar)` scoring — consensus gave the **lowest different-person ceiling** of the three modes at both sample sizes (see corrected H.2/H.3), which is the property that matters for false merges |
 
 **A high `TOP2_MARGIN` failure rate is a diagnostic, not evidence of under-merging.** The
 discriminator is `pair_similarity_to_best`:
@@ -493,41 +528,71 @@ Deliverables from Phase 9 are curves, not values.
 
 ## Part H — Measurement reference
 
-All numbers below were produced on `register_file.avi` (2560×1440, **0 H.265 decode errors**),
-which matches production camera resolution. **Sample: 6 people, one camera, one clip.** The
-"different person" set uses only tracks that **co-occur in the same frame**, since a person
-cannot be two simultaneous detections — earlier figures that included non-co-occurring track
-pairs were contaminated by fragmentation and are not reproduced here.
+**Reproduce any of this with the harness in [`tests/calibration/`](tests/calibration/)** —
+see its [README](tests/calibration/README.md) for which script produces which subsection.
+The scripts are the source of truth; this section is a snapshot.
 
-### H.1 Raw crop-to-crop cosine
+All numbers below were produced on `register_file.avi` (2560×1440, **0 H.265 decode errors**),
+which matches production camera resolution. **Sample: 6 people, one camera, one clip, 14
+proven-distinct pairs.** The "different person" set uses only tracks that **co-occur in the
+same frame**, since a person cannot be two simultaneous detections — earlier figures that
+included non-co-occurring track pairs were contaminated by fragmentation and are not
+reproduced here.
+
+> **Two methodological errors were made and corrected while producing this section.** Both
+> inflated the results in the optimistic direction, and both are now enforced in code by the
+> harness. (1) Different-person pairs must co-occur in a frame — otherwise fragments of one
+> person enter the different-person set. (2) Bank queries must be held out of the bank —
+> otherwise the max-exemplar term matches a query against itself and returns 1.000. Assume
+> further methodological error is possible; prefer the *direction* of a comparison over its
+> magnitude.
+
+### H.1 Raw crop-to-crop cosine (48 frames @ stride 6)
 
 | Tap | same mean | same p5 | other mean | other p95 | other MAX | margin |
 |---|---|---|---|---|---|---|
 | post-ReLU (ships) | 0.885 | 0.710 | 0.552 | 0.640 | 0.819 | +0.070 |
 | post-BN | 0.848 | 0.601 | 0.373 | 0.509 | 0.770 | +0.093 |
 
-### H.2 Bank scoring — `max(prototype, best_exemplar)`
+Sample-size sensitive — at 90 frames the post-ReLU ceiling rises to 0.936. See the note
+under H.2/H.3.
 
-This is what decides same-camera reacquisition and cross-camera links.
+### H.2 / H.3 Bank scoring and alternatives — **CORRECTED 2026-07-30**
 
-| Tap | same p5 | other p95 | other MAX | margin |
-|---|---|---|---|---|
-| post-ReLU (ships) | 0.768 | 0.722 | **0.828** | +0.047 |
-| post-BN | 0.696 | 0.625 | 0.772 | +0.071 |
+> **The first version of these two tables was wrong.** Bank queries were not held out of
+> the bank, so any query also present in the bank matched *itself* via the max-exemplar
+> term and returned 1.000. That inflated the same-person distribution by whatever fraction
+> of queries sat in the bank, which made the margin depend on frame count rather than on
+> the model. `tests/calibration/measure_score_separation.py::_holdout` now splits each
+> track into a bank half and a disjoint query half. The live engine documents this exact
+> trap in `_reinforce`. Superseded figures were: bank post-ReLU margin +0.047 / ceiling
+> 0.828; consensus +0.070 / 0.793.
 
-Operating points, post-ReLU: `0.60 → 100% correct / 33.4% wrong`;
-`0.70 → 99.5% / 5.3%`; `0.80 → 93.1% / 1.4%`; `0.85 → 88.7% / 0.0%`; `0.90 → 80.3% / 0.0%`.
+Corrected, `register_file.avi`, two sample sizes to show the instability:
 
-**Different people reach 0.828 on production-resolution footage.** At matched false-accept
-rates the two taps give identical recall (89% / 0%).
+| Mode | Tap | margin @48f | ceiling @48f | margin @90f | ceiling @90f |
+|---|---|---|---|---|---|
+| raw crop-to-crop | post-ReLU | +0.072 | 0.819 | +0.075 | 0.936 |
+| raw crop-to-crop | post-BN | +0.097 | 0.765 | +0.114 | 0.914 |
+| **bank** `max(proto,exemplar)` (ships) | post-ReLU | +0.055 | 0.845 | +0.108 | 0.892 |
+| **bank** `max(proto,exemplar)` | post-BN | +0.086 | 0.782 | +0.157 | 0.858 |
+| consensus (mean of top half) | post-ReLU | +0.060 | **0.798** | +0.080 | **0.835** |
+| consensus (mean of top half) | post-BN | +0.071 | **0.738** | +0.112 | **0.770** |
+| prototype only | post-ReLU | +0.059 | 0.845 | +0.104 | 0.869 |
+| prototype only | post-BN | +0.071 | 0.782 | +0.151 | 0.806 |
 
-### H.3 Scoring function comparison
+**Stable conclusions** — hold at both sample sizes, safe to act on:
 
-| Scoring | margin | other MAX |
-|---|---|---|
-| `max(proto, exemplar)` (ships) | +0.047 | 0.828 |
-| consensus (mean of top half) | **+0.070** | 0.793 |
-| prototype only | +0.046 | 0.828 |
+1. post-BN beats post-ReLU on margin in every mode, and lowers the ceiling
+2. consensus gives the **lowest different-person ceiling** of the three scoring modes
+3. the different-person ceiling (0.78–0.94) sits **far above**
+   `live.identity.same_camera_threshold: 0.70` — that threshold is inside the range where
+   strangers score. The correction made this finding *stronger*, not weaker.
+
+**Unstable — do not set a threshold from one run.** `other MAX` is an extreme-value
+statistic and grows with sample size (raw post-ReLU: 0.819 → 0.936 between the two runs).
+The margin itself moved +0.055 → +0.108. Prefer p95 over MAX, and get actual values from
+the Phase 9 sweep on frozen multi-camera footage.
 
 ### H.4 Reconcile — prototype vs prototype (what Phase 1 of reconcile compares)
 

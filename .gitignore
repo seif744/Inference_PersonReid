@@ -41,7 +41,17 @@ models/
 # Acceptance/stage tests -- kept local. These drive the live pipeline with
 # SYNTHETIC frames (tests/live/_synth.py), so they are dev harness rather than a
 # shipped suite. Untracked with `git rm -r --cached tests` (files stay on disk).
-tests/
+#
+# `tests/*` rather than `tests/` so a subtree can be re-included below: git cannot
+# re-include anything whose PARENT DIRECTORY is excluded, and `tests/` excludes the
+# directory itself. `tests/*` excludes only its contents, which leaves negation working.
+tests/*
+
+# EXCEPTION -- tests/calibration/ IS tracked. Unlike the synthetic stage tests, it
+# measures on REAL footage and produces the numbers REMEDIATION_PLAN.md Part H depends
+# on, so those scripts are the source of truth for every threshold decision and must not
+# live only on one machine. See tests/calibration/README.md.
+!tests/calibration/
 
 # Local design/planning notes -- kept out of git by choice. NOTE: because these are
 # untracked, git carries no history for them, so any revision record has to live
