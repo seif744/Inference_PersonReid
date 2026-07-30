@@ -253,7 +253,7 @@ identity:
   # which the sticky live decision cannot catch.
   reconcile:
     enabled: true
-    threshold: 0.70          # prototype cosine to merge cross-camera; blank = use
+    threshold: 0.63          # prototype cosine to merge cross-camera; blank = use
                              # identity.threshold. Set explicitly here because this
                              # runs independently of the verifier (see verifier.py) --
                              # it must be recalibrated whenever identity.threshold is.
@@ -324,7 +324,18 @@ identity:
         # tracklets 46+51, which merge at 0.815 -- at 0.85 they split again and
         # the symptom returns. None of the three confirmed false merges (reid 5,
         # 6, 10) involved a cam_213 same-camera merge.
-      # cam_224 WAS 0.80 here and is deliberately NOT any more.
+      cam_224:
+        same_camera_threshold: 0.80
+      # REVERTED to 0.80 on 2026-07-30, after the operator watched the videos.
+      #
+      # The reasoning for raising it to 0.90 is below and still reads well; the
+      # OUTPUT got worse anyway. Raising it split one person into many numbers,
+      # which the operator rated worse than the false merges it removed. Both
+      # states are wrong -- that is #45a -- but this is the one that was rated
+      # less wrong on screen, so this is where the config sits until a change is
+      # validated on a re-rendered video BEFORE it ships.
+      #
+      # Superseded reasoning, kept because the measurements were real:
       #
       # It caused two of the three false merges the operator saw:
       #   reid 6  <- cam_224 58+112 @ 0.823 and 58+120 @ 0.872
