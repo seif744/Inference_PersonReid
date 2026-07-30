@@ -866,7 +866,13 @@ def main():
         extractor = ReIDExtractor(
             weights=reid_cfg["weights"],
             device=reid_device,
+            # #39/#56: the feature tap and the batch ceiling. Changing the tap
+            # re-scales every threshold, so it is recorded in the run banner below.
+            tap=reid_cfg.get("tap", "post_relu"),
+            max_batch=int(reid_cfg.get("max_batch", 32)),
         )
+        print(f"[main] ReID tap: {reid_cfg.get('tap', 'post_relu')} "
+              f"-- thresholds are tap-specific; never compare score logs across taps.")
         for name, _ in sources:
             embedders[name] = TrackEmbedder(
                 extractor,

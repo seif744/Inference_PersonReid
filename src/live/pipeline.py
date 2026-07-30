@@ -223,7 +223,14 @@ class LivePipeline:
         reid_cfg = self.cfg.get("reid", {}) or {}
         det_cfg = self.cfg.get("detector", {}) or {}
         trk_cfg = self.cfg.get("tracker", {}) or {}
-        extractor = ReIDExtractor(weights=reid_cfg["weights"], device=device)
+        extractor = ReIDExtractor(
+            weights=reid_cfg["weights"], device=device,
+            # #39/#56. The tap is recorded in the run banner because every
+            # threshold in the config is specific to it.
+            tap=reid_cfg.get("tap", "post_relu"),
+            max_batch=int(reid_cfg.get("max_batch", 32)))
+        print(f"[live] ReID tap: {reid_cfg.get('tap', 'post_relu')} "
+              f"-- thresholds are tap-specific; never compare score logs across taps.")
 
         # LIVE-only pose toggle: the pose ensemble is a SECOND model per frame.
         # Skipping it ~halves detection cost -> far fewer dropped frames -> stabler

@@ -152,6 +152,39 @@ reid:
   # Multi-source domain-generalization checkpoint (trained on Duke+Market+CUHK03,
   # evaluated on MSMT17 as the unseen domain) from the torchreid Model Zoo.
   weights: src/reid/weights/osnet_ain_x1_0.pth
+  # FEATURE TAP (#39). Where in the network the embedding is taken from.
+  #   post_relu -- what has always shipped. torchreid's OSNet ends in
+  #                fc = Sequential(Linear, BatchNorm1d, ReLU) and eval-mode
+  #                forward() returns that whole block, so the embedding is confined
+  #                to the NON-NEGATIVE orthant: 21% of dimensions are exactly zero,
+  #                0% negative, and therefore the cosine between ANY two embeddings
+  #                is >= 0. That squeeze upward is why different people score as
+  #                high as 0.78-0.94 here.
+  #   post_bn   -- tap before the ReLU, keeping the negative half of the space.
+  #
+  # MEASURED (register_file.avi, both sample sizes): post_bn improved the
+  # separation margin in EVERY scoring mode -- +0.055 -> +0.086 at 48 frames,
+  # +0.108 -> +0.157 at 90 -- and lowered the different-person ceiling from 0.845
+  # to 0.782 and 0.892 to 0.858. The DIRECTION held at both sizes; the magnitudes
+  # did not. At matched false-accept rates recall was comparable, so this buys
+  # CALIBRATION ROBUSTNESS more than raw accuracy on the footage available.
+  #
+  # CHANGING THIS VOIDS EVERY THRESHOLD IN THIS FILE. It is a different feature
+  # space, not a better version of the same one -- same_camera_threshold,
+  # cross_camera_threshold and every number in Part H are all re-scaled. Never
+  # compare a score log across taps.
+  #
+  # To adopt it: switch the tap, then re-derive the bars on a captured run and
+  # watch the videos, all of which is now offline:
+  #   python tests/calibration/measure_score_separation.py register_file.avi 90 6
+  #   python tests/calibration/sweep_reconcile_thresholds.py <run_id> --cross 0.4,0.5,0.6,0.7
+  #   python tests/calibration/rerender_from_clips.py <run_id> --cross <chosen>
+  tap: post_relu
+  # #56: crops per forward pass. The batch used to be sized by however many people
+  # were in view, which is an OOM on a smaller GPU exactly when the scene is
+  # busiest. Chunking is embedding-invariant (measured 5.2e-08) because eval-mode
+  # BatchNorm uses running statistics. 0 = unbounded.
+  max_batch: 32
   device: auto               # auto | cpu | cuda | cuda:N -- same vocabulary as
                              # live.run.device, resolved by the same helper
                              # (src/live/capabilities.py::detect_device), so

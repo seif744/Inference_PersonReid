@@ -41,6 +41,22 @@ def bootstrap() -> str:
 
 
 REID_WEIGHTS = "src/reid/weights/osnet_ain_x1_0.pth"
+
+
+def reid_tap() -> str:
+    """The feature tap the pipeline would use (#39), overridable for comparisons
+    with CALIB_REID_TAP. Read from config for the same reason DETECT_WEIGHTS is:
+    a tap change must not leave the harness measuring the old feature space."""
+    override = os.environ.get("CALIB_REID_TAP")
+    if override:
+        return override
+    try:
+        import yaml
+        with open(os.path.join(project_root(), "config.yaml")) as f:
+            cfg = yaml.safe_load(f) or {}
+        return (cfg.get("reid") or {}).get("tap") or "post_relu"
+    except Exception:                                          # noqa: BLE001
+        return "post_relu"
 POSE_WEIGHTS = "yolo11n-pose.pt"
 
 

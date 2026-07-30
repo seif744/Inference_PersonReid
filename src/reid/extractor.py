@@ -94,7 +94,7 @@ class ReIDExtractor:
     """
 
     def __init__(self, weights: str, device: Optional[str] = None,
-                 max_batch: int = 32):
+                 max_batch: int = 32, tap: str = "post_relu"):
         """
         weights : path to a person-ReID OSNet checkpoint (.pth). NOT ImageNet
                   weights -- those do not separate identities.
@@ -110,6 +110,8 @@ class ReIDExtractor:
                   tests/calibration/verify_embedding_contract.py. 0 = unbounded.
         """
         self.max_batch = max(0, int(max_batch))
+        self.tap = str(tap or "post_relu")
+        self._tap_warned = False
         self.device = torch.device(
             device if device is not None
             else ("cuda" if torch.cuda.is_available() else "cpu")
@@ -204,7 +206,7 @@ class ReIDExtractor:
         batch = torch.stack([self._preprocess(c) for c in crops])
         batch = batch.to(self.device)
 
-        features = self.model(batch)                      # (N, 512), raw features
+        features = self._forward_tapped(batch)            # (N, 512), raw features
 
         # L2-normalize along the feature dim. eps guards the degenerate case of
         # an all-zero feature (never seen in practice) from producing NaNs.
@@ -212,6 +214,47 @@ class ReIDExtractor:
 
         # Back to CPU/NumPy for the rest of the (non-torch) pipeline.
         return features.cpu().numpy().astype(np.float32)
+
+    def _forward_tapped(self, batch):
+        """Run the model and take features at the configured TAP (#39).
+
+        torchreid's OSNet ends in `fc = Sequential(Linear, BatchNorm1d, ReLU)`, and
+        eval-mode forward() returns the output of that whole block -- so the shipped
+        embedding is POST-ReLU, confined to the non-negative orthant. Measured
+        consequence: 21.0% of dimensions are exactly zero, 0% negative, so the
+        cosine between ANY two embeddings is >= 0 and the usable range is squeezed
+        upward -- which is why different people score as high as 0.78-0.94.
+
+        Tapping POST-BN instead (before the ReLU) keeps the negative half of the
+        space. Measured on register_file.avi, post-BN improved the separation margin
+        in EVERY scoring mode at BOTH sample sizes (+0.055 -> +0.086 at 48 frames,
+        +0.108 -> +0.157 at 90) and lowered the different-person ceiling
+        (0.845 -> 0.782 and 0.892 -> 0.858). The DIRECTION is the stable result; the
+        magnitudes are not.
+
+        CHANGING THE TAP VOIDS EVERY THRESHOLD IN THE SYSTEM -- it is a different
+        feature space, not a better version of the same one. That is why it is a
+        flag and why it defaults to the shipped behaviour.
+        """
+        if self.tap != "post_bn":
+            return self.model(batch)
+        fc = getattr(self.model, "fc", None)
+        if fc is None or not hasattr(fc, "__getitem__") or len(fc) < 2:
+            # Not the Sequential(Linear, BN, ReLU) we expect -- do not guess at a
+            # different architecture's internals, just use the shipped tap.
+            if not self._tap_warned:
+                print("[reid] tap 'post_bn' requested but this model's `fc` is not "
+                      "the expected Sequential(Linear, BatchNorm1d, ReLU); using "
+                      "the default post-ReLU tap.")
+                self._tap_warned = True
+            return self.model(batch)
+        # featuremaps -> global pool -> fc[:2] (Linear, BatchNorm1d), stopping
+        # before the ReLU. Mirrors torchreid's own eval-mode forward.
+        v = self.model.featuremaps(batch)
+        v = torch.nn.functional.adaptive_avg_pool2d(v, 1).view(v.size(0), -1)
+        for layer in list(fc)[:2]:
+            v = layer(v)
+        return v
 
     def _preprocess(self, crop: np.ndarray) -> torch.Tensor:
         """
