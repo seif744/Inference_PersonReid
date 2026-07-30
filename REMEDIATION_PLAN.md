@@ -16,23 +16,36 @@ Read Part A before proposing any threshold change. Read Part H before trusting a
 
 ### 0.1 The next thing to do
 
-**Make `identity.reconcile.same_camera_threshold` per-camera, and set cam_213 and
-cam_224 to ~0.80 while leaving cam_206 at 0.90.** This is plan item **#40**.
+**Capture run2 and diff it against run1 (`20260730_093723`).** Two changes are staged
+in the working tree and neither has ever run on real footage:
 
-Why it is first: at the global 0.90, cam_213 achieves **zero** same-camera merges across
-all 11 of its subjects and cam_224 manages it for only 5 of 17, while cam_206 gets 9.0
-eligible partners per subject. A camera with no same-camera merging cannot join a
-person's front-view and back-view fragments, so each is absorbed cross-camera into a
-*different* cluster — which is exactly the "reid 2 becomes reid 7" the operator observed
-in cam_213 and cam_224. Full evidence in [J.6](#j6-decision-log-analysis--the-per-camera-finding-that-reframes-phase-9).
+| Staged change | What it should move |
+|---|---|
+| **#40** — `same_camera_threshold` is now per-camera; cam_213 and cam_224 at **0.80**, cam_206 and cam_219 left at 0.90 | orphans (33/89 today) and eligible-set size in cam_213 / cam_224 |
+| **detector `yolo11n.pt` → `yolo11m.pt`** (operator's call, 2026-07-30) | detection recall, and tracklet COUNT per camera |
 
-Per-camera reconcile thresholds **do not exist yet** — `detector.per_camera` covers
-detection only. This needs a config block plus a lookup in `pair_threshold()`.
+Then diff sections 1, 2 and 5 of the analyser against [J.10](#j10-full-analyser-output-run-20260730_093723):
 
-Then, in order: **#45a** (reconcile compares prototype *means*, which blurs front/back
-into a vector matching neither view — the structural cause behind cam_213; #40 treats
-only the symptom), then **#44** (`RECIPROCAL_BEST` rejects 31% of decisions at up to
-0.905, but fewer orphans will change that picture).
+```bash
+python tests/calibration/analyze_decision_log.py logs/reconcile_decisions_<run_id>.jsonl
+```
+
+> **These two changes confound each other**, because they attack the same symptom from
+> opposite ends: yolo11m creates *fewer* fragments (measured: it holds one 150-frame
+> track where yolo11n splits the same person into 64 + 37 frames — see [H.11](#h11-detector-capacity-yolo11n-vs-yolo11m)),
+> while #40 makes the fragments that remain *mergeable*. Both reduce the orphan count, so
+> one combined run cannot attribute it.
+>
+> They do leave **different fingerprints**, which is how to read a combined run:
+> yolo11m moves **tracklets per camera** (J.9's 61 / 11 / 7 / 18); #40 moves
+> **eligible-per-subject and orphans** (J.10 sections 2 and 5) at an unchanged tracklet
+> count. If you want clean attribution instead, flip `detector.model` back to
+> `yolo11n.pt` for run2 (one line) and take yolo11m in run3.
+
+After the run, in order: **#45a** (reconcile compares prototype *means*, which blurs
+front/back into a vector matching neither view — the structural cause behind cam_213;
+#40 treats only the symptom), then **#44** (`RECIPROCAL_BEST` rejects 31% of decisions
+at up to 0.905, but fewer orphans will change that picture).
 
 **Method, non-negotiable:** change ONE thing, re-run, and diff the analyser output.
 Four earlier tuning attempts were reverted without learning anything — see Part I.
@@ -45,17 +58,21 @@ Four earlier tuning attempts were reverted without learning anything — see Par
 | `e05c476` | **J.5 fix:** finalization survives a failed `print`. Two production runs had been lost to it |
 | `286e06a` + `c977f57` | `tests/calibration/analyze_decision_log.py` and a fix to its inverted band report |
 | `5598d31` | Part J.6: the per-camera finding from the first real run |
+| *working tree* | **#40**: `resolve_same_camera_thresholds` + `strictest_same_camera_bar` in `reconcile.py`, `identity.reconcile.per_camera` in config, both call sites wired, `tests/live/test_per_camera_same_camera_bar.py` (36 checks) |
+| *working tree* | `detector.model: yolo11m.pt`, `tests/calibration/compare_detector_models.py`, `_common.DETECT_WEIGHTS` now read from config instead of hardcoded |
 
-Test state: **10 test files pass** (`python tests/run_all.py`), including
-`test_phase1_decision_log.py` (28 checks) and `test_shutdown_reaches_reconcile.py` (14).
+Test state: **11 test files pass** (`python tests/run_all.py`), including
+`test_phase1_decision_log.py` (28 checks), `test_shutdown_reaches_reconcile.py` (14)
+and `test_per_camera_same_camera_bar.py` (36).
 
 ### 0.3 Verify state on a fresh machine
 
 ```bash
-python tests/run_all.py                                    # expect 10 files pass
-python tests/calibration/verify_embedding_contract.py      # expect 15 checks pass
-python tests/calibration/characterize_known_defects.py     # shows which defects remain
+python tests/run_all.py                                    # expect 11 files pass
+python tests/calibration/verify_embedding_contract.py      # expect PASS
+python tests/calibration/characterize_known_defects.py     # expect 9/9 still PRESENT
 python tests/calibration/analyze_decision_log.py <log>     # re-derive J.6
+python tests/calibration/compare_detector_models.py        # re-derive H.11
 ```
 
 Artefacts from run `20260730_093723` live on the A6000 at
@@ -67,10 +84,17 @@ reproduce every symptom and nothing local does.
 ### 0.4 Still unanswered
 
 - Does raising `imgsz` or lowering `conf` recover the people cam_206 misses at the start
-  of a clip? Measured as no-ops on other footage; **untested on cam_206's own clip**,
-  which is a crowded room with a table and is a different problem.
-- `cross_camera_threshold` remains uncalibrated. Do not touch it before #40.
-- Whether `yolo11s`/`yolo11m` is needed — treat as a measurement, not an upgrade.
+  of a clip? Measured as no-ops on other footage **with yolo11n**; untested on yolo11m,
+  and **untested on cam_206's own clip**, which is a crowded room with a table and is a
+  different problem.
+- `cross_camera_threshold` remains uncalibrated. Do not touch it before run2.
+- **Does yolo11m keep up on four live streams?** It buys real fragmentation reduction on
+  a file (H.11) at 2.0× the CPU cost. Whether that cost shows up as dropped frames — the
+  one thing that would make it a net loss — is only visible in run2's per-camera
+  `dropped%` and `infer_q dropped`. J.1 declared Phase 11 dead *at yolo11n's cost*.
+- Whether cam_219 also needs a lowered same-camera bar. It orphans 4 of 6 subjects, but
+  has only 7 tracklets at mean 264 observations, so there is little fragmentation to
+  repair. Left at 0.90 deliberately, to keep run2's comparison readable.
 
 ### 0.5 Reading order for a fresh session
 
@@ -170,7 +194,8 @@ These were measured and rejected. Do not revisit without new evidence.
 | Deepening `max_inference_queue` | 6 MB/frame; observed peak depth 900 ≈ 5.6 GB RAM | measured |
 | Frame-drop → fragmentation fixes | **CONFIRMED DEAD on production hardware (J.1):** real drop rate is 0.5–6.5%, not the 85–99% measured on CPU-with-file. Phase 11 solves a problem that does not exist at this crowd size | measured, field |
 | `TOP2_MARGIN` as a **gate** | Accepted and rejected margin distributions are near-identical on 163 real decisions (median 0.0224 vs 0.0186, p5 0.0017 vs 0.0016). A gate would be near-random. Compute and log it; never enforce it. See J.6 | measured, field |
-| A **global** `same_camera_threshold` of any value | The per-subject boundaries overlap across cameras (J.6): p95 of "top different" = 0.816 exceeds p5 of "worst same" = 0.719. No single number works. Must be per-camera | measured, field |
+| A **global** `same_camera_threshold` of any value | The per-subject boundaries overlap across cameras (J.6): p95 of "top different" = 0.816 exceeds p5 of "worst same" = 0.719. No single number works. **Per-camera bars landed 2026-07-30 (#40)** — so do not "fix" this by picking a better global number; tune the per-camera entries | measured, field |
+| `yolo11n` → `yolo11m` as a **no-op** | Superseded 2026-07-30. Part A previously implied detector changes buy nothing, on the strength of `imgsz`/`conf` results. Capacity is a different lever and it **does** move fragmentation: yolo11m holds one 150-frame track where yolo11n splits the same person into 64 + 37 (H.11). Shipped as a measurement; the throughput half is still unmeasured | measured |
 
 ---
 
@@ -182,14 +207,30 @@ measured on the replay harness. Phase 9 is calibration. Phases 10–12 are perfo
 ### Phase 0 — Baseline run (operator)
 
 Qdrant up. Set `live.reconcile.keep_frames: true` and `live.metrics.log_interval_sec: 10`.
-Four cameras, 2–3 minutes, people crossing between views, **one** `Ctrl-C`:
+Four cameras, 2–3 minutes, people crossing between views, **one** interrupt:
 
-```
+```bash
+# NOT `| tee`. See the warning below -- that pipeline cost two complete runs.
 python main.py --mode live --videos rtsp://...213/1/1 rtsp://...224/ch01/0 \
-    rtsp://...206/1/1 rtsp://...219/ch01/0 2>&1 | tee run1.log
+    rtsp://...206/1/1 rtsp://...219/ch01/0 > run1.log 2>&1 &
+echo $! > run.pid
+# ...let it run, then ONCE:
+kill -INT $(cat run.pid)
+# watch it finish WITHOUT holding the terminal that owns the process:
+tail -f run1.log        # Ctrl-C here is safe; it only stops tail
 ```
 
 Keep `run1.log` and the four `._live_src_cam_*.mp4`. Then `grep -c hevc run1.log`.
+
+> **Never launch this with `| tee`.** Ctrl-C reaches every process in the foreground
+> group, `tee` dies first, and every subsequent `print` in the pipeline raises
+> `BrokenPipeError` — which used to abandon reconcile entirely (J.5). That fix has
+> landed (`e05c476`), so a broken stdout no longer costs the ids, but redirect-and-signal
+> is still the correct habit: it keeps finalization off the terminal's process group, so
+> a dropped SSH session or a closed window cannot interrupt it either. **Two production
+> runs were lost to `| tee`, and a third to running `tail -f` and `kill` in the same
+> command block** — the `tail` held the foreground and the interrupt went to the wrong
+> process. Send the signal by pid, then follow the log separately.
 
 Yields: per-camera drop rate, fragmentation ratio, first cross-camera data, replayable
 footage, and the H.265 corruption answer.
@@ -255,11 +296,15 @@ merges vs the stranger ceiling). It produced J.6 on its first real run.
 
 And `tests/live/test_shutdown_reaches_reconcile.py` — 14 checks pinning the J.5 fix.
 
-**Four self-caught errors so far**, all found by building the instrumentation rather
+**Five self-caught errors so far**, all found by building the instrumentation rather
 than by reasoning: the two Part H methodology bugs, `MIN_OBSERVATIONS` being
-unfailable, `runner_up_differs` counting non-decisions, and the analyser printing an
-inverted "clean band". Assume more remain; prefer the *direction* of a comparison over
-its magnitude.
+unfailable, `runner_up_differs` counting non-decisions, the analyser printing an
+inverted "clean band", and — while landing #40 — the analyser's section 1 judging
+**every** configured threshold against **every** subject, which with per-camera bars
+blames 0.80 for subjects in a camera that never used it. Now filtered to the subjects
+that actually faced each bar, and it prints which cameras used it. **That correction is
+a no-op on a single-threshold log**, so run1's J.10 numbers stay directly comparable to
+run2's. Assume more remain; prefer the *direction* of a comparison over its magnitude.
 
 **Still open in Phase 1:** item 1 is partial (terminal states recorded; the
 `Candidate` / `merged Candidate` distinction is implicit in `phase` + `merged_from`),
@@ -386,7 +431,7 @@ pushes same-person scores toward the stranger band.
 
 | # | Item |
 |---|---|
-| 40 | **`same_camera_threshold` must become PER-CAMERA — it does not exist today.** Field data (J.6) shows 0.90 yields 9.0 eligible partners per subject in cam_206 but **0.0** in cam_213 and 0.5 in cam_224. No global value works: the per-subject boundaries overlap. Start cam_213 and cam_224 at ~0.80, leave cam_206 at 0.90. **This is now the highest-value change in the plan** — it is the direct cause of the observed "reid 2 becomes reid 7" |
+| 40 | ~~**`same_camera_threshold` must become PER-CAMERA**~~ — **LANDED 2026-07-30, unmeasured.** Field data (J.6) showed 0.90 yields 9.0 eligible partners per subject in cam_206 but **0.0** in cam_213 and 0.5 in cam_224, with overlapping per-subject boundaries so no global value works. Shipped: `identity.reconcile.per_camera` (cam_213 and cam_224 at **0.80**), resolved by `reconcile.resolve_same_camera_thresholds` — the single merge point both call sites use, so live and file-batch cannot drift, exactly as `resolve_detector_cfg` does for the detector. `pair_threshold()` resolves a CLUSTER pair's bar with `strictest_same_camera_bar`: **max** over the cameras the two clusters share, since merging asserts the same-person claim for every one of them and the loosest camera must not launder a merge past the tightest. Malformed config is skipped loudly (an unnoticed `80` for `0.80` would silently disable same-camera merging); a configured camera absent from the run is named in the log (D1). 36 checks in `tests/live/test_per_camera_same_camera_bar.py`, including that **no overrides reproduces the old behaviour exactly**. **Still a hypothesis from one run — it has not been measured on footage** (D9) |
 | 41 | `cross_camera_threshold` — still uncalibrated. Do this only AFTER #40, since fewer orphans means fewer spurious competitors and the picture will change |
 | 42 | `min_tracklet_observations` — LOW priority: only 8/97 tracklets and 0.3% of observations suppressed (J.6) |
 | 43 | ~~`TOP2_MARGIN` sweep~~ — **ANSWERED, see Part A.** Accepted and rejected margin distributions are near-identical (median 0.0224 vs 0.0186), so it carries no information. Keep `threshold: null` |
@@ -415,7 +460,13 @@ Deliverable: **curves, not values.**
 | 48 | `max_frame_staleness_ms: 100` and `track_buffer: 30` are absolute → 2.5 vs 1.5 frame periods across cameras | read |
 | 49 | `detector.per_camera` is `{}` — the intended lever for heterogeneous cameras, unused | read |
 
-### Phase 11 — Throughput (conditional on run1 showing fragmentation)
+### Phase 11 — Throughput (dropped to lowest priority by J.1; **re-open if yolo11m drops frames**)
+
+> J.1 measured real drop rates of 0.5–6.5% and declared this phase largely dead — but that
+> was at `yolo11n`'s cost. The detector is now `yolo11m` (~10× the FLOPs, 2.0× measured on
+> CPU: H.11). If run2's per-camera `dropped%` climbs, the items below stop being dead code
+> and #50 / #51 become the cheapest way to pay for the bigger model.
+
 
 | # | Item | Evidence |
 |---|---|---|
@@ -531,8 +582,9 @@ association is one-to-one. Across 120 frames the tracker returned more rows than
 
 | Run | Purpose |
 |---|---|
-| **run1** — baseline, Phase 0 | per-camera drop rate, fragmentation ratio, H.265 answer, first cross-camera data, frozen clips. Unblocks Phases 9–11 |
-| **run2** — after Phase 5, TCP transport | compare `grep -c hevc` and prototype tightness |
+| ~~**run1** — baseline, Phase 0~~ | **DONE**, `20260730_093723`. Per-camera drop rate, fragmentation ratio, H.265 answer, first cross-camera data, frozen clips. Analysis in J.6–J.12 |
+| **run2** — #40 + yolo11m, **the next run** | Did the orphan count fall and did the operator's four named symptoms (J.8) go away? Diff analyser sections 1/2/5 against J.10, and per-camera tracklet counts against J.9. **Also the throughput verdict on yolo11m** — per-camera `dropped%` vs J.9's 0.4–2.9% |
+| **run3** — after Phase 5, TCP transport | compare `grep -c hevc` and prototype tightness |
 | **Single-person route walk** through all four cameras with rough timings | cleanest data for per-pair tolerances (#17) and `cross_camera_threshold` |
 | **Crowded run**, as many people as possible | every measurement in Part H tops out at 6 people; the production regime is untested |
 
@@ -756,6 +808,39 @@ representative of A100-on-RTSP — they locate the bottleneck, nothing more.
 
 Output timeline: 157 frames at 20 fps = 7.85 s for 42.9 s of content = **5.5× too fast**.
 
+### H.11 Detector capacity: yolo11n vs yolo11m
+
+`tests/calibration/compare_detector_models.py`, `register_file.avi` (2560×1440),
+150 consecutive frames, shipped `conf 0.40 / iou 0.60 / imgsz 640`, fresh ByteTrack
+per model. **4 people in view.**
+
+| Model | dets | mean/frame | track ids | track lengths | ms/frame (CPU) |
+|---|---|---|---|---|---|
+| yolo11n (was) | 552 | 3.68 | **6** | 150, 150, 150, **64, 37**, 1 | 215 |
+| yolo11m (ships) | 600 | 4.00 | **4** | 150, 150, 150, 150 | 435 |
+
+yolo11m found more boxes on 49 of 150 frames and fewer on 1. The result that matters is
+the **id count**, not the box count: yolo11n's ids 4 (frames 0–55) and 6 (frames 80–149)
+**never co-occur in any frame** and are separated by a 24-frame gap — one person lost and
+re-minted. yolo11m covers that person with a single continuous track. yolo11n also emits a
+1-frame phantom id.
+
+So the two changes staged for run2 meet in the middle: **yolo11m creates fewer fragments;
+#40 merges the fragments that remain.** Same-camera fragmentation is the mechanism behind
+both the operator's cam_213 front/back split and their own diagnosis, *"this seems like a
+track id change so reid change nonsense"*.
+
+**What this does NOT establish.** One clip, one camera, 4 people, no frame dropping, and
+CPU timings — the 2.0× CPU ratio is not the GPU ratio, and a file run never drops frames.
+The live path does: a slower detector means more dropping, which fragments tracks, cutting
+against the gain measured here. That half is only answerable from run2's per-camera
+`dropped%`. Nor is this clip cam_206, whose missed people are in a crowded room with a
+table — its own frozen replay clip is the only thing that reproduces that.
+
+> Precedent worth respecting: Part A rejected `imgsz` 640→1280 as a no-op on this same
+> clip with yolo11n. Capacity moved what resolution did not, so `imgsz` deserves
+> re-measuring on yolo11m before it is treated as settled.
+
 ---
 
 ## Part J — Field results, 2026-07-30 (A6000, 4 cameras, live RTSP)
@@ -919,6 +1004,11 @@ because these are what "working" has to mean.
 | cam_219 | "a little slowed"; reid 2 → **reid 4** when he moves to the other side of the table | 24.2 fps tagged 20 → 1.21× slow; the id change is a track-id change that reconcile failed to re-merge |
 | cam_213 | reid 2 correct **by his front**, becomes **reid 7 by his back** | cam_213 achieves ZERO same-camera merges at 0.90, so front and back fragments can never join. Compounded by reconcile comparing prototype *means* (#45a) |
 | cam_206 | 5 people present but only 1 detected at first; "randomly starts detecting the rest" | **detection recall**, not identity. Nothing downstream can invent a box YOLO never produced. Also explains cam_206's 61 tracklets |
+
+**Responses now staged for run2:** the cam_213 / cam_224 rows are what #40 addresses; the
+cam_206 recall row is why `detector.model` moved to `yolo11m` (H.11). The cam_224 and
+cam_219 playback-speed rows are **not** addressed — they are #45/#46 and still open, so
+expect the same "sped up / slowed" complaint from run2's videos.
 
 Operator's own diagnosis, which was correct: *"this seems like a track id change so reid
 change nonsense which should not always be the case."* Final-video ids come from
