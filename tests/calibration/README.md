@@ -39,6 +39,19 @@ directory with a distinct camera name and a local Qdrant, so it cannot overwrite
 | `measure_pose_ensemble.py` | no | — | only if the batch path comes back into use |
 | `characterize_known_defects.py` | no, always exits 0 | — | after each phase lands, to see what moved |
 | `audit_product_path.py` | no | H.10 | after any pipeline change; the only whole-path check |
+| `explain_merge_failure.py` | no | Part M | when the operator reports one person carrying two reids — names the rule and the tracklet pair that refused the merge |
+| `sweep_reconcile_thresholds.py` | no | #41, Part M.1 | to explore merge settings on a finished run, with no camera time |
+| `rerender_from_clips.py` | no | — | to see a setting on the actual video before it ships |
+
+**The three scripts that re-run reconcile** (`explain_merge_failure`,
+`sweep_reconcile_thresholds`, `rerender_from_clips`) all take their settings from
+`config.yaml` through `identity.reconcile.resolve_reconcile_kwargs`, and each prints the
+full setting line before its first result. That is not decoration. Until 2026-07-31 the
+sweep and the re-render passed neither `covisibility` nor `same_camera_reciprocal_best`,
+both of which default OFF in `reconcile_tracklets` and are ON in production — so every
+threshold conclusion in Part J was measured against a clustering that does not ship. **If
+that setting line ever disagrees with the run you are trying to explain, nothing below it
+means anything.**
 
 `verify_embedding_contract.py` is the one genuine regression test. Everything it covers is
 a **silent** failure mode — a broken BGR→RGB swap, a transposed resize, a batch/crop

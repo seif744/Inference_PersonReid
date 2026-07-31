@@ -1014,33 +1014,20 @@ def _finalize_run(threads, stop_event, shared, jobs, cfg, disp_cfg, id_cfg,
     # reconcile does not run, in which case the labels simply carry no score.
     reid_quality = {}
     if identity is not None and recon_cfg.get("enabled"):
-        from identity.reconcile import (reconcile_tracklets,
-                                        resolve_covisibility,
-                                        resolve_same_camera_thresholds)
-        threshold = recon_cfg.get("threshold")
-        if threshold is None:
-            threshold = id_cfg.get("threshold", 0.85)
+        from identity.reconcile import (describe_reconcile_kwargs,
+                                        reconcile_tracklets,
+                                        resolve_reconcile_kwargs)
+        # EVERY reconcile setting comes from the one resolver, so this path, the
+        # live pipeline and both offline tools cannot drift. They HAD drifted:
+        # this call site defaulted min_tracklet_observations to 1 (the pipeline
+        # used 3) and fell back to identity.threshold=0.85 (the pipeline used
+        # 0.63). See resolve_reconcile_kwargs and REMEDIATION_PLAN.md Part M.
+        recon_kwargs = resolve_reconcile_kwargs(cfg)
         print("[main] Reconciling identities across cameras... "
               "(do NOT press Ctrl-C -- this is where the final ids are decided)")
-        reconcile_tracklets(
-            store,
-            threshold=threshold,
-            run_id=run_id,
-            same_camera_threshold=recon_cfg.get("same_camera_threshold", 0.90),
-            # Per-camera same-camera bars (#40), resolved by reconcile's own helper
-            # so this path and the live pipeline's can never disagree.
-            same_camera_thresholds=resolve_same_camera_thresholds(recon_cfg),
-            require_reciprocal_best=recon_cfg.get("require_reciprocal_best", True),
-            min_tracklet_observations=recon_cfg.get("min_tracklet_observations", 1),
-            # Pair-scoring mode (#45a); thresholds above are mode-specific.
-            scoring=recon_cfg.get("scoring", "prototype"),
-            covisibility=resolve_covisibility(recon_cfg),
-            same_camera_reciprocal_best=recon_cfg.get(
-                "same_camera_reciprocal_best", False),
-            quality_out=reid_quality,
-            consensus_top_frac=recon_cfg.get("consensus_top_frac", 0.25),
-            max_observations_per_side=recon_cfg.get("max_observations_per_side", 64),
-        )
+        print(f"[main] reconcile settings: {describe_reconcile_kwargs(recon_kwargs)}")
+        reconcile_tracklets(store, run_id=run_id, quality_out=reid_quality,
+                            **recon_kwargs)
 
     # ---- Final render: annotated videos with the reconciled global ids ------
     # Done AFTER reconciliation so the same person carries the same GID (and

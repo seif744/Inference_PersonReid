@@ -1431,6 +1431,246 @@ change nonsense which should not always be the case."*
 
 ---
 
+## Part M — The cam_219 split: why reconcile *cannot* merge reid 1 and reid 11
+
+Run `20260731_060425` (4 cameras, 80 s, 2216 observations, 69 tracklets → 25 identities).
+
+### M.1 The symptom
+
+> *"cam 219: someone is assigned reid 1 for first 15 seconds, then switches to reid 11 and
+> he persists as reid 11 across cameras, only when he sits in the angle for the first 15
+> seconds he is back to reid 1."*
+
+This is the fourth report of the same failure class (L.4: *"reid 2 by his front, reid 7 by
+his back"*, *"reid 3 becomes reid 7 at a bad angle"*, *"reid 1 becomes reid 6 when he comes
+back the other side of the room"*). Every previous attempt moved a threshold and was
+reverted. **The threshold is not what is blocking this merge.**
+
+### M.2 What the run's own output already proves
+
+The two clusters the operator is seeing, from the run summary:
+
+| | cam_206 | cam_213 | cam_219 | cam_224 |
+|---|---|---|---|---|
+| **GID 1** | 12 | 51 | **7 + 113** | 30 |
+| **GID 11** | 48 | 79 + 88 | **46** | 3 + 68 + 102 |
+
+His sitting fragments (219/7 + 219/113, merged in Phase 1 at cosine 0.969) are in GID 1.
+His standing/walking fragment (219/46) is in GID 11. For the operator's complaint to go
+away, those two clusters must merge. Reconcile refuses, for **two independent and
+individually sufficient reasons**, neither of which is the cross-camera threshold.
+
+#### Reason 1 — the merge is judged as a SAME-camera claim, at 0.90
+
+`pair_threshold` / `pair_bar_now` (reconcile.py): if two clusters share *any* camera, the
+bar becomes `strictest_same_camera_bar` over *all* shared cameras. GID 1 and GID 11 share
+**all four**, so the bar is
+
+    max(cam_206 0.90, cam_213 0.80, cam_219 0.90, cam_224 0.80) = 0.90
+
+The 0.63 cross-camera threshold is never consulted. Two clusters of 5 and 7 tracklets are
+compared by the cosine of their *cluster means* — a mean of a mean, over multiple people
+and multiple views — and asked to clear **0.90**. That number is unreachable by
+construction. Worse, the rule is monotone in the wrong direction: **as clusters grow, the
+score falls (means average out) while the bar rises (more shared cameras → strictest).**
+Merging gets harder the more evidence accumulates.
+
+#### Reason 2 — the pair is very likely never scored at all
+
+`mergeable_cross` calls `conflict()` **before** scoring, and `conflict()` is an all-pairs
+hard veto over the full member cross-product. For GID 1 × GID 11 that is 5 × 7 = **35
+member pairs**, all of which must pass:
+
+- **8 same-camera pairs** need fully disjoint frame envelopes (206: 12↔48; 213: 51↔79, 51↔88; 219: 7↔46, 113↔46; 224: 30↔3, 30↔68, 30↔102)
+- **7 cross-camera pairs** are exempt (cam_219↔cam_224 is declared `covisible`)
+- **20 cross-camera pairs** are vetoed on more than **1.0 s** of wall-clock overlap
+
+One failure anywhere in that grid removes the pair from `root_scores` entirely: no score,
+no log line, no gate record, and **nothing any threshold, scoring mode or reciprocal-best
+setting can reach.** The run's own diagnostics say this dominates: 1537 + 1961 candidate
+exclusions from the two temporal gates against 314 decisions, and the analyser's own
+verdict, *"TOP2_MARGIN disagreement 79.21% (hard constraints reshaping the candidate
+space)"*.
+
+Which of the 35 pairs actually fires is the **one fact still missing**, and M.0 below
+recovers it.
+
+### M.3 How he got split in the first place
+
+The lock-in above only matters because the two halves were separated earlier:
+
+1. **cam_219's same-camera bar is 0.90** (it is absent from `per_camera`, so it inherits
+   the global). Config's own note already flags cam_219 as orphaning 4 of 6 subjects and
+   says it was left at 0.90 only to avoid confounding a comparison.
+2. **`scoring: prototype`** — mean-vs-mean. Sitting at an angle is a different appearance
+   *mode* from walking, and this file already documents at length (§#45a, config lines
+   422-455) why a mean is the wrong summary: *"their mean sits between them, matching
+   NEITHER view"*. Measured on the fixture: one person's two modes score **0.640** while
+   two strangers score **0.800**. So 219/7 vs 219/46 never came close to 0.90 in Phase 1.
+3. **Phase 2 could not rescue it either.** While both halves are still single-camera
+   cam_219 clusters, `mergeable_cross` requires at least one cross-camera member pair, so
+   the pair is `NOT_MERGEABLE_CROSS` (1564 exclusions this run). By the time each half has
+   absorbed a foreign camera, Reason 1 sets the bar back to 0.90 and Reason 2 has arrived.
+   **The only window in which this merge was ever possible was Phase 1, at 0.90, on
+   prototype means.**
+4. **Then each half was captured by a different cluster through a weak link.** From the
+   run log: GID 11 absorbed cam_206/48 at **0.649** and cam_206/27+cam_219/8 at **0.677**;
+   GID 1 absorbed cam_206/12 at **0.818**. The measured different-person ceiling for this
+   footage is **0.661** (H.4, and `STRANGER_CEILING` in the sweep). A cross bar of 0.63
+   sits *below* it, so at least one of those links is a stranger — and a cluster's hard
+   constraints are the **union** of its members' constraints, so **one wrong member
+   permanently removes a correct merge.** Merge order decides who gets poisoned.
+
+### M.4 Why five rounds of tuning could not have worked
+
+- Reason 1 is arithmetic on the *shared-camera* rule, not on the cross bar. Lowering
+  `threshold` from 0.70 to 0.63 (and back) never touched it.
+- Reason 2 is a hard veto evaluated *before* scoring. It is threshold-immune by design.
+- And the feedback loop was measuring a different algorithm: **`sweep_reconcile_thresholds.py`
+  and `rerender_from_clips.py` passed neither `covisibility` nor
+  `same_camera_reciprocal_best` to `reconcile_tracklets`, both of which default OFF and are
+  ON in production.** Every threshold conclusion in Part J was drawn from a run with the
+  cross-camera veto disabled — i.e. from a clustering that does not ship. (Fixed in M.1.)
+
+### M.5 The plan
+
+Ordered so that each step is verifiable before the next one changes any decision. **No
+step tunes a threshold.** Rule D9 still holds: one change, re-run offline, diff, and watch
+the video before it ships.
+
+#### M.0 — Recover the missing fact (read-only, no behaviour change) — **DONE, needs running**
+
+`tests/calibration/explain_merge_failure.py <run_id> <id_a> <id_b>` re-runs reconcile
+read-only at the **production** settings and then prints, for the two resulting clusters:
+membership with observation counts and wall-clock spans, the bar that applies and why, the
+pair score under all three scoring modes, and **the full 35-pair conflict grid with the
+overlap in seconds for every pair** — i.e. the witness. Verdict line is one of
+`BLOCKED BY <gate> at <pair>` or `SCORED <s> BELOW BAR <bar>`.
+
+*Acceptance:* run on `20260731_060425` for ids 1 and 11, and the output names the blocking
+pair. **Everything below is chosen by what it prints.**
+
+#### M.1 — Make the offline loop reproduce production — **DONE**
+
+- `identity.reconcile.resolve_reconcile_kwargs(cfg)` is now the single place every
+  reconcile setting is read; `main.py`, `LivePipeline` and both calibration tools use it.
+  This also kills two live drifts: `main.py` defaulted `min_tracklet_observations` to **1**
+  where the live path used **3**, and fell back to `identity.threshold` **0.85** where the
+  live path used **0.63**.
+- Both tools now print `describe_reconcile_kwargs(...)` — one line naming the cross bar,
+  the per-camera bars, the scoring mode, and all three switches — so a sweep can never
+  again be read as production.
+- `--same-reciprocal` now exists (config.yaml has been telling the operator to run it since
+  #45a; it was never parsed, so the test it documents measured *nothing changing*).
+- `--no-covisibility` added, for measuring the veto's cost deliberately rather than by
+  accident.
+
+*Acceptance:* `sweep_reconcile_thresholds.py 20260731_060425` with no flags reproduces the
+live run exactly — **25 identities, 7 spanning >1 camera**, same composition. That equality
+is the proof the loop is trustworthy. Until it holds, no other measurement counts.
+
+#### M.2 — Same-camera veto: occupancy, not envelope
+
+`_spans_disjoint` compares `(min_frame, max_frame)` of the **sampled** observations
+(`reid.interval_sec: 0.4`, so ~10 frames apart). A tracklet with a hole — occlusion, or a
+duplicate box on one body — claims its entire envelope, so a fragment living *inside* that
+hole is declared "provably a different person" and hard-vetoed forever. The axiom *"one
+body cannot be two simultaneous tracks"* is also simply false under duplicate detection,
+and cam_206 produced 42 tracklets for ~5 people this run.
+
+Replace with an interval set: each observation contributes `[frame - h, frame + h]` for
+`h ≈ ` that camera's sampling period; union adjacent intervals; conflict only on
+**sustained** intersection (≥ 2 sample periods), never a single instant. Two genuinely
+co-present people overlap densely, so the real guard is untouched; a phantom envelope and a
+one-frame duplicate stop vetoing. Fail-open behaviour unchanged.
+
+*Acceptance:* unit tests for (a) a gap-nested pair that must NOT conflict, (b) a densely
+co-present pair that must, (c) a single-instant duplicate that must not. Then re-run M.0
+and diff the grid.
+
+#### M.3 — Judge the shared-camera claim on the fragments it is about
+
+Today: shared camera → strictest bar over *all* shared cameras → applied to the *cluster
+mean* score. Both halves of that are wrong (M.2 Reason 1).
+
+Change to: for each shared camera `c`, the same-camera claim is tested **within `c`** — the
+best score between A's members in `c` and B's members in `c` must clear `c`'s bar — while
+the cross-camera part keeps the cross bar. This is exactly the claim the docstring says it
+wants to make, applied to the evidence that claim is about, and camera-disjoint clusters
+behave exactly as today. Keep `strictest_same_camera_bar`, but apply it per camera instead
+of collapsing four cameras into one number over one global score.
+
+*Acceptance:* GID 1 × GID 11 is judged at cam_219's bar on 219/7 ↔ 219/46 (a real
+comparison) instead of 0.90 on a mean of means. Re-render and watch cam_219's first 15 s.
+
+#### M.4 — Stop the poisoning
+
+In order of cost:
+
+1. **Restore the cross bar to 0.70.** Not new tuning: config's own comment records it as
+   *measured* on run `20260730_111232` and *"the only free move in the whole sweep"* — 0
+   merges below the stranger ceiling, cross-camera identities unchanged. Commit `a77895fe`
+   ("revert: back to run 2's reconcile settings") put the value back to 0.63 and **left the
+   comment claiming 0.70**. Re-confirm with the now-faithful sweep, then set value and
+   comment together.
+2. **A cluster must not absorb a member that fits it worse than its existing members fit
+   each other** — refuse a merge whose score is below the absorbing cluster's own internal
+   cohesion (its minimum internal pairwise score). This removes weak-edge capture without
+   moving any bar, the same argument that made reciprocal-best worth more than a sweep.
+3. Only if M.0's grid says merge *order* is what costs identities: replace greedy union-find
+   with must-not-link-constrained agglomerative clustering that re-evaluates. Large; do not
+   start it in this pass.
+
+*Acceptance:* the 0.649 and 0.677 links are gone and cross-camera identities do not drop.
+
+#### M.5 — Fix the cause: scoring mode
+
+The split originates in a mean-vs-mean comparison of two appearance modes, and this repo has
+already measured the fix (`consensus`: same person 1.000, strangers 0.800, one bad crop only
+0.880). Changing the mode **voids every bar**, so it ships as one operation: sweep
+`--scoring consensus` over both axes with M.1's faithful settings, pick the pair of bars,
+re-render, watch cam_219, then set mode *and* bars together in one commit.
+
+#### M.6 — Regression test
+
+`tests/live/test_reconcile_two_halves_rejoin.py`: one person with two appearance modes in
+cam_219, two strangers co-present in cam_206, cam_224 covisible. Assert the two halves land
+in one identity **and** assert the fixture's own preconditions (L.3's trap: that the
+stranger really is a stranger, and that the spans really do overlap). Plus the M.2 unit
+tests.
+
+### M.7 Loose code found while diagnosing
+
+| # | Finding | Status |
+|---|---|---|
+| M-a | Sweep + re-render passed neither `covisibility` nor `same_camera_reciprocal_best` — the offline loop measured a non-shipping algorithm | **fixed** (M.1) |
+| M-b | `main.py` vs `LivePipeline`: `min_tracklet_observations` 1 vs 3, threshold fallback 0.85 vs 0.63 | **fixed** — one resolver |
+| M-c | `--same-reciprocal` documented in config.yaml, never implemented; the operator would have measured a no-op | **fixed** |
+| M-d | `_arg()` in both tools raises `IndexError` on a trailing boolean flag, and a boolean flag silently consumes the next flag as its value | **fixed** — shared `arg()` / `flag()` in `_common.py` |
+| M-e | `identity.reconcile.threshold` is 0.63 under a comment whose first line says it was *raised to 0.70 and measured*. Stale narrative beside a live number is exactly the L.3 trap | **comment corrected**; the value is M.4.1 |
+| M-f | Decision log records `TEMPORAL_CONFLICT_CROSS_CAMERA` as `_na_gate()` ("does not apply") in Phase 2 while candidates are being excluded by it — the gate-failure histogram can never show the veto that dominates the run | **fixed** — real count recorded |
+| M-g | `conflict_reason` returns only the gate name and discards the witness pair, so "why did these two not merge" is unanswerable from the log | M.0 recovers it externally; plumb the witness into the log with M.2 |
+| M-h | Only cam_224↔cam_219 is declared `covisible`, but all four cameras overlap, and `ts` is *receive* time (#15) carrying jitter and queue delay. 1961 cross-camera exclusions this run, each of which manufactures a second identity if wrong (violates invariant L.2.2) | **open** — decide from M.0's overlap numbers |
+| M-i | `src/interrupt_guard.py:27` has `Ctrl-\ ` in the module docstring → `SyntaxWarning: invalid escape sequence` on every single run | **fixed** — raw docstring |
+| M-j | `deploy.sh` target is `/home/you/seifer_work/...` while the run lives in `/home/easemyai/seifer_work/...` — the literal `you` placeholder L.3 warns about; `./deploy.sh` may be pushing to a directory nobody runs | **open** — operator to confirm |
+| M-k | The file-batch path builds no `DecisionLog` at all (live only), so a `--mode file` reconcile is undiagnosable | **open**, low priority |
+| M-l | Phase 2 `best_partner` picks partners with the snapshot bar while the merge re-checks `pair_bar_now`, so a cluster can pick a partner it will then be refused, wasting the round | **open** — becomes trivial with M.3 |
+
+### M.8 What to run on the GPU box
+
+Two commands, both read-only, both on the already-captured run — no camera time:
+
+```bash
+RUN=20260731_060425
+python tests/calibration/explain_merge_failure.py $RUN 1 11      # M.0: the witness
+python tests/calibration/sweep_reconcile_thresholds.py $RUN      # M.1: must reproduce 25 / 7
+```
+
+Send back both outputs in full. The first decides between M.2, M.3 and M.4; the second says
+whether the measurement loop can be trusted at all.
+
+---
+
 ## Part I — Historical context
 
 Git history, parsed from every committed `config.yaml`:

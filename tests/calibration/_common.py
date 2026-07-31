@@ -86,6 +86,117 @@ def detect_weights() -> str:
 DETECT_WEIGHTS = detect_weights()
 
 
+def load_config() -> dict:
+    """config.yaml as a dict, or {} if it cannot be read."""
+    try:
+        import yaml
+        with open(os.path.join(project_root(), "config.yaml")) as f:
+            return yaml.safe_load(f) or {}
+    except Exception:                                          # noqa: BLE001
+        return {}
+
+
+# ------------------------------------------------- argv helpers (shared)
+#
+# `_arg` used to be copy-pasted into each script as
+#     if flag in sys.argv: return sys.argv[sys.argv.index(flag) + 1]
+# which has two live bugs: a BOOLEAN flag written last on the command line raises
+# IndexError instead of being honoured, and a boolean flag followed by another
+# flag returns THAT flag as its value -- truthy, so it happens to work, while
+# silently consuming nothing. Both are the kind of thing that costs a validation
+# cycle rather than failing loudly, so they live here once, fixed.
+
+def arg(flag: str, default=None):
+    """Value after `flag`, or `default`. Never raises on a trailing flag."""
+    argv = sys.argv
+    if flag in argv:
+        i = argv.index(flag) + 1
+        if i < len(argv) and not argv[i].startswith("--"):
+            return argv[i]
+        raise SystemExit(f"[calib] {flag} expects a value "
+                         f"(got {'nothing' if i >= len(argv) else argv[i]!r})")
+    return default
+
+
+def flag(name: str) -> bool:
+    """True when the boolean flag `name` is present. Takes no value."""
+    return name in sys.argv
+
+
+def reconcile_settings(cfg=None, log=print, owns=()):
+    """Reconcile kwargs AS PRODUCTION WOULD RUN THEM, plus argv overrides.
+
+    `owns` names flags the CALLER parses itself, so they are left alone here. The
+    sweep and the re-render take comma-separated LISTS for `--cross` and
+    `--scoring` (they compare settings), which cannot collapse into one value.
+
+    WHY EVERY OFFLINE TOOL MUST GO THROUGH THIS. The sweep and the re-render used
+    to build their kwargs by hand and pass neither `covisibility` nor
+    `same_camera_reciprocal_best`, both of which default OFF in
+    reconcile_tracklets and are ON in config.yaml. So the only cheap feedback loop
+    this project has was measuring a clustering algorithm that does not ship --
+    with the cross-camera simultaneity veto disabled, the exact guard that
+    dominates the production candidate space (1961 exclusions in run
+    20260731_060425). See REMEDIATION_PLAN.md Part M.
+
+    Overrides, all optional:
+      --cross F              cross-camera bar (a single value; the sweep parses
+                             its own comma list before calling this)
+      --same-global F        global same-camera bar
+      --same cam=F,cam=F     per-camera same-camera bars (REPLACES config's)
+      --min-obs N            min_tracklet_observations
+      --scoring MODE         prototype | max_exemplar | consensus
+      --top-frac F           consensus_top_frac
+      --no-reciprocal        turn Phase 2 mutual-best OFF
+      --same-reciprocal      turn Phase 1 mutual-best ON
+      --no-same-reciprocal   turn Phase 1 mutual-best OFF
+      --no-covisibility      disable the cross-camera simultaneity veto
+    """
+    from identity.reconcile import resolve_reconcile_kwargs
+
+    kw = resolve_reconcile_kwargs(cfg if cfg is not None else load_config(), log=log)
+
+    def mine(f):
+        """The flag's value, unless the caller owns that flag."""
+        return None if f in owns else arg(f)
+
+    if mine("--cross") is not None:
+        kw["threshold"] = float(mine("--cross"))
+    if mine("--same-global") is not None:
+        kw["same_camera_threshold"] = float(mine("--same-global"))
+    if mine("--same") is not None:
+        kw["same_camera_thresholds"] = parse_same(mine("--same"))
+    if mine("--min-obs") is not None:
+        kw["min_tracklet_observations"] = int(mine("--min-obs"))
+    if mine("--scoring") is not None:
+        kw["scoring"] = mine("--scoring")
+    if mine("--top-frac") is not None:
+        kw["consensus_top_frac"] = float(mine("--top-frac"))
+    if flag("--no-reciprocal"):
+        kw["require_reciprocal_best"] = False
+    if flag("--same-reciprocal"):
+        kw["same_camera_reciprocal_best"] = True
+    if flag("--no-same-reciprocal"):
+        kw["same_camera_reciprocal_best"] = False
+    if flag("--no-covisibility"):
+        kw["covisibility"] = (False, {})
+    return kw
+
+
+def parse_same(text):
+    """"cam_213=0.80,cam_224=0.90" -> {'cam_213': 0.8, 'cam_224': 0.9}."""
+    out = {}
+    for part in (text or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            raise SystemExit(f"[calib] --same expects cam=VALUE, got {part!r}")
+        cam, _, value = part.partition("=")
+        out[cam.strip()] = float(value)
+    return out
+
+
 def pick_video(preferred: str | None = None) -> str:
     """Resolve a clip to measure on.
 

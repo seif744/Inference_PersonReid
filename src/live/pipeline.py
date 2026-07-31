@@ -563,9 +563,9 @@ class LivePipeline:
             self._cleanup_clips()
             return
         try:
-            from identity.reconcile import (reconcile_tracklets,
-                                            resolve_covisibility,
-                                            resolve_same_camera_thresholds)
+            from identity.reconcile import (describe_reconcile_kwargs,
+                                            reconcile_tracklets,
+                                            resolve_reconcile_kwargs)
             # reuse the file path's render + summary helpers (unchanged).
             # #60: this used to be a bare `from main import ...`, which only
             # resolves when the process was started from the project root. Run the
@@ -582,37 +582,21 @@ class LivePipeline:
                   f"leaving the captured clips in place.")
             return
 
-        # Merge thresholds come from identity.reconcile.* so live == file reconcile.
-        threshold = self._recon_cfg.get("threshold")
-        if threshold is None:
-            threshold = (self.cfg.get("identity", {}) or {}).get("threshold", 0.63)
+        # EVERY merge setting comes from identity.reconcile.* through the ONE
+        # resolver, so this path, main.py's and both offline calibration tools
+        # cannot drift -- they had (see resolve_reconcile_kwargs).
+        recon_kwargs = resolve_reconcile_kwargs(self.cfg)
         try:
             print("[live] reconciling identities across cameras...")
+            print(f"[live] reconcile settings: "
+                  f"{describe_reconcile_kwargs(recon_kwargs)}")
             reid_quality = {}
             reconcile_tracklets(
                 self.store,
-                threshold=threshold,
                 run_id=self.run_id,
-                same_camera_threshold=self._recon_cfg.get("same_camera_threshold", 0.90),
-                # Per-camera same-camera bars (#40). Resolved by reconcile's own
-                # helper so this path and main.py's can never disagree.
-                same_camera_thresholds=resolve_same_camera_thresholds(
-                    self._recon_cfg),
-                require_reciprocal_best=self._recon_cfg.get("require_reciprocal_best", True),
-                min_tracklet_observations=self._recon_cfg.get("min_tracklet_observations", 3),
-                # Pair-scoring mode (#45a). Mode-specific thresholds: changing the
-                # mode without re-deriving the bars above is meaningless.
-                scoring=self._recon_cfg.get("scoring", "prototype"),
-                # Physical vetoes and the Phase 1 mutual-best guard. Both
-                # default OFF; neither voids a threshold when enabled.
-                covisibility=resolve_covisibility(self._recon_cfg),
-                same_camera_reciprocal_best=self._recon_cfg.get(
-                    "same_camera_reciprocal_best", False),
                 # #34: per-tracklet fit/margin for the on-screen label.
                 quality_out=reid_quality,
-                consensus_top_frac=self._recon_cfg.get("consensus_top_frac", 0.25),
-                max_observations_per_side=self._recon_cfg.get(
-                    "max_observations_per_side", 64),
+                **recon_kwargs,
                 **self._decision_log_kwargs(),
             )
         except Exception as e:

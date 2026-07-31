@@ -38,7 +38,7 @@ import json
 import os
 import sys
 
-from _common import bootstrap, header
+from _common import arg, bootstrap, header, reconcile_settings
 
 # Where the user invoked us, captured BEFORE bootstrap() -- it chdirs to the repo
 # root so relative model paths resolve, which would otherwise silently look for
@@ -49,7 +49,9 @@ ROOT = bootstrap()
 sys.path.insert(0, ROOT)             # for main.render_final_videos
 
 from database.store import PersonVectorStore                      # noqa: E402
-from identity.reconcile import SCORING_MODES, reconcile_tracklets  # noqa: E402
+from identity.reconcile import (SCORING_MODES,                     # noqa: E402
+                                describe_reconcile_kwargs,
+                                reconcile_tracklets)
 
 
 class _ReadOnlyStore:
@@ -64,23 +66,6 @@ class _ReadOnlyStore:
 
     def clear_global_id(self, point_ids):
         pass
-
-
-def _arg(flag, default=None):
-    if flag in sys.argv:
-        return sys.argv[sys.argv.index(flag) + 1]
-    return default
-
-
-def _parse_same(text):
-    out = {}
-    for part in (text or "").split(","):
-        part = part.strip()
-        if not part:
-            continue
-        cam, _, value = part.partition("=")
-        out[cam.strip()] = float(value)
-    return out
 
 
 def load_clips(pattern="._live_src_*.mp4"):
@@ -109,23 +94,25 @@ def main():
                          "[--out 'cmp_{name}_{tag}.mp4']")
     run_id = sys.argv[1]
 
-    crosses = [float(x) for x in _arg("--cross", "0.70").split(",")]
-    same_global = float(_arg("--same-global", "0.90"))
-    per_camera = _parse_same(_arg("--same", "cam_213=0.80"))
-    min_obs = int(_arg("--min-obs", "3"))
-    reciprocal = _arg("--no-reciprocal") is None
-    scorings = (_arg("--scoring", "") or "").split(",")
+    # Base = exactly what production would run; only the swept axes are overridden.
+    # This tool used to pass neither `covisibility` nor
+    # `same_camera_reciprocal_best`, so the video it produced was rendered from a
+    # clustering that does not ship -- and the video is the ONLY ground truth this
+    # project has. See REMEDIATION_PLAN.md Part M.
+    base_kw = reconcile_settings(owns=("--cross", "--scoring"))
+    crosses = [float(x) for x in
+               (arg("--cross") or f"{base_kw['threshold']:.2f}").split(",")]
+    scorings = (arg("--scoring", "") or "").split(",")
     scorings = [m.strip() for m in scorings if m.strip()] or [None]
     for m in scorings:
         if m is not None and m not in SCORING_MODES:
             raise SystemExit(f"[rerender] unknown --scoring {m!r}; "
                              f"expected any of {list(SCORING_MODES)}")
-    top_frac = float(_arg("--top-frac", "0.25"))
-    out_pattern = _arg("--out", "rerender_{name}_{tag}.mp4")
-    fps = float(_arg("--fps", "0") or 0)
+    out_pattern = arg("--out", "rerender_{name}_{tag}.mp4")
+    fps = float(arg("--fps", "0") or 0)
 
     # Work where the clips are, so the re-rendered videos land beside them.
-    clip_dir = os.path.abspath(_arg("--dir", INVOKED_FROM))
+    clip_dir = os.path.abspath(arg("--dir", INVOKED_FROM))
     os.chdir(clip_dir)
     print(f"[rerender] clips from {clip_dir}")
 
@@ -142,9 +129,10 @@ def main():
           + ", ".join(f"{c} ({b['frames']} frames @ {b['clip_fps']}fps)"
                       for c, _, b in clips))
 
-    store = PersonVectorStore(path=_arg("--path", "qdrant_data"),
-                              url=_arg("--url", "http://localhost:6333") or None)
+    store = PersonVectorStore(path=arg("--path", "qdrant_data"),
+                              url=arg("--url", "http://localhost:6333") or None)
     ro = _ReadOnlyStore(store)
+    print(f"[rerender] base settings: {describe_reconcile_kwargs(base_kw)}")
 
     from main import render_final_videos                          # noqa: E402
 
@@ -156,18 +144,13 @@ def main():
         tag = f"x{cross:.2f}".replace(".", "")
         if mode is not None:
             tag += f"_{mode}"
-        header(f"scoring={mode or 'config default'}  cross={cross:.2f}  "
-               f"same={per_camera or 'global only'} (global {same_global})")
+        kw = dict(base_kw)
+        kw["threshold"] = cross
+        if mode is not None:
+            kw["scoring"] = mode
+        header(f"cross={cross:.2f}  {describe_reconcile_kwargs(kw)}")
         lines = []
-        kw = {} if mode is None else {"scoring": mode,
-                                      "consensus_top_frac": top_frac}
-        remap = reconcile_tracklets(
-            ro, threshold=cross, run_id=run_id,
-            same_camera_threshold=same_global,
-            same_camera_thresholds=per_camera,
-            require_reciprocal_best=reciprocal,
-            min_tracklet_observations=min_obs,
-            log=lines.append, **kw)
+        remap = reconcile_tracklets(ro, run_id=run_id, log=lines.append, **kw)
         if not remap:
             print("[rerender] reconcile produced NO assignments for this run_id "
                   "-- nothing to draw. Check the run_id against the store.")

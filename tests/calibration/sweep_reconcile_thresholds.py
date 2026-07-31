@@ -32,12 +32,14 @@ to find the settings worth rendering, then render those.
 import sys
 from collections import defaultdict
 
-from _common import bootstrap, header
+from _common import arg, bootstrap, header, parse_same, reconcile_settings
 
 bootstrap()
 
 from database.store import PersonVectorStore                      # noqa: E402
-from identity.reconcile import SCORING_MODES, reconcile_tracklets  # noqa: E402
+from identity.reconcile import (SCORING_MODES,                     # noqa: E402
+                                describe_reconcile_kwargs,
+                                reconcile_tracklets)
 
 # Measured different-person prototype ceiling, same-camera, n=12 (Part H.4).
 # Cross-camera stranger scores run LOWER than same-camera, so a cross-camera
@@ -62,18 +64,6 @@ class _ReadOnlyStore:
         self.writes += len(point_ids)
 
 
-def _parse_same(text):
-    """'cam_219=0.80,cam_213=0.80' -> {'cam_219': 0.8, 'cam_213': 0.8}"""
-    out = {}
-    for part in (text or "").split(","):
-        part = part.strip()
-        if not part:
-            continue
-        cam, _, value = part.partition("=")
-        out[cam.strip()] = float(value)
-    return out
-
-
 def _parse_same_variants(text):
     """Several same-camera settings at once, separated by ';':
 
@@ -90,34 +80,32 @@ def _parse_same_variants(text):
         chunk = chunk.strip()
         if not chunk:
             continue
-        parsed = _parse_same(chunk)
+        parsed = parse_same(chunk)
         label = ", ".join(f"{c}={v:.2f}" for c, v in sorted(parsed.items()))
         variants.append((label or "global only", parsed))
     return variants or [("global only", {})]
 
 
-def _arg(flag, default=None):
-    if flag in sys.argv:
-        return sys.argv[sys.argv.index(flag) + 1]
-    return default
+def run_once(store, run_id, base_kw, cross, per_camera, scoring=None):
+    """One reconcile at these settings -> (remap, merge log lines).
 
-
-def run_once(store, run_id, cross, same_global, per_camera, min_obs, reciprocal,
-             scoring=None, top_frac=0.25):
-    """One reconcile at these settings -> (remap, merge log lines)."""
+    `base_kw` is the PRODUCTION setting set (reconcile_settings()); only the axes
+    being swept are overridden. Before this, run_once built its kwargs by hand and
+    passed neither `covisibility` nor `same_camera_reciprocal_best`, so every row
+    of every sweep described a clustering that does not ship -- with the
+    cross-camera veto OFF, the guard that dominates the real candidate space.
+    See REMEDIATION_PLAN.md Part M.4.
+    """
     lines = []
-    ro = _ReadOnlyStore(store)
-    # scoring=None means "whatever reconcile defaults to", so the baseline row is
-    # the shipped behaviour rather than a mode this script chose.
-    kw = {} if scoring is None else {"scoring": scoring,
-                                     "consensus_top_frac": top_frac}
-    remap = reconcile_tracklets(
-        ro, threshold=cross, run_id=run_id,
-        same_camera_threshold=same_global,
-        same_camera_thresholds=per_camera,
-        require_reciprocal_best=reciprocal,
-        min_tracklet_observations=min_obs,
-        log=lines.append, **kw)
+    kw = dict(base_kw)
+    kw["threshold"] = cross
+    kw["same_camera_thresholds"] = per_camera
+    # scoring=None means "whatever config says", so the baseline row is the
+    # shipped behaviour rather than a mode this script chose.
+    if scoring is not None:
+        kw["scoring"] = scoring
+    remap = reconcile_tracklets(_ReadOnlyStore(store), run_id=run_id,
+                               log=lines.append, **kw)
     return remap, lines
 
 
@@ -157,23 +145,34 @@ def main():
         raise SystemExit(__doc__.strip().split("\n\n")[1])
     run_id = sys.argv[1]
 
-    crosses = [float(x) for x in _arg("--cross", "0.63,0.70,0.75,0.80").split(",")]
-    same_global = float(_arg("--same-global", "0.90"))
-    variants = _parse_same_variants(_arg("--same", "cam_213=0.80,cam_224=0.80"))
-    min_obs = int(_arg("--min-obs", "3"))
-    reciprocal = _arg("--no-reciprocal") is None
-    scorings = (_arg("--scoring", "") or "").split(",")
+    # Base = exactly what production would run (config.yaml through reconcile's own
+    # resolver), then the sweep overrides only the axes it is sweeping. The FIRST
+    # row of a default sweep must therefore reproduce the live run's identity count
+    # -- that equality is what makes every other row meaningful.
+    base_kw = reconcile_settings(owns=("--cross", "--same", "--scoring"))
+    crosses = [float(x) for x in
+               (arg("--cross") or f"{base_kw['threshold']:.2f},0.70,0.75,0.80"
+                ).split(",")]
+    default_same = ", ".join(f"{c}={v}" for c, v in
+                             sorted((base_kw["same_camera_thresholds"] or {}).items()))
+    variants = _parse_same_variants(arg("--same", default_same))
+    # --scoring here is a LIST (the sweep compares modes); reconcile_settings has
+    # already applied a single --scoring to the base, so drop it from the base to
+    # avoid describing a mode twice.
+    scorings = (arg("--scoring", "") or "").split(",")
     scorings = [m.strip() for m in scorings if m.strip()] or [None]
     for m in scorings:
         if m is not None and m not in SCORING_MODES:
             raise SystemExit(f"[sweep] unknown --scoring {m!r}; "
                              f"expected any of {list(SCORING_MODES)}")
-    top_frac = float(_arg("--top-frac", "0.25"))
 
-    url = _arg("--url", "http://localhost:6333") or None
-    store = PersonVectorStore(path=_arg("--path", "qdrant_data"), url=url)
-    print(f"[sweep] store: {url or _arg('--path', 'qdrant_data')} "
+    url = arg("--url", "http://localhost:6333") or None
+    store = PersonVectorStore(path=arg("--path", "qdrant_data"), url=url)
+    print(f"[sweep] store: {url or arg('--path', 'qdrant_data')} "
           f"-- {store.count()} point(s) total")
+    # The settings the rows are relative to, named in full. A sweep whose switches
+    # differ from production is not a measurement of production.
+    print(f"[sweep] base settings: {describe_reconcile_kwargs(base_kw)}")
 
     # Refuse to sweep nothing. Without this a wrong run_id reports "0 identities"
     # at every setting, which reads like a devastating result rather than a typo.
@@ -209,13 +208,15 @@ def main():
                 for m in scorings for lab, pc in variants]
     for label, per_camera, mode in variants:
         for cross in crosses:
-            remap, lines = run_once(store, run_id, cross, same_global,
-                                    per_camera, min_obs, reciprocal,
-                                    scoring=mode, top_frac=top_frac)
+            remap, lines = run_once(store, run_id, base_kw, cross, per_camera,
+                                    scoring=mode)
             s = summarize(remap, lines)
             results[(label, cross)] = s
-            shipped = (abs(cross - 0.63) < 1e-9
-                       and per_camera == {"cam_213": 0.80, "cam_224": 0.80})
+            # "shipped" is now derived from config, not from a hardcoded 0.63 that
+            # goes stale the moment the value moves -- which it has, twice.
+            shipped = (abs(cross - base_kw["threshold"]) < 1e-9
+                       and per_camera == (base_kw["same_camera_thresholds"] or {})
+                       and (mode is None or mode == base_kw["scoring"]))
             mark = "  <-- shipped" if shipped else ""
             print(f"  {label:<38}{cross:>7.2f}{s['identities']:>6}{s['max']:>6}"
                   f"{s['multi_camera']:>7}{s['cross_merges']:>9}"

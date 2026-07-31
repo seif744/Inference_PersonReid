@@ -162,6 +162,71 @@ def resolve_covisibility(recon_cfg, log=print):
     return enabled, pairs
 
 
+def resolve_reconcile_kwargs(cfg, log=print):
+    """Whole config -> the kwargs `reconcile_tracklets` should be called with.
+
+    THE ONE PLACE reconcile's settings are read, for the same reason
+    resolve_same_camera_thresholds and resolve_covisibility exist -- except that
+    those two only covered the two newest keys, and the FOUR call sites went on
+    reading the rest independently. They had already drifted:
+
+      * main.py defaulted `min_tracklet_observations` to 1, the live pipeline to 3
+      * main.py fell back to identity.threshold=0.85, the live pipeline to 0.63
+      * tests/calibration/sweep_reconcile_thresholds.py and rerender_from_clips.py
+        passed NEITHER `covisibility` NOR `same_camera_reciprocal_best`, so both
+        defaulted OFF while production ran with both ON
+
+    That last one is the expensive one: the offline sweep and the offline
+    re-render are the ONLY cheap feedback loop this project has, and they were
+    measuring a different clustering algorithm than the one that ships. Every
+    threshold conclusion drawn from them was drawn about a run that never
+    happened. See REMEDIATION_PLAN.md Part M.
+
+    Returns the kwargs only; `store`, `run_id`, `quality_out`, `decision_log` and
+    `log` stay with the caller because they are per-run, not configuration.
+    """
+    cfg = cfg or {}
+    recon = (cfg.get("identity") or {}).get("reconcile") or {}
+    threshold = recon.get("threshold")
+    if threshold is None:
+        threshold = (cfg.get("identity") or {}).get("threshold", 0.63)
+    return {
+        "threshold": float(threshold),
+        "same_camera_threshold": float(recon.get("same_camera_threshold", 0.90)),
+        "same_camera_thresholds": resolve_same_camera_thresholds(recon, log=log),
+        "require_reciprocal_best": bool(recon.get("require_reciprocal_best", True)),
+        "min_tracklet_observations": int(recon.get("min_tracklet_observations", 3)),
+        "scoring": recon.get("scoring", PROTOTYPE),
+        "consensus_top_frac": float(recon.get("consensus_top_frac", 0.25)),
+        "max_observations_per_side": int(recon.get("max_observations_per_side", 64)),
+        "covisibility": resolve_covisibility(recon, log=log),
+        "same_camera_reciprocal_best": bool(
+            recon.get("same_camera_reciprocal_best", False)),
+    }
+
+
+def describe_reconcile_kwargs(kw):
+    """One-line summary of the settings actually in force.
+
+    Printed by every offline tool so a sweep's output can never again be read as
+    if it described production. The three switches that silently differed are all
+    here by name.
+    """
+    covis_on, covis_pairs = kw.get("covisibility") or (False, {})
+    per_cam = kw.get("same_camera_thresholds") or {}
+    return (
+        f"cross={kw['threshold']:.2f} "
+        f"same={kw['same_camera_threshold']:.2f}"
+        + (" (" + ", ".join(f"{c}={v:.2f}" for c, v in sorted(per_cam.items())) + ")"
+           if per_cam else "")
+        + f" scoring={kw['scoring']}"
+        + (f"/top_frac={kw['consensus_top_frac']}" if kw["scoring"] == CONSENSUS else "")
+        + f" min_obs={kw['min_tracklet_observations']}"
+        f" reciprocal={'on' if kw['require_reciprocal_best'] else 'OFF'}"
+        f" same_reciprocal={'on' if kw['same_camera_reciprocal_best'] else 'OFF'}"
+        f" covisibility={'on/' + str(len(covis_pairs)) + ' pairs' if covis_on else 'OFF'}")
+
+
 def temporal_overlap_sec(span_a, span_b):
     """Seconds two wall-clock spans overlap (0.0 when they do not, None if either
     span is missing). A single-observation tracklet has a zero-length span, so it
@@ -392,6 +457,14 @@ def _gather_tracklets(store, run_id):
             # None when no usable ts was stored, which is the signal every
             # ts-dependent rule uses to fail open rather than guess.
             "span_ts": ((min(times), max(times)) if times else None),
+            # The SAMPLED instants themselves, not just their envelope. `span` is
+            # min/max over observations taken every reid.interval_sec, so a tracklet
+            # with a hole in the middle claims the whole envelope -- and the
+            # same-camera veto then reads a gap as occupancy. Anything that wants to
+            # ask "were these two ever really co-present" needs the instants (Part
+            # M.2); explain_merge_failure.py does exactly that.
+            "frames": sorted(frames),
+            "times": sorted(times),
             "gids": info["gids"],
         }
     return out
@@ -1089,7 +1162,19 @@ def reconcile_tracklets(store, threshold, run_id=None,
                                   if r == dlog.TEMPORAL_CONFLICT_SAME_CAMERA),
                         threshold=0, passed=True,
                         extra={"note": "count of peers excluded for time overlap"}),
-                    dlog.TEMPORAL_CONFLICT_CROSS_CAMERA: _na_gate(),
+                    # Was _na_gate() -- "does not apply" -- while candidates were
+                    # being excluded by exactly this veto (1961 exclusions in run
+                    # 20260731_060425). The gate-failure histogram therefore could
+                    # never show the guard that dominates the candidate space, which
+                    # is the opposite of why the log exists. Counted like its
+                    # same-camera twin now. Part M.7 item M-f.
+                    dlog.TEMPORAL_CONFLICT_CROSS_CAMERA: GateResult(
+                        value=sum(1 for _, _, _, r in scored
+                                  if r == dlog.TEMPORAL_CONFLICT_CROSS_CAMERA),
+                        threshold=0, passed=True,
+                        extra={"note": "count of peers excluded for cross-camera "
+                                       "simultaneity",
+                               "applies": bool(covis_enabled)}),
                 }, accepted_partner=partner, context=ctx)
 
         round_index += 1

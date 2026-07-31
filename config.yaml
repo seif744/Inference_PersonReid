@@ -322,16 +322,39 @@ identity:
                              # runs independently of the verifier (see verifier.py) --
                              # it must be recalibrated whenever identity.threshold is.
                              #
-                             # RAISED 0.63 -> 0.70 on 2026-07-30, the first time
-                             # this value has ever been calibrated (plan #41).
-                             # Measured by the offline sweep on run
-                             # 20260730_111232: at 0.63 two accepted cross-camera
-                             # merges sat BELOW the measured different-person
-                             # ceiling of 0.661 (0.639 and 0.659), and clusters
-                             # grow by union, so two weak links in a row fuse
-                             # three strangers. At 0.70 that count is 0 while
-                             # identities spanning >1 camera are UNCHANGED -- the
-                             # only free move in the whole sweep.
+                             # THE VALUE IS 0.63 AND THE MEASUREMENT BELOW SAYS 0.70.
+                             # That is not an oversight in the measurement, it is a
+                             # revert: commit a77895fe ("back to run 2's reconcile
+                             # settings") put this number back to 0.63 and left the
+                             # comment claiming 0.70, so the file has been arguing
+                             # against itself since 2026-07-30. Corrected here rather
+                             # than silently, because reading a stale narrative beside
+                             # a live number is exactly the trap in Part L.3.
+                             #
+                             # THE MEASUREMENT, which still stands (plan #41, the
+                             # first time this value was ever calibrated). Offline
+                             # sweep on run 20260730_111232: at 0.63 two accepted
+                             # cross-camera merges sat BELOW the measured
+                             # different-person ceiling of 0.661 (0.639 and 0.659),
+                             # and clusters grow by union, so two weak links in a row
+                             # fuse three strangers. At 0.70 that count is 0 while
+                             # identities spanning >1 camera are UNCHANGED -- "the
+                             # only free move in the whole sweep".
+                             #
+                             # CAVEAT that is why it is not simply restored: that
+                             # sweep ran with the cross-camera simultaneity veto OFF
+                             # and Phase-1 mutual-best OFF, because neither was passed
+                             # to reconcile_tracklets by the sweep script (fixed
+                             # 2026-07-31). Both are ON in production, so the numbers
+                             # above describe a clustering that does not ship.
+                             # Re-confirm on the now-faithful sweep, then move value
+                             # and comment TOGETHER. See REMEDIATION_PLAN.md M.4.1.
+                             #
+                             # Run 20260731_060425 shows the cost of 0.63 directly:
+                             # cross-camera merges accepted at 0.649 and 0.677, at or
+                             # below that same 0.661 ceiling, and those foreign
+                             # members are what temporal-veto the correct merge of
+                             # the operator's reid 1 / reid 11 split (Part M).
                              #
                              # 0.75 is the open question. It additionally cleans
                              # reid 10 (a 0.724 link) but SPLITS a 10-tracklet
@@ -477,9 +500,12 @@ identity:
     # round in Phase 1; the rest consolidate in Phase 2's rounds instead, so they
     # arrive later rather than never.
     #
-    # OFF by default so it changes nothing until it is tested on its own. Test with
-    # NO other change, on a captured run, and watch the video:
+    # Test with NO other change, on a captured run, and watch the video:
     #   python tests/calibration/rerender_from_clips.py <id> --same-reciprocal
+    # That flag was DOCUMENTED HERE BUT NEVER PARSED until 2026-07-31, so the test
+    # this line describes silently measured no change at all. It works now, and the
+    # re-render also inherits this key from config, so the default already matches
+    # production and the flag is only needed to force it on. See Part M.7 item M-c.
     same_camera_reciprocal_best: true
 
     # CROSS-CAMERA SIMULTANEITY VETO (#38, Phase 7). conflict() used to skip every
