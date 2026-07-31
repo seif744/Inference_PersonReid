@@ -1,7 +1,10 @@
 # Pipeline Remediation Plan
 
-**Status:** Phase 1 largely landed. One production run captured and analysed.
-**Created:** 2026-07-30 · **Last updated:** 2026-07-30 (after run `20260730_093723`)
+**Status:** **ALL IMPLEMENTABLE ITEMS LANDED.** Three blocked on missing libraries or
+vendored code; two finished features deliberately OFF (each re-scales every threshold);
+Part C is out of scope by verification. **Not yet validated on footage since the last
+batch -- the next action is a RUN.** See §0.
+**Created:** 2026-07-30 · **Last updated:** 2026-07-31
 **Scope:** detection, tracking, embedding, reconciliation, and the final rendered output
 
 This document is the reference plan for fixing identity instability in the live RTSP →
@@ -14,132 +17,153 @@ Read Part A before proposing any threshold change. Read Part H before trusting a
 
 ## 0. START HERE — current state and next action
 
-### 0.1 The next thing to do
+### 0.1 State, in one paragraph
 
-> **UPDATE, later on 2026-07-30 — the threshold era is over.** Two live runs and an
-> offline sweep established that **no threshold fixes this**, from either direction:
-> cam_224 at 0.80 fused several people into one reid; at 0.90 one person shattered
-> into many. That is J.6's overlapping boundaries showing up in the product, and the
-> cause is **#45a — reconcile compared prototype MEANS**, which scores one person's
-> front-vs-back fragments *below* two strangers in similar clothing.
->
-> Landed since: per-camera bars (#40), the first calibrated `cross_camera_threshold`
-> (#41), **offline threshold sweeps and offline re-rendering** (#23, partial — a
-> finished run can now be re-clustered *and re-rendered into watchable video* with no
-> cameras), **#45a scoring modes** (`prototype` | `max_exemplar` | `consensus`), and
-> **#28/#29** RTSP TCP + socket timeouts.
->
-> **The next action is no longer a code change: pick the scoring mode from the
-> captured run.** `scoring` still ships as `prototype`, because changing the mode
-> voids every threshold. On the server, with a run captured under
-> `keep_frames: true`:
->
-> ```bash
-> python tests/calibration/sweep_reconcile_thresholds.py <run_id> \
->     --scoring prototype,consensus,max_exemplar --cross 0.60,0.70,0.80
-> python tests/calibration/rerender_from_clips.py <run_id> \
->     --scoring prototype,consensus --cross 0.70
-> ```
->
-> Then **watch the videos** and set the mode with its re-derived bars in one commit.
-> Expect consensus to need *lower* bars than prototype — it is a different scale, not
-> a better number on the same one.
+**Everything in this plan that can be implemented, is implemented** (2026-07-30/31).
+What remains is three items that are genuinely blocked on missing hardware libraries
+or vendored code, a set of live-engine defects the plan already scoped OUT, and two
+finished features deliberately left switched OFF because each one re-scales every
+threshold in the config. The pipeline has NOT been validated on footage since the
+last batch landed: **the next action is a run**, not a code change.
 
-**Capture run2 and diff it against run1 (`20260730_093723`).** Two changes are staged
-in the working tree and neither has ever run on real footage:
-
-| Staged change | What it should move |
-|---|---|
-| **#40** — `same_camera_threshold` is now per-camera; cam_213 and cam_224 at **0.80**, cam_206 and cam_219 left at 0.90 | orphans (33/89 today) and eligible-set size in cam_213 / cam_224 |
-| **detector `yolo11n.pt` → `yolo11m.pt`** (operator's call, 2026-07-30) | detection recall, and tracklet COUNT per camera |
-
-Then diff sections 1, 2 and 5 of the analyser against [J.10](#j10-full-analyser-output-run-20260730_093723):
+### 0.2 Do this first
 
 ```bash
+python tests/run_all.py                                # expect 14 files pass
+python tests/calibration/verify_embedding_contract.py  # expect PASS
+python tests/calibration/characterize_known_defects.py # expect #25/#26 FIXED
+```
+
+Then capture a run (three or four cameras, 4-5 minutes, people crossing views):
+
+```bash
+python main.py --mode live --videos "rtsp://..." "rtsp://..." "rtsp://..." \
+    > run.log 2>&1 &
+echo $! > run.pid
+# ...then ONCE, from a different prompt:
+kill -INT $(pgrep -f "python.*main.py")
+```
+
+> **Never launch with `| tee`.** Ctrl-C reaches the whole foreground group, `tee`
+> dies first, and every later `print` raises `BrokenPipeError`. Two production runs
+> were lost that way and a third to running `tail -f` and `kill` in the same block.
+> Redirect, background, signal by pid, follow the log separately.
+
+Wait for `[live] shutdown complete.` -- that line, and only that line, means the ids
+were decided and the videos written.
+
+### 0.3 The workflow that makes this cheap now
+
+Every threshold question used to cost a live run: cameras, people walking, five
+minutes, and a fresh set of track ids that could not be compared to the last set.
+**That loop is gone.** A run now leaves a complete record -- `._live_src_<cam>.mp4`
+(clean frames), `._live_src_<cam>.annotations.json` (per-frame box geometry), and
+its embeddings in Qdrant -- so reconcile and the render can be replayed offline on
+the SAME footage with the SAME track ids:
+
+```bash
+# re-cluster at any settings, in seconds, read-only, no cameras and no model
+python tests/calibration/sweep_reconcile_thresholds.py <run_id> \
+    --cross 0.60,0.70,0.80 --same "cam_213=0.80,cam_224=0.80" --scoring consensus
+
+# and turn any of them into WATCHABLE video for the operator to judge
+python tests/calibration/rerender_from_clips.py <run_id> --cross 0.63,0.70
+
+# what the run itself decided
 python tests/calibration/analyze_decision_log.py logs/reconcile_decisions_<run_id>.jsonl
 ```
 
-> **These two changes confound each other**, because they attack the same symptom from
-> opposite ends: yolo11m creates *fewer* fragments (measured: it holds one 150-frame
-> track where yolo11n splits the same person into 64 + 37 frames — see [H.11](#h11-detector-capacity-yolo11n-vs-yolo11m)),
-> while #40 makes the fragments that remain *mergeable*. Both reduce the orphan count, so
-> one combined run cannot attribute it.
->
-> They do leave **different fingerprints**, which is how to read a combined run:
-> yolo11m moves **tracklets per camera** (J.9's 61 / 11 / 7 / 18); #40 moves
-> **eligible-per-subject and orphans** (J.10 sections 2 and 5) at an unchanged tracklet
-> count. If you want clean attribution instead, flip `detector.model` back to
-> `yolo11n.pt` for run2 (one line) and take yolo11m in run3.
+Requires `live.reconcile.keep_frames: true` (now the default). Replays everything
+downstream of the store: thresholds, scoring mode, reciprocal-best,
+`min_tracklet_observations`. Does NOT replay what changed the recording -- detector
+model, `imgsz`, `reid.interval`, crop quality still need a live run.
 
-After the run, in order: **#45a** (reconcile compares prototype *means*, which blurs
-front/back into a vector matching neither view — the structural cause behind cam_213;
-#40 treats only the symptom), then **#44** (`RECIPROCAL_BEST` rejects 31% of decisions
-at up to 0.905, but fewer orphans will change that picture).
+### 0.4 The two switches that are OFF, and why
 
-**Method, non-negotiable:** change ONE thing, re-run, and diff the analyser output.
-Four earlier tuning attempts were reverted without learning anything — see Part I.
+Both are implemented, tested, and one config line each. **Do not enable either
+without re-deriving the thresholds in the same commit** -- each is a different
+score space, not a better number in the same one.
 
-### 0.2 What has landed
+| Switch | Default | What it changes |
+|---|---|---|
+| `reid.tap` (#39) | `post_relu` | post-BN keeps the negative half of the feature space. Measured: separation margin improved in EVERY scoring mode at BOTH sample sizes (+0.055 -> +0.086 at 48 frames, +0.108 -> +0.157 at 90), different-person ceiling 0.845 -> 0.782. Voids every threshold in Part H |
+| `identity.reconcile.scoring` (#45a) | `prototype` | `consensus` / `max_exemplar` compare observation SETS instead of means. On the front/back counterexample prototype scores one person's two visits **0.640, below two strangers at 0.800**; consensus scores them 1.000 vs 0.800 and still holds a bad crop to 0.880 |
+
+Procedure for either: flip it, sweep for new bars against a captured run, re-render,
+watch, then commit the switch AND its bars together.
+
+### 0.5 What is NOT implemented, and why
+
+| # | Item | Why |
+|---|---|---|
+| 53 | NVDEC hardware decode | `NVDEC_IMPLEMENTED = False` is a stub for a GPU decode library that is not installed. Not blocking: four streams decode on CPU with <3% drops (J.9) |
+| 54 | ByteTrack Kalman `dt` | Inside Ultralytics' `multi_predict`. Patching a vendored motion model to fix a defect that only bites under heavy frame loss, when measured loss is ~1%, risks tracking quality for no gain |
+| 24 | Frame-level deterministic replay | The reconcile half is covered by 0.3. Frame-exact replay needs the capture decimation bypassed |
+| 13-17 | Phase 1 leftovers: label-free correctness counters, per-camera timing, timestamp diagnostics | Pure instrumentation; nothing depends on them |
+| 31, 37 | Renderer purity tests, `as-known-at-time` playback | #37 is a new feature, not a defect |
+| 42, 44 | `min_tracklet_observations` and `RECIPROCAL_BEST` sweeps | Calibration, and both changed meaning when Phase 1 mutual-best landed. Redo with 0.3 |
+| Part C | Live-engine defects (bank poisoning, two-lane leak, co-active expiry) | Verified end-to-end as computed and DISCARDED while `live.reconcile.enabled: true`. `live.identity.*` has no effect on the deliverable |
+
+### 0.6 What has landed
 
 | Commit | What |
 |---|---|
-| `182c677` | Phase 1: `src/identity/decision_log.py`, reconcile instrumented additively, config keys, `LivePipeline` wiring, `tests/calibration/` (8 scripts) |
-| `e05c476` | **J.5 fix:** finalization survives a failed `print`. Two production runs had been lost to it |
-| `286e06a` + `c977f57` | `tests/calibration/analyze_decision_log.py` and a fix to its inverted band report |
-| `5598d31` | Part J.6: the per-camera finding from the first real run |
-| *working tree* | **#40**: `resolve_same_camera_thresholds` + `strictest_same_camera_bar` in `reconcile.py`, `identity.reconcile.per_camera` in config, both call sites wired, `tests/live/test_per_camera_same_camera_bar.py` (36 checks) |
-| *working tree* | `detector.model: yolo11m.pt`, `tests/calibration/compare_detector_models.py`, `_common.DETECT_WEIGHTS` now read from config instead of hardcoded |
-| `c7cc79c` | **#41 first calibrated `cross_camera_threshold`** 0.63→0.70, and cam_224 back to 0.90 (cam_213 stays 0.80) — both chosen by offline sweep, not by a run each |
-| `3dd0107` + `680ce61` | **Offline threshold sweeps** (`sweep_reconcile_thresholds.py`): re-cluster a finished run from its stored observations in seconds, read-only, both threshold axes |
-| `e51175b` | **Offline RE-RENDER** (`rerender_from_clips.py` + `._live_src_*.annotations.json`): a captured run becomes watchable video at any reconcile setting, no cameras. `keep_frames` now defaults true |
-| `a7a042c` | **#45a scoring modes** — `prototype` \| `max_exemplar` \| `consensus`, with the front/back counterexample pinned (23 checks). Default unchanged |
-| `9f5e7fc` | **#28/#29** RTSP `rtsp_transport;tcp` + open/read socket timeouts; `VideoSource.open`/`_reopen` unified (17 checks) |
+| `182c677` | Phase 1 instrumentation: `decision_log.py`, reconcile instrumented additively, `tests/calibration/` |
+| `e05c476` | **J.5:** finalization survives a failed `print`. Two runs had been lost to it |
+| `8458a62` | **#40** per-camera `same_camera_threshold` (`per_camera` block, `strictest_same_camera_bar`) |
+| `8bbd8d6` | **yolo11m** detector, with `compare_detector_models.py` (H.11) |
+| `3dd0107` `680ce61` | **Offline threshold sweep** -- re-cluster a finished run in seconds, read-only, both axes |
+| `c7cc79c` | **#41** first ever calibration of `cross_camera_threshold` |
+| `e51175b` | **Offline re-render** -- `annotations.json` sidecar + `rerender_from_clips.py`; `keep_frames` now true |
+| `a7a042c` | **#45a** scoring modes (`prototype` / `max_exemplar` / `consensus`), default unchanged |
+| `9f5e7fc` | **#28/#29** RTSP TCP + socket timeouts; `VideoSource.open`/`_reopen` unified |
+| `530b446` | Revert to run 2's reconcile settings after the operator rated the tuned ones worse |
+| `afbfe9e` | **Phase 1 mutual-best** + **#38** simultaneity veto, both ON · **#45/#46** per-camera fps · **#35** palette · **#55 #58 #59 #64 #66** loud failures |
+| `84ed133` | **#25** lone tracklet gets an identity · **#27** stale-roots merge bug · **#32/#33** UNRESOLVED · **#34** fit/margin labels · **#36** clipped labels |
+| `cfc6fc9` | **#19-22** store transport/filter/validation · **#30** credentials · **#47** per-second embedding · **#56** batch chunking · **#57** camera recovery · **#61 #62 #63 #65 #67** |
+| `9dafa42` | **#39** post-BN tap behind a flag |
+| `7015ed4` | **#48** per-frame-period staleness · **#50** narrowed ReID lock · **#51 #52 #60** |
 
-Test state: **13 test files pass** (`python tests/run_all.py`), including
-`test_phase1_decision_log.py` (28 checks), `test_shutdown_reaches_reconcile.py` (14),
-`test_per_camera_same_camera_bar.py` (36), `test_reconcile_scoring_modes.py` (23) and
-`test_rtsp_options.py` (17).
+**Test state: 14 files pass.** Notable: `test_reconcile_physical_guards.py` (20),
+`test_per_camera_same_camera_bar.py` (36), `test_phase1_decision_log.py` (28),
+`test_reconcile_scoring_modes.py` (23), `test_rtsp_options.py` (17),
+`test_shutdown_reaches_reconcile.py` (14).
 
-### 0.3 Verify state on a fresh machine
+### 0.7 Current shipping configuration
 
-```bash
-python tests/run_all.py                                    # expect 11 files pass
-python tests/calibration/verify_embedding_contract.py      # expect PASS
-python tests/calibration/characterize_known_defects.py     # expect 9/9 still PRESENT
-python tests/calibration/analyze_decision_log.py <log>     # re-derive J.6
-python tests/calibration/compare_detector_models.py        # re-derive H.11
+```
+detector.model                              yolo11m.pt
+reid.tap                                    post_relu      (#39 available, OFF)
+reid.interval_sec                           0.4            (#47)
+identity.reconcile.scoring                  prototype      (#45a available, OFF)
+identity.reconcile.threshold                0.63           cross-camera
+identity.reconcile.same_camera_threshold    0.90           global
+  per_camera: cam_213 0.80, cam_224 0.80
+identity.reconcile.same_camera_reciprocal_best  true       Phase 1 mutual-best
+identity.reconcile.covisibility.enabled     true           #38, 6 pairs
+source.rtsp                                 tcp, 5000 ms   (#28/#29)
+live.reconcile.keep_frames                  true           enables 0.3
 ```
 
-Artefacts from run `20260730_093723` live on the A6000 at
-`~/seifer_work/Inference_PersonReid`: `run1.log`,
-`logs/reconcile_decisions_20260730_093723.jsonl` (286 decisions), and the four
-`._live_src_cam_*.mp4` frozen clips. **Those clips are the replay corpus** — they
-reproduce every symptom and nothing local does.
+### 0.8 Reading order for a fresh session
 
-### 0.4 Still unanswered
+Section 0 (this) -> **Part A** (what NOT to retry, with evidence) -> **Part J**
+(field data and operator observations) -> Part G (design decisions) -> Part H
+(measurements and their caveats).
 
-- Does raising `imgsz` or lowering `conf` recover the people cam_206 misses at the start
-  of a clip? Measured as no-ops on other footage **with yolo11n**; untested on yolo11m,
-  and **untested on cam_206's own clip**, which is a crowded room with a table and is a
-  different problem.
-- `cross_camera_threshold` remains uncalibrated. Do not touch it before run2.
-- **Does yolo11m keep up on four live streams?** It buys real fragmentation reduction on
-  a file (H.11) at 2.0× the CPU cost. Whether that cost shows up as dropped frames — the
-  one thing that would make it a net loss — is only visible in run2's per-camera
-  `dropped%` and `infer_q dropped`. J.1 declared Phase 11 dead *at yolo11n's cost*.
-- Whether cam_219 also needs a lowered same-camera bar. It orphans 4 of 6 subjects, but
-  has only 7 tracklets at mean 264 observations, so there is little fragmentation to
-  repair. Left at 0.90 deliberately, to keep run2's comparison readable.
+Parts C and D exist to stop rediscovery: C is deferred/out-of-scope, D is verified
+clean.
 
-### 0.5 Reading order for a fresh session
+### 0.9 The one lesson this project keeps paying for
 
-Section 0 (this) → **Part A** (what not to retry, with the evidence) → **Part J** (field
-data from the real run) → **Part B Phase 9** (the calibration items) → Part G (design
-decisions and why) → Part H (measurements, with their caveats).
+**A cluster count cannot tell you whether a cluster is one person or three.** Every
+number quoted for a threshold change during the 2026-07-30 session was equally
+consistent with the good and the bad outcome, and two settings chosen that way both
+made the videos worse. Thresholds were then measured to be the wrong lever entirely
+(Part A, first row).
 
-Parts C and D exist to stop rediscovery: C is deferred/out-of-scope defects, D is what
-was verified clean and should not be re-audited.
-
+So: no change that touches identity ships without a re-rendered video compared
+against the previous one. Section 0.3 makes that a local job of seconds. Use it.
 ---
 
 ## Contents
@@ -157,7 +181,8 @@ was verified clean and should not be re-audited.
 10. [Part G — Design decisions log](#part-g--design-decisions-log)
 11. [Part H — Measurement reference](#part-h--measurement-reference)
 12. [Part J — Field results, 2026-07-30](#part-j--field-results-2026-07-30-a6000-4-cameras-live-rtsp)
-13. [Part I — Historical context](#part-i--historical-context)
+13. [Part L — Handover notes](#part-l--handover-notes-2026-07-31)
+14. [Part I — Historical context](#part-i--historical-context)
 
 ---
 
@@ -229,6 +254,8 @@ These were measured and rejected. Do not revisit without new evidence.
 | Deepening `max_inference_queue` | 6 MB/frame; observed peak depth 900 ≈ 5.6 GB RAM | measured |
 | Frame-drop → fragmentation fixes | **CONFIRMED DEAD on production hardware (J.1):** real drop rate is 0.5–6.5%, not the 85–99% measured on CPU-with-file. Phase 11 solves a problem that does not exist at this crowd size | measured, field |
 | `TOP2_MARGIN` as a **gate** | Accepted and rejected margin distributions are near-identical on 163 real decisions (median 0.0224 vs 0.0186, p5 0.0017 vs 0.0016). A gate would be near-random. Compute and log it; never enforce it. See J.6 | measured, field |
+| **Threshold tuning as the fix for id instability**, of ANY value on ANY bar | **Settled by two live runs, an offline sweep, and the operator watching the videos.** cam_224 at 0.80 fused several people into one reid; at 0.90 one person shattered into many numbers. BOTH directions wrong means the number is not the variable. The cause is #45a: reconcile compared prototype MEANS, which score one person's front-vs-back fragments **below** two strangers in similar clothing (0.640 vs 0.800 on the counterexample) -- so for a real fraction of people NO bar orders them correctly. Fix the SCORING or add a physical guard; tune bars only afterwards | measured, field |
+| Choosing a setting from **cluster counts** | A cluster count cannot tell you whether a cluster is one person or three. Every number quoted for a threshold change on 2026-07-30 was equally consistent with the good and the bad outcome, and two settings picked that way both made the videos worse. Rank candidates with the sweep, then **render and watch** (§0.3) before shipping | measured, field |
 | **Any** `same_camera_threshold` as the fix for id instability | **Settled 2026-07-30 by two live runs plus an offline sweep.** cam_224 at 0.80 fused several people into one reid; at 0.90 one person shattered into many numbers. Both were observed in the rendered videos. This is J.6's overlapping boundaries reaching the product, and it is #45a (prototype MEANS), not a number. Tune bars *after* choosing a scoring mode, never instead | measured, field |
 | A **global** `same_camera_threshold` of any value | The per-subject boundaries overlap across cameras (J.6): p95 of "top different" = 0.816 exceeds p5 of "worst same" = 0.719. No single number works. **Per-camera bars landed 2026-07-30 (#40)** — so do not "fix" this by picking a better global number; tune the per-camera entries | measured, field |
 | `yolo11n` → `yolo11m` as a **no-op** | Superseded 2026-07-30. Part A previously implied detector changes buy nothing, on the strength of `imgsz`/`conf` results. Capacity is a different lever and it **does** move fragmentation: yolo11m holds one 150-frame track where yolo11n splits the same person into 64 + 37 (H.11). Shipped as a measurement; the throughput half is still unmeasured | measured |
@@ -352,10 +379,10 @@ diagnostics, which live in capture/pipeline) are not started.
 
 | # | Item | Evidence |
 |---|---|---|
-| 19 | `store.prefer_grpc` (default `false`) + `store.grpc_port: 6334`. `docker-compose.yml` **already maps 6334** — no infra change | verified |
-| 20 | `_gather_tracklets` scrolls **unfiltered** with `with_vectors=True`, discarding other runs in Python — cost grows with every run forever. Add server-side `scroll_filter` on `run_id` here, in `build_gid_map`, and in `print_run_summary` | verified; `scroll_filter` exists, unused |
-| 21 | Log active transport at startup; keep embedded `path=` mode working (no gRPC in-process) | required for tests |
-| 22 | Store never validates an existing collection's dim/metric on startup | read |
+| 19 | **DONE** `cfc6fc9`. `store.prefer_grpc` (default `false`) + `store.grpc_port: 6334`. `docker-compose.yml` **already maps 6334** — no infra change | verified |
+| 20 | **DONE** `cfc6fc9` -- server-side `run_id` filter in reconcile, `build_gid_map` and `print_run_summary`, with the Python check kept as a fallback. Was: `_gather_tracklets` scrolls **unfiltered** with `with_vectors=True`, discarding other runs in Python — cost grows with every run forever. Add server-side `scroll_filter` on `run_id` here, in `build_gid_map`, and in `print_run_summary` | verified; `scroll_filter` exists, unused |
+| 21 | **DONE** `cfc6fc9`. Log active transport at startup; keep embedded `path=` mode working (no gRPC in-process) | required for tests |
+| 22 | **DONE** `cfc6fc9` -- dim and distance metric are checked and warned about. Was: never validated | read |
 
 **Gate:** bit-identical assignments over REST and gRPC on the same clip; finalization wall
 time reported for both.
@@ -364,8 +391,8 @@ time reported for both.
 
 | # | Item | Evidence |
 |---|---|---|
-| 23 | Reconcile runs end-to-end from a persisted score log with **no model in memory**, reproducing assignments bit-for-bit at identical thresholds | spec §6.2 |
-| 24 | Replay harness: frozen clips fed with `NewestSlot` and the 2-deep queue decimation bypassed, so runs are deterministic | prerequisite |
+| 23 | **DONE in the part that matters** `3dd0107`/`e51175b` -- reconcile AND the render replay from the store + clips + geometry sidecar, no model in memory (§0.3). Original: Reconcile runs end-to-end from a persisted score log with **no model in memory**, reproducing assignments bit-for-bit at identical thresholds | spec §6.2 |
+| 24 | **NOT DONE** (see §0.5). Replay harness: frozen clips fed with `NewestSlot` and the 2-deep queue decimation bypassed, so runs are deterministic | prerequisite |
 
 This turns Phase 9's sweeps into an interactive loop instead of a re-inference job.
 
@@ -373,9 +400,9 @@ This turns Phase 9's sweeps into an interactive loop instead of a re-inference j
 
 | # | Item | Evidence |
 |---|---|---|
-| 25 | Reconcile stamps **no identity at all** below 2 tracklets (`if len(keys) < 2: return {}`) — the whole video renders as bare `ID <n>` | **measured**: 1 tracklet, 5 observations, zero ids written |
-| 26 | Reconcile **never reads `ts`**; spans use per-camera frame indices, which are not comparable across 15/25 fps. Switch to `ts` with frame-index fallback | verified by grep |
-| 27 | Phase 2 selects its threshold from a **stale `roots` snapshot** — a camera-sharing pair can merge at 0.63 instead of 0.90 | verified: `union` updates `members`, not `roots` |
+| 25 | **FIXED** `84ed133`; the defect characteriser now reports it FIXED. Was: reconcile stamps **no identity at all** below 2 tracklets (`if len(keys) < 2: return {}`) — the whole video renders as bare `ID <n>` | **measured**: 1 tracklet, 5 observations, zero ids written |
+| 26 | **FIXED** `afbfe9e` -- `span_ts` gathered per tracklet, frame-index fallback kept. Was: reconcile **never reads `ts`**; spans use per-camera frame indices, which are not comparable across 15/25 fps. Switch to `ts` with frame-index fallback | verified by grep |
+| 27 | **FIXED** `84ed133` -- the merge loop re-reads the bar from CURRENT membership and skips the pair loudly if an earlier merge raised it. Snapshot and live views are separate by name so the decision log still records the round AS SCORED. Was: Phase 2 selects its threshold from a **stale `roots` snapshot** — a camera-sharing pair can merge at 0.63 instead of 0.90 | verified: `union` updates `members`, not `roots` |
 
 `next_gid` cross-run collision **dropped from scope** — harmless with run-scoped ids, since
 every consumer filters by `run_id`.
@@ -388,7 +415,7 @@ every consumer filters by `run_id`.
 |---|---|---|
 | 28 | ~~**No RTSP transport or timeout options anywhere.**~~ **LANDED `9f5e7fc`** (`source.rtsp`, applied before any capture opens; TCP is a sound default, not a measured fix — J.4 saw zero live decode errors). Set `OPENCV_FFMPEG_CAPTURE_OPTIONS` with `rtsp_transport;tcp` and a socket timeout | **measured**: 294/682 and 207/1573 broken H.265 references in project recordings; grep confirms none set |
 | 29 | Without a socket timeout `cap.read()` can block indefinitely; the capture thread never re-checks `stop_event`, so `Ctrl-C` cannot stop that camera | read |
-| 30 | Move credentials out of command-line URLs (visible in `ps` and shell history) into `.env` | observed |
+| 30 | **DONE** `cfc6fc9` -- `source.env_urls` names environment variables, resolved from the untracked `.env`, missing ones reported. Was: move credentials out of command-line URLs (visible in `ps` and shell history) into `.env` | observed |
 
 **Rationale:** H.265 reference loss produces smeared frames that feed both the detector and
 the ReID crop, so a corrupted crop poisons the tracklet prototype. Packet loss is random,
@@ -400,19 +427,19 @@ which no threshold explains — this is the leading hypothesis for random identi
 
 | # | Item | Evidence |
 |---|---|---|
-| 31 | Renderer becomes a **pure function of `(state, frame)`** — no state, no promotion. Both purity tests: frame *N* direct vs sequential `0..N` byte-identical; forward-then-backward label stability | spec §3 |
-| 32 | Unresolved handles: distinct colour, dashed box, **no ID number**, never in a tally | spec §2.3 |
-| 33 | Suppressed tracklets currently render as bare `ID <n>`, reading as the identity vanishing — replaced by #32's treatment | verified |
-| 34 | **REID confidences.** `render_final_videos` builds `SimpleNamespace` without `reid_score`, so the final MP4 shows no confidence at all. Add per-tracklet **fit** (prototype vs final cluster prototype) and **margin** (gap to nearest other cluster) → `ID 7 (0.94 / +0.21)`. Label as reconcile-scale — **not** comparable to live-engine scores | verified |
-| 35 | Palette has only **8 colours** (`id % 8`). Across four videos, where the check is "did this person keep their colour", collisions read as false merges that did not happen | verified |
-| 36 | Labels clipped for boxes with `y1 < ~30` — people entering at the top have no visible id | read |
-| 37 | `as-known-at-time` playback mode reading the same state log | spec §4 |
+| 31 | **NOT DONE** (see §0.5). Renderer becomes a **pure function of `(state, frame)`** — no state, no promotion. Both purity tests: frame *N* direct vs sequential `0..N` byte-identical; forward-then-backward label stability | spec §3 |
+| 32 | **DONE** `84ed133` -- `UNRESOLVED` label in a fixed neutral grey that is deliberately NOT in the palette, so two unresolved people cannot look like one. No dashed box. Was: unresolved handles: distinct colour, dashed box, **no ID number**, never in a tally | spec §2.3 |
+| 33 | **DONE** `84ed133` (same change as #32). Was: suppressed tracklets render as bare `ID <n>`, reading as the identity vanishing — replaced by #32's treatment | verified |
+| 34 | **DONE** `84ed133` -- reconcile returns per-tracklet fit/margin, rendered as `REID 7 (0.94 / +0.21)`. Was: **REID confidences.** `render_final_videos` builds `SimpleNamespace` without `reid_score`, so the final MP4 shows no confidence at all. Add per-tracklet **fit** (prototype vs final cluster prototype) and **margin** (gap to nearest other cluster) → `ID 7 (0.94 / +0.21)`. Label as reconcile-scale — **not** comparable to live-engine scores | verified |
+| 35 | **DONE** `afbfe9e` -- 20 distinct colours, hue-interleaved so consecutive gids are far apart. Was: palette has only **8 colours** (`id % 8`). Across four videos, where the check is "did this person keep their colour", collisions read as false merges that did not happen | verified |
+| 36 | **DONE** `84ed133` -- label flips inside the box when it would clip, and x is clamped at the right edge. Was: labels clipped for boxes with `y1 < ~30` — people entering at the top have no visible id | read |
+| 37 | **NOT DONE** -- a new feature, not a defect (§0.5). `as-known-at-time` playback mode reading the same state log | spec §4 |
 
 ### Phase 7 — Cross-camera simultaneity veto
 
 | # | Item | Evidence |
 |---|---|---|
-| 38 | `conflict()` skips cross-camera pairs entirely, so tracklets overlapping in time in non-co-visible cameras merge on appearance alone. This is the "id switches to another person" symptom | verified: `if a[0] != b[0]: continue` |
+| 38 | **DONE and ON** `afbfe9e` -- needs `ts` (#26); fail-open on unlisted pairs, co-visible pairs and missing timestamps, and every unlisted pair is named at startup. Was: `conflict()` skips cross-camera pairs entirely, so tracklets overlapping in time in non-co-visible cameras merge on appearance alone. This is the "id switches to another person" symptom | verified: `if a[0] != b[0]: continue` |
 
 ```yaml
 identity:
@@ -449,7 +476,7 @@ metrics so it is not mistaken for the veto working.
 
 | # | Item | Evidence |
 |---|---|---|
-| 39 | `fc = Sequential(Linear, BatchNorm1d, ReLU)` and eval-mode `forward` returns `self.fc(v)` — the shipped embedding is **post-ReLU**, confined to the non-negative orthant. Add post-BN behind a config flag; record the tap in the run config; refuse to compare score logs across taps | **measured** |
+| 39 | **IMPLEMENTED, OFF BY DEFAULT** `9dafa42` (`reid.tap`; see §0.4). Verified here: post-ReLU 19.2% zero dims / 0% negative, post-BN 0% / 19.2%. Was: `fc = Sequential(Linear, BatchNorm1d, ReLU)` and eval-mode `forward` returns `self.fc(v)` — the shipped embedding is **post-ReLU**, confined to the non-negative orthant. Add post-BN behind a config flag; record the tap in the run config; refuse to compare score logs across taps | **measured** |
 
 Measured effect (bank scoring, 14 proven-distinct pairs — see the corrected H.2/H.3):
 post-BN improves the separation margin in **every** scoring mode at **both** sample sizes,
@@ -492,8 +519,8 @@ Deliverable: **curves, not values.**
 |---|---|---|
 | 45 | Single global `output.fps_default: 20` applied to all four cameras ([pipeline.py:203](src/live/pipeline.py#L203), [:430](src/live/pipeline.py#L430)) → four videos with four different wrong time scales, which **blocks visual cross-camera verification** | verified |
 | 46 | Output MP4 timeline **5.5× too fast** (157 frames @20fps for 42.9 s of content). `WriterStage` has correct wall-clock pacing but is never constructed in reconcile mode | **measured** |
-| 47 | `reid.interval` counts processed frames → cam_224 at 15 fps accumulates ~40% fewer observations per second, giving the weakest prototypes to the hardest camera pair. Convert to seconds | arithmetic |
-| 48 | `max_frame_staleness_ms: 100` and `track_buffer: 30` are absolute → 2.5 vs 1.5 frame periods across cameras | read |
+| 47 | **DONE** `cfc6fc9` -- `reid.interval_sec: 0.4` converts per camera from its measured rate (cam_224 every 6 frames, the fast cameras every 10). Was: `reid.interval` counts processed frames → cam_224 at 15 fps accumulates ~40% fewer observations per second, giving the weakest prototypes to the hardest camera pair. Convert to seconds | arithmetic |
+| 48 | **DONE** `7015ed4` -- `max_frame_staleness_periods: 2.5` converts per camera (cam_213 ~100ms, cam_224 ~169ms), falling back to the absolute bound until a rate is known. `track_buffer` untouched. Was: absolute → 2.5 vs 1.5 frame periods across cameras | read |
 | 49 | `detector.per_camera` is `{}` — the intended lever for heterogeneous cameras, unused | read |
 
 ### Phase 11 — Throughput (dropped to lowest priority by J.1; **re-open if yolo11m drops frames**)
@@ -506,29 +533,29 @@ Deliverable: **curves, not values.**
 
 | # | Item | Evidence |
 |---|---|---|
-| 50 | `_embed_lock` wraps all of `TrackEmbedder.process` — cropping, a float64 Laplacian, an O(N²) occlusion loop, all preprocessing — not just the forward pass, contradicting its own docstring | verified |
-| 51 | Drops dominated by `max_inference_queue: 2` (629 of 637 batches on a file run; `slot_drop` was 1) | **measured** |
-| 52 | `warmup_embeddings: 3` fires on consecutive frames → ~1 effective view for short tracklets, exactly those needing to clear 0.90. Spread it | read |
-| 53 | 251 Mpx/s of CPU-only H.265 decode (cam_219 alone 92.2); NVDEC is a stub (`NVDEC_IMPLEMENTED = False`) | arithmetic |
-| 54 | ByteTrack's Kalman filter advances one step per `update` regardless of elapsed time — no `dt`. Under load-dependent dropping the predicted box is wrong by however long the gap really was | verified |
+| 50 | **DONE** `7015ed4` -- the lock moved INTO `ReIDExtractor` around the forward pass alone; per-camera embedders now overlap (measured 3 concurrent where the old lock pinned it at 1). Was: `_embed_lock` wraps all of `TrackEmbedder.process` — cropping, a float64 Laplacian, an O(N²) occlusion loop, all preprocessing — not just the forward pass, contradicting its own docstring | verified |
+| 51 | **DONE** `7015ed4` -- 2 -> 4, raised modestly not deepened (each slot is a full batch at ~6 MB/frame). Was: drops dominated by `max_inference_queue: 2` (629 of 637 batches on a file run; `slot_drop` was 1) | **measured** |
+| 52 | **DONE** `7015ed4` -- `reid.warmup_spacing: 3` frames (~0.12s) so warmup samples different moments. Was: `warmup_embeddings: 3` fires on consecutive frames → ~1 effective view for short tracklets, exactly those needing to clear 0.90. Spread it | read |
+| 53 | **BLOCKED, not implementable** (§0.5) -- `NVDEC_IMPLEMENTED = False` is a stub for a GPU decode library that is not installed. 251 Mpx/s of CPU-only H.265 decode (cam_219 alone 92.2); NVDEC is a stub (`NVDEC_IMPLEMENTED = False`) | arithmetic |
+| 54 | **BLOCKED, deliberately** (§0.5) -- inside vendored Ultralytics; patching it risks tracking quality to fix a defect that only bites under heavy loss (measured ~1%). ByteTrack's Kalman filter advances one step per `update` regardless of elapsed time — no `dt`. Under load-dependent dropping the predicted box is wrong by however long the gap really was | verified |
 
 ### Phase 12 — Robustness
 
 | # | Item | Evidence |
 |---|---|---|
-| 55 | No exception guard in any worker `run()`; no watchdog. A dead `InferenceStage` runs forever writing `CAMERA OFFLINE` frames | verified by grep |
-| 56 | ReID batch unbounded in number of people; no chunking → OOM risk on a weaker GPU | verified |
-| 57 | Camera death permanent after ~15 s of retries; all-dead ends the run, so a 20 s switch reboot kills a session | read |
-| 58 | Clips deleted in a `finally` even when the render failed, destroying the only copy of the footage | read |
-| 59 | Qdrant down → `_build_store` returns `None` → reconcile **silently disabled** → live-annotated output instead. Make it fail loudly | verified |
-| 60 | `from main import` inside `_finalize_offline` → fails outside the project root, returning without rendering | observed |
-| 61 | Threads started outside `try/finally`; identity never drains on shutdown; render's drain races identity | read |
-| 62 | Clip writer latches frame size from the first frame → a mid-run resolution change desyncs annotations from the clip permanently | read |
-| 63 | `output.codec: h264` ignored on the product path (mp4v hardcoded); metrics always report `written=0` in reconcile mode | verified in a real run |
-| 64 | A camera with no annotations produces **no video and no message** (`if not annos: return`). With four cameras this is easy to miss. Log loudly and record per-camera outcome in the summary | verified |
-| 65 | Clip disk and annotation RAM are unbounded and scale with camera count. Measured **51.0 KB/frame** at 1920×1080 mp4v → see table below. No cap, no rotation, no free-space check | **measured** |
-| 66 | `_g("inference","pose_ensemble", True)` defaults **True** — deleting one config line enables the duplicate-box generator on the live path. Change the default to `False` | verified |
-| 67 | `source.videos` points at non-existent `placeholder_video/`, so bare `python main.py` fails | observed |
+| 55 | **DONE** `afbfe9e` -- all four stages report and re-raise, and shutdown names every stage that died. Was: no exception guard in any worker `run()`; no watchdog. A dead `InferenceStage` runs forever writing `CAMERA OFFLINE` frames | verified by grep |
+| 56 | **DONE** `cfc6fc9` -- chunked at 32, verified embedding-invariant (5.2e-08) because eval-mode BatchNorm uses running stats. Was: ReID batch unbounded in number of people; no chunking → OOM risk on a weaker GPU | verified |
+| 57 | **DONE** `cfc6fc9` -- retries every 30s indefinitely after the fast budget; a camera that comes back rejoins. Was: camera death permanent after ~15 s of retries; all-dead ends the run, so a 20 s switch reboot kills a session | read |
+| 58 | **DONE** `afbfe9e` -- clips are KEPT on render failure, with the re-render command printed. Was: clips deleted in a `finally` even when the render failed, destroying the only copy of the footage | read |
+| 59 | **DONE** `afbfe9e` -- a banner says reconcile is disabled and the ids will be provisional. Was: Qdrant down → `_build_store` returns `None` → reconcile **silently disabled** → live-annotated output instead. Make it fail loudly | verified |
+| 60 | **DONE** `7015ed4` -- the project root is derived from `__file__` and put on `sys.path` first. Was: `from main import` inside `_finalize_offline` → fails outside the project root, returning without rendering | observed |
+| 61 | **DONE** `cfc6fc9` -- a failure mid-start stops and joins whatever came up. Was: threads started outside `try/finally`; identity never drains on shutdown; render's drain races identity | read |
+| 62 | **DONE** `cfc6fc9` -- later frames are resized to the latched size so geometry stays aligned, warned once. Was: clip writer latches frame size from the first frame → a mid-run resolution change desyncs annotations from the clip permanently | read |
+| 63 | **DONE** `cfc6fc9` -- the configured codec reaches the render, falling back to mp4v if the build lacks it. Was: `output.codec: h264` ignored on the product path (mp4v hardcoded); metrics always report `written=0` in reconcile mode | verified in a real run |
+| 64 | **DONE** `afbfe9e` -- says so loudly. Was: a camera with no annotations produces **no video and no message** (`if not annos: return`). With four cameras this is easy to miss. Log loudly and record per-camera outcome in the summary | verified |
+| 65 | **DONE** `cfc6fc9` -- `live.reconcile.max_clip_gb: 4.0` per camera, plus a free-space report before the run. Annotation RAM untouched. Was: clip disk and annotation RAM are unbounded and scale with camera count. Measured **51.0 KB/frame** at 1920×1080 mp4v → see table below. No cap, no rotation, no free-space check | **measured** |
+| 66 | **DONE** `afbfe9e` -- defaults False. Was: `_g("inference","pose_ensemble", True)` defaults **True** — deleting one config line enables the duplicate-box generator on the live path. Change the default to `False` | verified |
+| 67 | **DONE** `cfc6fc9` -- points at footage that ships with the repo. Was: `source.videos` points at non-existent `placeholder_video/`, so bare `python main.py` fails | observed |
 
 Clip growth, assuming no frames dropped:
 
@@ -620,7 +647,12 @@ association is one-to-one. Across 120 frames the tracker returned more rows than
 |---|---|
 | ~~**run1** — baseline, Phase 0~~ | **DONE**, `20260730_093723`. Per-camera drop rate, fragmentation ratio, H.265 answer, first cross-camera data, frozen clips. Analysis in J.6–J.12 |
 | **run2** — #40 + yolo11m, **the next run** | Did the orphan count fall and did the operator's four named symptoms (J.8) go away? Diff analyser sections 1/2/5 against J.10, and per-camera tracklet counts against J.9. **Also the throughput verdict on yolo11m** — per-camera `dropped%` vs J.9's 0.4–2.9% |
-| **run3** — after Phase 5, TCP transport | compare `grep -c hevc` and prototype tightness |
+| ~~**run2** — #40 + yolo11m~~ | **DONE**, `20260730_111232` (3 cameras; cam_206 was dropped from the command by a shell error). Operator: reid 5, 6 and 10 each held more than one person |
+| ~~**run3** — tightened bars~~ | **DONE**, `20260730_120551`. Operator rated it WORSE: one person cycled through many numbers. Both changes reverted (`530b446`) |
+| **run4 — the next run.** All guards on, thresholds at run 2's values | Did Phase 1 mutual-best and the #38 veto remove the shared-reid failures WITHOUT re-splitting people? Check `grep -c "refused for not being each other's best"` and `grep "simultaneity veto"`. Keeps its clips, so any follow-up setting is testable offline |
+| **run5** — after picking a scoring mode or tap (§0.4) | Only once run4 gives a baseline. Change ONE of them, re-derive its bars, re-render, watch |
+| Single-person route walk through every camera | Still the cleanest data for per-pair tolerances (#17) and cross-camera calibration |
+| Crowded run | Every Part H measurement tops out at 6 people; the production regime is untested |
 | **Single-person route walk** through all four cameras with rough timings | cleanest data for per-pair tolerances (#17) and `cross_camera_threshold` |
 | **Crowded run**, as many people as possible | every measurement in Part H tops out at 6 people; the production regime is untested |
 
@@ -641,7 +673,12 @@ association is one-to-one. Across 120 frames the tracker returned more rows than
 7. `as-known-at-time` mode and default mode both derive from the same state log.
 8. REST and gRPC produce identical assignments on the same clip.
 9. The `TOP2_MARGIN` summary block matches recomputation from the annotated candidate vector.
-10. The existing 8 test files stay green throughout.
+10. The existing test files stay green throughout — **14 files pass** as of 2026-07-31.
+
+**Status of these criteria:** 2, 3, 4, 6, 9 and 10 are met and pinned by tests. 5 is
+met for reconcile (§0.3 replays it from the store with no model) but not from a
+persisted *score* log. 1 and 7 are not met (#31, #37 — see §0.5). 8 is untested:
+gRPC is available (#19) but REST/gRPC have not been diffed on the same clip.
 
 ---
 
@@ -1275,6 +1312,77 @@ identity starts accepting strangers. Separately, `min_prob_gap: 0.05` saturates:
 observations, cosine 0.90 vs 0.85 gives a probability gap of **0.0019**, so a clean winner
 is rejected and a duplicate minted. Batch path only, hence Part C — but do not reuse these
 weights anywhere without re-deriving them.
+
+---
+
+## Part L — Handover notes (2026-07-31)
+
+Things a new agent needs that are not item numbers.
+
+### L.1 Where the code now lives
+
+| Concern | File | Notes |
+|---|---|---|
+| Merge decisions | `src/identity/reconcile.py` | scoring modes, per-camera bars, both physical guards, fit/margin |
+| The record of every decision | `src/identity/decision_log.py` | read by `analyze_decision_log.py` |
+| Offline sweep | `tests/calibration/sweep_reconcile_thresholds.py` | read-only by construction |
+| Offline re-render | `tests/calibration/rerender_from_clips.py` | needs the `.annotations.json` sidecar |
+| Detector comparison | `tests/calibration/compare_detector_models.py` | produces H.11 |
+| Box geometry sidecar | `src/live/render.py::_write_annotations` | written when the clip finalises |
+
+Two resolvers exist so the live path and the file-batch path cannot drift, the same
+argument as `detector.resolve_detector_cfg`: `resolve_same_camera_thresholds` and
+`resolve_covisibility`. Both call sites use them. Add config the same way.
+
+### L.2 Invariants worth not breaking
+
+1. **Fail-soft in finalization.** Nothing between `Ctrl-C` and `[live] shutdown
+   complete.` may raise. A cosmetic `print` once cost two runs their identities
+   (J.5); the decision log, the geometry sidecar and the disk cap all degrade
+   rather than throw.
+2. **Fail-open on physical vetoes.** An unlisted camera pair, a co-visible pair or
+   a missing timestamp all mean "no veto". A wrong veto manufactures a second
+   identity for someone who has one, which is worse than a missed one.
+3. **Read-only means read-only.** The sweep and the re-render take reconcile's
+   RETURNED remap and never let it write ids into the store, so two settings run
+   back to back cannot contaminate each other.
+4. **The decision log records the round AS SCORED.** Do not feed it post-merge
+   state; a bar logged beside a score it never applied to is worse than no log.
+
+### L.3 Traps that have already caught someone
+
+- **`| tee`** — see §0.2. Also `tail -f` and `kill` in one block: the interrupt
+  goes to `tail`.
+- **`output_cam_*.mp4` existing does not mean the last run succeeded.** They are
+  only overwritten by a completed render, so stale files look like success. Check
+  mtime against the `run_id`.
+- **Placeholders in shell commands.** `<run_id>` and `you@host` were both pasted
+  literally, and `<` is a shell redirect. Write commands that derive their own
+  values: `RUN=$(grep -o 'run_id=[0-9_]*' run.log | tail -1 | cut -d= -f2)`.
+- **Test fixtures that do not test what they claim.** Two caught in one session: a
+  "stranger" built in the same plane as the true partner was 0.966 similar to it,
+  and 0.5s tracklet spans could never exceed a 1.0s veto tolerance, so the veto
+  "passed" without ever being exercised. Assert the fixture's own preconditions.
+- **Editing a `__init__` by inserting methods mid-body** orphans every assignment
+  after them. `verify_embedding_contract.py` caught it in seconds; run it after
+  touching anything in `src/reid/`.
+
+### L.4 The operator's own words, as ground truth
+
+Symptoms are reported by watching, not by metrics. Recorded verbatim in substance
+because these are what "working" has to mean:
+
+- *"reid 2 correct by his front, becomes reid 7 by his back"* (cam_213)
+- *"reid 3 becomes reid 7 when the person moves at a bad angle"* (cam_224)
+- *"reid 1 becomes reid 6 when he leaves the cam and comes back the other side of
+  the room"* (cam_219, same camera)
+- *"multiple other people in the room are also called reid 6"* — a false merge
+- *"cam_224 definitely sped up"*, *"cam_219 a little slowed"* — #45/#46, now fixed
+- *"5 people present but only 1 detected at first"* (cam_206) — detection recall,
+  which is why the detector moved to yolo11m
+
+Their own diagnosis, which was correct: *"this seems like a track id change so reid
+change nonsense which should not always be the case."*
 
 ---
 
