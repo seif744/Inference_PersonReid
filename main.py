@@ -45,7 +45,7 @@ import cv2
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 
 from video_source import VideoSource, is_stream_path
-from detector import PersonDetector
+from detector import PersonDetector, resolve_detector_cfg
 from drawing import draw_detections, draw_hud
 from crop_saver import CropSaver
 from interrupt_guard import InterruptGuard, print_stop_hint
@@ -291,7 +291,8 @@ def build_gid_map(store, run_id):
     return {key: counter.most_common(1)[0][0] for key, counter in votes.items()}
 
 
-def render_final_videos(jobs, cfg, shared, store, run_id):
+def render_final_videos(jobs, cfg, shared, store, run_id,
+                        gid_map=None, out_pattern="output_{name}.mp4"):
     """
     SECOND PASS -- write output_<camera>.mp4 with the FINAL (post-reconciliation)
     global ids. The live pass only captured box geometry; cross-camera identity is
@@ -300,10 +301,21 @@ def render_final_videos(jobs, cfg, shared, store, run_id):
     output videos -- the core proof the pipeline works. We re-decode the source
     frames (cheap; no model) and draw the captured boxes, so boxes/track ids match
     the live pass exactly.
+
+    gid_map / out_pattern exist so a PAST run can be re-rendered offline at
+    different reconcile settings (tests/calibration/rerender_from_clips.py):
+      * gid_map -- supply {(camera, track_id): gid} directly, which is exactly what
+        reconcile_tracklets returns. Skips build_gid_map, so a re-render never has
+        to write ids into the store first and can therefore leave the gallery
+        untouched while producing a watchable video.
+      * out_pattern -- write somewhere other than output_<cam>.mp4, so two settings
+        can be rendered side by side and compared instead of overwriting.
+    Both default to today's behaviour exactly; the live path passes neither.
     """
     from concurrent.futures import ThreadPoolExecutor
     from types import SimpleNamespace
-    gid_map = build_gid_map(store, run_id)
+    if gid_map is None:
+        gid_map = build_gid_map(store, run_id)
     resize_width = cfg["source"].get("resize_width", 0)
     fps = float(cfg["display"].get("output_fps", 20.0))
 
@@ -311,7 +323,7 @@ def render_final_videos(jobs, cfg, shared, store, run_id):
         annos = shared["annotations"].get(name)
         if not annos:
             return
-        out_path = f"output_{name}.mp4"
+        out_path = out_pattern.format(name=name)
         writer = None
         try:
             with VideoSource(path=path) as cam:
@@ -339,7 +351,13 @@ def render_final_videos(jobs, cfg, shared, store, run_id):
 
                         dets.append(
                             SimpleNamespace(
-                                x1=x1, y1=y1, x2=x2, y2=y2,
+                                # cv2.rectangle needs ints. Detection declares int
+                                # coordinates, so the live path already satisfies
+                                # this -- but these can also arrive from a
+                                # persisted .annotations.json, where a float would
+                                # otherwise fail deep inside OpenCV with an
+                                # unreadable overload-resolution error.
+                                x1=int(x1), y1=int(y1), x2=int(x2), y2=int(y2),
                                 track_id=track_id, confidence=conf,
                                 global_id=gid_map.get((name, track_id)),
                                 reid_id=gid_map.get((name, track_id)),
@@ -625,6 +643,12 @@ def main():
     args = parse_args()
     load_dotenv()          # pull secrets (QDRANT_API_KEY, ...) from untracked .env
     cfg = load_config()
+    # RTSP transport + socket timeouts, BEFORE anything opens a capture: FFmpeg
+    # reads its options at open time, so this cannot be done later. Applies to both
+    # the live pipeline and the file-batch flow, since both open through
+    # VideoSource. Files ignore it. See source.rtsp and plan #28/#29.
+    from video_source import rtsp_options_from_config
+    rtsp_options_from_config(cfg)
     det_cfg = cfg["detector"]
     trk_cfg = cfg["tracker"]
     crop_cfg = cfg["crops"]
@@ -687,12 +711,16 @@ def main():
     # Each crop saver writes to crops/<name>/ so crops stay separate.
     jobs = []  # each: (name, path, detector, crop_saver)
     for name, path in sources:
+        # Per-camera overrides (angle/lighting differ per view) merged over the
+        # global detector block -- see detector.resolve_detector_cfg.
+        cam_det_cfg = resolve_detector_cfg(det_cfg, name)
         detector = PersonDetector(
-            model_path=det_cfg["model"],
-            confidence_threshold=det_cfg["confidence_threshold"],
-            person_class_id=det_cfg["person_class_id"],
+            model_path=cam_det_cfg["model"],
+            confidence_threshold=cam_det_cfg["confidence_threshold"],
+            person_class_id=cam_det_cfg["person_class_id"],
             tracker_config=trk_cfg["config"],
-            pose_ensemble=det_cfg.get("pose_ensemble"),
+            pose_ensemble=cam_det_cfg.get("pose_ensemble"),
+            iou=cam_det_cfg.get("iou", 0.7),
         )
         crop_saver = None
         if crop_cfg["save"]:
@@ -882,7 +910,8 @@ def _finalize_run(threads, stop_event, shared, jobs, cfg, disp_cfg, id_cfg,
     # populated, merge global ids that are the same person across cameras.
     recon_cfg = id_cfg.get("reconcile", {}) if id_cfg else {}
     if identity is not None and recon_cfg.get("enabled"):
-        from identity.reconcile import reconcile_tracklets
+        from identity.reconcile import (reconcile_tracklets,
+                                        resolve_same_camera_thresholds)
         threshold = recon_cfg.get("threshold")
         if threshold is None:
             threshold = id_cfg.get("threshold", 0.85)
@@ -893,8 +922,15 @@ def _finalize_run(threads, stop_event, shared, jobs, cfg, disp_cfg, id_cfg,
             threshold=threshold,
             run_id=run_id,
             same_camera_threshold=recon_cfg.get("same_camera_threshold", 0.90),
+            # Per-camera same-camera bars (#40), resolved by reconcile's own helper
+            # so this path and the live pipeline's can never disagree.
+            same_camera_thresholds=resolve_same_camera_thresholds(recon_cfg),
             require_reciprocal_best=recon_cfg.get("require_reciprocal_best", True),
             min_tracklet_observations=recon_cfg.get("min_tracklet_observations", 1),
+            # Pair-scoring mode (#45a); thresholds above are mode-specific.
+            scoring=recon_cfg.get("scoring", "prototype"),
+            consensus_top_frac=recon_cfg.get("consensus_top_frac", 0.25),
+            max_observations_per_side=recon_cfg.get("max_observations_per_side", 64),
         )
 
     # ---- Final render: annotated videos with the reconciled global ids ------

@@ -7,10 +7,19 @@ in a slow decode is judged stale and skipped, v5 §5), and dispatches a batch to
 the inference stage when it reaches `max_batch_size` OR `t_batch_ms` elapses.
 
 Stage 1 keeps the policy trivial (grab fresh frames, dispatch; bs is usually 1
-on CPU). It ALREADY emits a list ("batch"), so Stage 2 only has to add fairness
-(round-robin, starvation bound) without changing the interface. It never waits
-for an individual camera beyond one cycle -- a stalled camera simply contributes
-nothing that cycle (no head-of-line blocking).
+on CPU). It ALREADY emits a list ("batch"). It never waits for an individual
+camera beyond one cycle -- a stalled camera simply contributes nothing that cycle
+(no head-of-line blocking).
+
+FAIRNESS: this scheduler holds NO rotation state, and deliberately so -- it is
+fair by construction. `slot.get()` CLEARS the slot it reads, so a camera that was
+just served has an empty slot on the next pass and the following camera wins even
+at max_batch_size=1 (measured: 33.3/33.3/33.4% over 3 continuously-fresh cameras).
+An earlier version of this docstring claimed a "round-robin, starvation bound"
+that was never implemented, and config.yaml carried a matching `max_skip_cycles`
+knob that nothing read; both are gone. Explicit round-robin DOES exist further
+down the pipeline, in priority.py::CameraFairQueue, where the identity stage
+drains one shared multi-camera queue and the ordering is not self-correcting.
 """
 
 import threading

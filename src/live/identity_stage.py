@@ -111,12 +111,16 @@ class IdentityStage(threading.Thread):
             if det.track_id is None:
                 det.reid_id = None
                 det.global_id = None
+                det.reid_score = None
                 continue
             has_fresh_emb = (det.track_id in fresh) and (det.embedding is not None)
             reid = self.engine.assign(frame.cam, det.track_id, det.embedding,
                                       det.crop_quality, frame.ts, has_fresh_emb)
             det.reid_id = reid
             det.global_id = reid if (reid is not None and reid > 0) else None
+            # Identity match confidence for the overlay -- deliberately NOT
+            # det.confidence (that's YOLO's person score, a different question).
+            det.reid_score = self.engine.score_for(frame.cam, det.track_id)
 
             # Persist a SAMPLED fresh observation for the offline reconcile.
             if self._store is not None and not self._store_failed and has_fresh_emb:

@@ -44,9 +44,29 @@ class TrackEmbedder:
                  max_embeddings_per_track=0, warmup_embeddings=5):
         """
         extractor : a ReIDExtractor (loaded once, reused).
-        interval  : recompute a track's embedding every N frames (>=1).
+        interval  : recompute a track's embedding every N PROCESSED frames (>=1).
         ttl       : evict a track from the cache after it's been unseen for this
-                    many frames.
+                    many PROCESSED frames.
+
+                    Both count frames THIS EMBEDDER ACTUALLY SAW, not the camera's
+                    `frame_index`. That distinction is the whole point: the live
+                    pipeline sheds load by design (`NewestSlot` keeps only the
+                    freshest frame), so `frame_index` jumps by however many frames
+                    were dropped -- ~68 on a saturated CPU box. Throttling on that
+                    gap meant `frame_index - last >= interval` was ALWAYS true, so
+                    the throttle silently stopped throttling and every processed
+                    detection got a fresh forward pass: measured 25 forward passes
+                    over 25 frames instead of 7, i.e. 3.6x the ReID cost arriving
+                    exactly when the machine is already too slow. A feedback loop --
+                    slower -> more drops -> bigger gaps -> more embedding work.
+
+                    `ttl` had the mirror bug in the other direction: 300 camera
+                    frames at ~68-frame gaps is only ~4 processed frames, so a track
+                    briefly out of view was evicted, which RESET its embedding cap
+                    and discarded its cached vector.
+
+                    On an unsaturated box (no drops) processed frames and camera
+                    frames advance together, so this changes nothing there.
         quality   : optional crop-quality gate config. Bad crops are not
                     embedded or persisted, which keeps the gallery cleaner.
         max_embeddings_per_track : cap on how many embeddings ONE track_id
@@ -93,6 +113,11 @@ class TrackEmbedder:
         # }
         self._cache = {}
 
+        # Monotonic count of process() calls = frames THIS embedder actually saw.
+        # `interval` and `ttl` are measured against this, never against the
+        # camera's frame_index (see __init__ docstring).
+        self._tick = 0
+
         # How many forward-pass embeddings we actually computed on the last
         # process() call. Exposed for monitoring/logging (forward passes per
         # frame is the cost knob in production); not part of the core contract.
@@ -118,6 +143,7 @@ class TrackEmbedder:
         """
         due = []   # (detection, crop) pairs that need a fresh forward pass
         rejected = []
+        self._tick += 1        # one processed frame (see __init__ on why not frame_index)
 
         for det in detections:
             if det.track_id is None:
@@ -126,6 +152,7 @@ class TrackEmbedder:
             entry = self._cache.get(det.track_id)
             if entry is not None:
                 entry["seen"] = frame_index               # keep the track alive
+                entry["seen_tick"] = self._tick           # what eviction measures
 
             # Once a track has contributed its cap of embeddings, its identity is
             # already settled -- stop re-embedding it (reuse the cached vector).
@@ -134,7 +161,11 @@ class TrackEmbedder:
             capped = (self.max_per_track > 0 and entry is not None
                       and entry.get("count", 0) >= self.max_per_track)
             warmup = entry is not None and entry.get("count", 0) < self.warmup_embeddings
-            is_due = entry is None or warmup or (frame_index - entry["frame"]) >= self.interval
+            # Warmup deliberately ignores the interval, so a NEW track still gets
+            # its first `warmup_embeddings` vectors back-to-back and the identity
+            # evidence gate (min_evidence_obs) is reached just as fast as before.
+            is_due = (entry is None or warmup
+                      or (self._tick - entry.get("tick", 0)) >= self.interval)
 
             if capped or not is_due:
                 if entry is not None:
@@ -172,6 +203,7 @@ class TrackEmbedder:
                 self._cache[det.track_id] = {
                     "embedding": emb, "frame": frame_index,
                     "seen": frame_index, "count": count,
+                    "tick": self._tick, "seen_tick": self._tick,
                 }
         self.last_num_embedded = len(due)
         self.last_embedded = [det for det, _ in due]
@@ -244,12 +276,18 @@ class TrackEmbedder:
 
     def _evict_stale(self, frame_index):
         """
-        Drop tracks not SEEN within `ttl` frames (they've left view). We evict on
-        last-seen, not last-embedded, so a capped track (no longer re-embedded but
-        still on screen) is kept alive -- otherwise it would be evicted, re-added,
-        and its embedding cap would reset.
+        Drop tracks not SEEN within `ttl` PROCESSED frames (they've left view). We
+        evict on last-seen, not last-embedded, so a capped track (no longer
+        re-embedded but still on screen) is kept alive -- otherwise it would be
+        evicted, re-added, and its embedding cap would reset.
+
+        Measured in processed frames (`_tick`), not the camera's frame_index: under
+        load-shedding the two diverge by the drop ratio, which made `ttl` ~15x more
+        aggressive than configured and caused exactly the cap-reset this docstring
+        says it avoids. `frame_index` is kept as a parameter for the diagnostic
+        fields in the cache entries.
         """
         stale = [tid for tid, e in self._cache.items()
-                 if frame_index - e.get("seen", e["frame"]) > self.ttl]
+                 if (self._tick - e.get("seen_tick", 0)) > self.ttl]
         for tid in stale:
             del self._cache[tid]

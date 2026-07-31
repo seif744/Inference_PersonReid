@@ -28,7 +28,7 @@ from datetime import datetime
 import numpy as np
 
 # src/ is already on sys.path (main.py inserts it); import the reused components.
-from detector import PersonDetector
+from detector import PersonDetector, resolve_detector_cfg
 from reid.extractor import ReIDExtractor
 from reid.service import TrackEmbedder
 
@@ -43,6 +43,56 @@ from live.topology import FailOpenTopology, GraphTopology
 from live.render import RenderStage
 from live.writer import WriterStage
 from interrupt_guard import InterruptGuard, print_stop_hint
+
+
+class _QuietOnBrokenPipe:
+    """Text-stream wrapper that goes silent instead of raising on a dead consumer.
+
+    WHY THIS EXISTS (two real runs were lost to it): `python main.py ... | tee log`
+    puts python and tee in ONE foreground process group, so Ctrl-C is delivered to
+    both. tee has no SIGINT handler and dies immediately; every subsequent print in
+    python then raises BrokenPipeError. The first such print is inside the shutdown
+    sequence, and `_report(final=True)` runs BEFORE `_finalize_offline()` -- so a
+    cosmetic print failure aborted the run before the reconciled ids were ever
+    decided, and the traceback went into the same dead pipe so nothing was visible.
+    A dropped SSH session or a closed terminal does exactly the same thing.
+
+    Printing is never worth the deliverable. Installed only around finalization, so
+    normal output is untouched; once the stream breaks we stop trying.
+    """
+
+    def __init__(self, stream):
+        self._stream = stream
+        self.broken = False
+
+    def write(self, data):
+        if self.broken:
+            return len(data)
+        try:
+            return self._stream.write(data)
+        except (BrokenPipeError, OSError, ValueError):
+            self.broken = True
+            return len(data)
+
+    def flush(self):
+        if self.broken:
+            return
+        try:
+            self._stream.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            self.broken = True
+
+    def isatty(self):
+        try:
+            return self._stream.isatty()
+        except Exception:                                      # noqa: BLE001
+            return False
+
+    def fileno(self):
+        return self._stream.fileno()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
 
 
 class LivePipeline:
@@ -172,12 +222,17 @@ class LivePipeline:
 
         detectors, embedders = {}, {}
         for name, _ in self.sources:
+            # Per-camera overrides merged over the global detector block. pose_cfg
+            # stays as resolved above: the live pose toggle is a THROUGHPUT
+            # decision for the whole path, not a per-camera one.
+            cam_det_cfg = resolve_detector_cfg(det_cfg, name)
             detectors[name] = PersonDetector(
-                model_path=det_cfg["model"],
-                confidence_threshold=det_cfg["confidence_threshold"],
-                person_class_id=det_cfg["person_class_id"],
+                model_path=cam_det_cfg["model"],
+                confidence_threshold=cam_det_cfg["confidence_threshold"],
+                person_class_id=cam_det_cfg["person_class_id"],
                 tracker_config=trk_cfg.get("config", "bytetrack.yaml"),
                 pose_ensemble=pose_cfg,
+                iou=cam_det_cfg.get("iou", 0.7),
             )
             embedders[name] = TrackEmbedder(
                 extractor,
@@ -228,7 +283,7 @@ class LivePipeline:
                 self._clip_paths[name] = clip_path
                 renderer = RenderStage(name, render_q, None, self.stop_event,
                                        capture_mode=True, clip_path=clip_path,
-                                       clip_fps=fps)
+                                       clip_fps=fps, run_id=self.run_id)
                 self.renderers.append(renderer)
                 self.threads.append((f"render-{name}", renderer))
             else:
@@ -342,10 +397,21 @@ class LivePipeline:
 
         The whole phase runs under InterruptGuard: a second Ctrl-C here would
         kill the writers mid-flush and skip the reconcile, so extra presses are
-        warned about instead of raising (3 in a row still force-quit)."""
-        with InterruptGuard("finalizing outputs (flushing videos, then "
-                            "reconciling ids + re-rendering)"):
-            self._shutdown_inner()
+        warned about instead of raising (3 in a row still force-quit).
+
+        InterruptGuard covers SIGNALS. It does NOT cover a dead stdout, which is a
+        separate way to lose the same work -- see _QuietOnBrokenPipe. Both are
+        needed: the guard stops Ctrl-C aborting finalization, the stream wrapper
+        stops a failed `print` doing it."""
+        prev_out, prev_err = sys.stdout, sys.stderr
+        sys.stdout, sys.stderr = (_QuietOnBrokenPipe(prev_out),
+                                  _QuietOnBrokenPipe(prev_err))
+        try:
+            with InterruptGuard("finalizing outputs (flushing videos, then "
+                                "reconciling ids + re-rendering)"):
+                self._shutdown_inner()
+        finally:
+            sys.stdout, sys.stderr = prev_out, prev_err
 
     def _shutdown_inner(self):
         """The actual shutdown sequence (always called under InterruptGuard)."""
@@ -367,8 +433,16 @@ class LivePipeline:
                 t.join(timeout=5)
         for w in self.writers:
             w.join(timeout=10)     # writer flushes queue + releases the MP4
+        # Reporting is DIAGNOSTIC and must never be able to skip what follows it.
+        # Guarded because it sits between the joins and the reconcile: any failure
+        # here -- a dead stdout, a KeyError in the metrics dicts, a stage object
+        # that never got built -- used to abandon the run's ids.
         if self._t_start is not None:
-            self._report(time.monotonic() - self._t_start, final=True)
+            try:
+                self._report(time.monotonic() - self._t_start, final=True)
+            except Exception as e:                                 # noqa: BLE001
+                print(f"[live] final metrics report failed ({type(e).__name__}: {e}); "
+                      f"continuing to reconcile -- the ids matter, the report does not.")
         # Offline reconcile runs AFTER every stage has joined: identity has flushed
         # all observations to the store, and each render stage has finalized its
         # temp clip -- so the whole-gallery view and the re-render source are both
@@ -394,7 +468,8 @@ class LivePipeline:
             self._cleanup_clips()
             return
         try:
-            from identity.reconcile import reconcile_tracklets
+            from identity.reconcile import (reconcile_tracklets,
+                                            resolve_same_camera_thresholds)
             # reuse the file path's render + summary helpers (unchanged).
             from main import render_final_videos, print_run_summary
         except Exception as e:
@@ -413,8 +488,19 @@ class LivePipeline:
                 threshold=threshold,
                 run_id=self.run_id,
                 same_camera_threshold=self._recon_cfg.get("same_camera_threshold", 0.90),
+                # Per-camera same-camera bars (#40). Resolved by reconcile's own
+                # helper so this path and main.py's can never disagree.
+                same_camera_thresholds=resolve_same_camera_thresholds(
+                    self._recon_cfg),
                 require_reciprocal_best=self._recon_cfg.get("require_reciprocal_best", True),
                 min_tracklet_observations=self._recon_cfg.get("min_tracklet_observations", 3),
+                # Pair-scoring mode (#45a). Mode-specific thresholds: changing the
+                # mode without re-deriving the bars above is meaningless.
+                scoring=self._recon_cfg.get("scoring", "prototype"),
+                consensus_top_frac=self._recon_cfg.get("consensus_top_frac", 0.25),
+                max_observations_per_side=self._recon_cfg.get(
+                    "max_observations_per_side", 64),
+                **self._decision_log_kwargs(),
             )
         except Exception as e:
             print(f"[live] reconcile failed ({e}); rendering with unreconciled ids.")
@@ -439,19 +525,56 @@ class LivePipeline:
         finally:
             self._cleanup_clips()
 
+    def _decision_log_kwargs(self):
+        """Build the reconcile decision-log arguments from identity.reconcile.*.
+
+        Guarded and fail-soft: if anything here is misconfigured we reconcile
+        WITHOUT diagnostics rather than losing the run's ids. Diagnostics are worth
+        a lot, but never worth the deliverable.
+        """
+        try:
+            from identity.decision_log import DecisionLog
+            margin_cfg = self._recon_cfg.get("top2_margin") or {}
+            path = self._recon_cfg.get("decision_log")
+            log = None
+            if path:
+                path = str(path).replace("<run_id>", self.run_id)
+                log = DecisionLog(path=path, run_id=self.run_id)
+            return {
+                "decision_log": log,
+                "top2_margin_threshold": margin_cfg.get("threshold"),
+                "top2_margin_basis": margin_cfg.get("basis", "eligible"),
+            }
+        except Exception as e:                                    # noqa: BLE001
+            print(f"[live] decision log disabled ({e}); reconciling without it.")
+            return {}
+
     def _cleanup_clips(self):
-        """Delete the transient processed-frame clips (unless keep_frames)."""
+        """Delete the transient processed-frame clips (unless keep_frames).
+
+        The box-geometry sidecar travels WITH its clip: either both survive or
+        both go. A clip without its geometry cannot be re-rendered, and geometry
+        without its clip has nothing to draw on, so keeping one alone is only a
+        confusing leftover.
+        """
+        pairs = [(p, os.path.splitext(p)[0] + ".annotations.json")
+                 for p in self._clip_paths.values()]
         if self._keep_frames:
-            for p in self._clip_paths.values():
-                if os.path.exists(p):
-                    print(f"[live] keeping processed-frame clip: {p}")
+            for clip, annos in pairs:
+                if os.path.exists(clip):
+                    print(f"[live] keeping processed-frame clip: {clip}"
+                          + (f" (+ {annos})" if os.path.exists(annos) else ""))
+            print("[live] re-render these at other reconcile settings with: "
+                  "python tests/calibration/rerender_from_clips.py "
+                  f"{self.run_id}")
             return
-        for p in self._clip_paths.values():
-            try:
-                if os.path.exists(p):
-                    os.remove(p)
-            except OSError as e:
-                print(f"[live] could not remove {p}: {e}")
+        for clip, annos in pairs:
+            for p in (clip, annos):
+                try:
+                    if os.path.exists(p):
+                        os.remove(p)
+                except OSError as e:
+                    print(f"[live] could not remove {p}: {e}")
 
     # ---- metrics -----------------------------------------------------------
     def _track_peaks(self):

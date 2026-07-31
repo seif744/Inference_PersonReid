@@ -250,6 +250,10 @@ class IdentityEngine:
         # tuning -- see HIST_LABELS. recam = same-camera reacquire, xcam = cross-camera.
         self.recam_hist = [0] * 6
         self.xcam_hist = [0] * 6
+        # Score behind the gid that _match just returned, read by _resolve. It is
+        # a hand-off between two calls in the same stack, NOT state -- _match
+        # clears it on entry so a mint can never inherit a previous match's score.
+        self._last_match_score = None
 
     # ---- public API -------------------------------------------------------
     def assign(self, cam, track_id, embedding, crop_quality, ts, has_fresh_emb):
@@ -258,7 +262,8 @@ class IdentityEngine:
         st = self._tracks.get(key)
         if st is None:
             st = {"gid": self._mint_provisional(), "status": "provisional",
-                  "sum": None, "w": 0.0, "obs": 0, "first_ts": ts, "last_ts": ts}
+                  "sum": None, "w": 0.0, "obs": 0, "first_ts": ts, "last_ts": ts,
+                  "score": None}
             self._tracks[key] = st
         st["last_ts"] = ts
 
@@ -271,10 +276,24 @@ class IdentityEngine:
             return st["gid"]
 
         unit = _unit(embedding)
-        if unit is not None:
-            w = max(bbox_quality_scalar(crop_quality), 0.05)   # floor: never zero
-            st["sum"] = (unit * w) if st["sum"] is None else (st["sum"] + unit * w)
-            st["w"] += w
+        if unit is None:
+            # Degenerate embedding (zero / non-finite): it contributes NO evidence,
+            # so it must not advance the evidence gate either. Counting it used to
+            # let a track cross min_evidence_obs on fewer real observations, which
+            # resolves identity off a thinner aggregate -- and a thin aggregate is
+            # exactly what loses the match and mints a duplicate id.
+            #
+            # An ASSIGNED track still extends its camera span (same as the
+            # no-fresh-evidence branch above): the person IS on screen, and the
+            # co-presence veto depends on that window staying current even when
+            # this particular crop produced nothing usable.
+            if st["status"] == "assigned":
+                self.store.extend_span(st["gid"], cam, ts)
+            return st["gid"]
+
+        w = max(bbox_quality_scalar(crop_quality), 0.05)   # floor: never zero
+        st["sum"] = (unit * w) if st["sum"] is None else (st["sum"] + unit * w)
+        st["w"] += w
         st["obs"] += 1
 
         if st["status"] == "provisional":
@@ -283,6 +302,16 @@ class IdentityEngine:
         else:                                   # assigned -> reinforce, stay sticky
             self._reinforce(cam, st, unit, ts)
         return st["gid"]
+
+    def score_for(self, cam, track_id):
+        """The IDENTITY match score (cosine) behind this track's current reid, or
+        None if it hasn't matched anything yet (still provisional, or freshly
+        minted). Read-only accessor so the overlay can show identity confidence
+        WITHOUT changing assign()'s `-> gid` contract, which reconcile, the
+        offline path and the live tests all depend on.
+        """
+        st = self._tracks.get((cam, track_id))
+        return st.get("score") if st is not None else None
 
     def sweep(self, now):
         """Evict cold identities + stale track state (call periodically)."""
@@ -311,6 +340,9 @@ class IdentityEngine:
             gid = self._mint()
         st["gid"] = gid
         st["status"] = "assigned"
+        # Score behind this resolution, for the overlay. A mint matched nothing,
+        # so _match left it None -- which the label renders as "new", not "0.00".
+        st["score"] = self._last_match_score
         # Open the span back at the track's first observation so the overlap veto
         # covers the whole time it has been on screen, not just from resolve on.
         self.store.add_observation(gid, cam, agg, ts, ts_start=st["first_ts"])
@@ -318,6 +350,14 @@ class IdentityEngine:
     def _reinforce(self, cam, st, unit, ts):
         """An assigned track keeps its id (sticky) but feeds the identity's bank +
         span with fresh evidence so the prototype/medoid stays current."""
+        # Refresh the overlay score FIRST: scoring this crop against the identity
+        # AFTER add_observation would compare the crop to a bank that now contains
+        # it, and store.score()'s medoid term would return ~1.0 every frame. This
+        # is read-only w.r.t. the decision -- the id stays sticky either way.
+        if unit is not None:
+            s = self.store.score(st["gid"], unit)
+            if s is not None:
+                st["score"] = s
         self.store.add_observation(st["gid"], cam, unit, ts)
 
     # ---- matching (two-lane, false-merge-conservative) --------------------
@@ -333,6 +373,7 @@ class IdentityEngine:
         gathering candidates, so an identity on screen NOW via another track (or
         historically overlapping) is never a candidate -- one body can't be two.
         """
+        self._last_match_score = None      # cleared per attempt (see __init__)
         scored = {}
         for gid in self.store.gids():
             if self._gid_coactive(gid, cam, ts, exclude_key):
@@ -359,6 +400,7 @@ class IdentityEngine:
             self.recam_hist[_bin6(scored[best])] += 1
             if scored[best] >= self.same_thr:
                 self.reacquired += 1
+                self._last_match_score = scored[best]
                 return best
             # Failed the strict same-camera bar -> this track will (usually) mint a
             # new id = identity fragmentation. Track how far below we landed so we
@@ -395,6 +437,7 @@ class IdentityEngine:
                 # candidates are pruned before they can compete), so anything reaching
                 # here is physically reachable.
                 self.linked += 1
+                self._last_match_score = best_s
                 return best
 
         return None
@@ -418,19 +461,36 @@ class IdentityEngine:
         return False
 
     def _reciprocal_best_ok(self, gid_star, agg, cam, ts, our_score):
-        """Reciprocal-best guard (ported from service.py::_reciprocal_best_ok):
-        score gid_star's OWN prototype against every other active identity (minus
-        those co-present in this camera) and confirm none is a better partner for
-        it than we are. Stops one track absorbing a look-alike crowd when scores
-        are compressed. Fail-safe: no prototype -> allow."""
-        proto = self.store.prototype(gid_star)
-        if proto is None:
-            return True
+        """Reciprocal-best guard: confirm no other active identity is a better
+        partner for gid_star than we are. Stops one track absorbing a look-alike
+        crowd when scores are compressed. Fail-safe: nothing to compare -> allow.
+
+        BOTH sides must be measured against the SAME reference bank, or the
+        comparison is not a comparison. `our_score` is store.score(gid_star, agg)
+        -- gid_star's bank queried with our aggregate. So the competitors are
+        scored the same way, store.score(gid_star, other_prototype), rather than
+        the other way round (scoring the OTHER identity's bank with gid_star's
+        prototype, which is what this did before). That older form compared two
+        different quantities built from different exemplar sets, and because a
+        prototype averaged over ~20 observations is denoised while our aggregate
+        is a mean of `min_evidence_obs` noisy crops, it was systematically biased
+        AGAINST accepting -- it rejected real links for being new rather than for
+        being wrong.
+
+        A residual bias remains and is unavoidable: our aggregate has genuinely
+        less evidence behind it than an established prototype. That is a reason to
+        watch the xcam rejection counters, not to add a fudge constant here.
+
+        `agg` is unused (kept so the signature mirrors service.py's version).
+        """
         best_other = -1.0
         for gid in self.store.gids():
             if gid == gid_star or self.store.same_camera_overlap(gid, cam, ts):
                 continue
-            s = self.store.score(gid, proto)
+            other_proto = self.store.prototype(gid)
+            if other_proto is None:
+                continue
+            s = self.store.score(gid_star, other_proto)
             if s is not None:
                 best_other = max(best_other, s)
         return our_score >= best_other

@@ -94,13 +94,28 @@ def draw_detections(frame, detections):
 
         # 2) The text label. Prefer the cross-camera REID id, else the legacy
         #    global id, else just the track id ("ID 3  0.87"), else "person".
+        #
+        # The score shown next to a REID id is the IDENTITY match cosine
+        # (det.reid_score), NOT det.confidence. det.confidence answers "is this a
+        # person"; when the question on screen is "is this the SAME person", a
+        # detection score is the wrong number and misleads by looking plausible.
+        #
+        # No score -> print none. Two cases legitimately have no identity score:
+        # a freshly MINTED identity (it matched nothing, so there is nothing to
+        # report -- and "0.00" would read as a terrible match rather than no
+        # comparison), and the offline re-render in main.py::render_final_videos,
+        # whose ids come from tracklet-prototype merges on a different score
+        # scale. getattr because that path passes SimpleNamespace, not Detection.
+        reid_score = getattr(det, "reid_score", None)
+        score_suffix = f" ({reid_score:.2f})" if reid_score is not None else ""
         if provisional:
             # Still deciding who this is -- show a pending marker, not the id.
             label = (f"REID ...  ID{det.track_id}"
                      if det.track_id is not None else "REID ...")
         elif det.reid_id is not None:
-            label = (f"REID {det.reid_id}  ID{det.track_id}"
-                     if det.track_id is not None else f"REID {det.reid_id}")
+            label = (f"REID {det.reid_id}{score_suffix}  ID{det.track_id}"
+                     if det.track_id is not None
+                     else f"REID {det.reid_id}{score_suffix}")
         elif det.global_id is not None:
             label = (f"GID {det.global_id}  ID{det.track_id}"
                      if det.track_id is not None else f"GID {det.global_id}")

@@ -45,6 +45,102 @@ def is_stream_path(path):
     return isinstance(path, str) and "://" in path
 
 
+# ------------------------------------------------------------------ RTSP options
+#
+# Two separate problems, one place (plan #28 / #29).
+#
+# TRANSPORT. Nothing in this project ever set an RTSP transport, so FFmpeg's
+# default applied: UDP, where lost packets are simply gone. A dropped packet in
+# H.265 costs a reference frame, and the smeared frames that follow feed BOTH the
+# detector and the ReID crop -- so a corrupted crop poisons a tracklet prototype,
+# and packet loss is random, which no threshold can explain. TCP retransmits.
+#   Honesty about the evidence: J.4 measured ZERO decode errors across four LIVE
+#   streams, so this is NOT the cause of the identity problems on this network --
+#   the 294/682 and 207/1573 broken references were in recorded files, an artefact
+#   of how those were made. TCP is set because it is the right default on a lossy
+#   or busy network, not because it is a fix for something measured here.
+#
+# TIMEOUT is the one that has bitten. Without a socket timeout `cap.read()` can
+# block INDEFINITELY, and the capture thread cannot re-check stop_event while
+# blocked inside it -- so a single wedged camera makes Ctrl-C unable to stop that
+# thread, and the interrupt that is supposed to reach reconcile never gets there.
+# A timeout turns an indefinite block into a failed read, which the existing
+# reconnect path already handles and which lets the loop see stop_event.
+#
+# Belt and braces, because they act at different layers:
+#   * OPENCV_FFMPEG_CAPTURE_OPTIONS -> FFmpeg's own socket timeout, read at open
+#     time by the FFmpeg backend, so it MUST be set before any VideoCapture is
+#     constructed. Both `timeout` and `stimeout` are sent: FFmpeg renamed the RTSP
+#     option, builds disagree about which they accept, and an unrecognised key is
+#     ignored rather than fatal.
+#   * CAP_PROP_OPEN/READ_TIMEOUT_MSEC -> OpenCV's own guard, passed per capture.
+RTSP_ENV_VAR = "OPENCV_FFMPEG_CAPTURE_OPTIONS"
+
+_STREAM_OPEN_PARAMS = []          # [propId, value, ...] for VideoCapture(...)
+
+
+def apply_rtsp_options(transport="tcp", open_timeout_ms=5000,
+                       read_timeout_ms=5000, ffmpeg_options=None, log=print):
+    """Install RTSP transport + timeouts for every capture opened afterwards.
+
+    Call ONCE at startup, before opening any source. Returns the option string
+    actually installed (or None when disabled) so a run's log records it --
+    transport is exactly the kind of setting that is invisible until it matters.
+
+    An explicit `ffmpeg_options` string overrides the built one verbatim, so an
+    FFmpeg build wanting different keys needs a config edit, not a code change.
+    Set transport to "" / None and the timeouts to 0 to disable entirely and get
+    the old behaviour back.
+    """
+    global _STREAM_OPEN_PARAMS
+
+    params = []
+    for prop, value in ((getattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC", None),
+                         open_timeout_ms),
+                        (getattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC", None),
+                         read_timeout_ms)):
+        if prop is not None and value and float(value) > 0:
+            params += [int(prop), int(float(value))]
+    _STREAM_OPEN_PARAMS = params
+
+    if ffmpeg_options is None:
+        parts = []
+        if transport:
+            parts.append(f"rtsp_transport;{transport}")
+        # FFmpeg wants MICROseconds here, while every other timeout in this
+        # project is in milliseconds. Converting in one place beats a config key
+        # whose unit differs from its neighbours.
+        if read_timeout_ms and float(read_timeout_ms) > 0:
+            micros = int(float(read_timeout_ms) * 1000)
+            parts.append(f"timeout;{micros}")
+            parts.append(f"stimeout;{micros}")
+        ffmpeg_options = "|".join(parts)
+
+    if not ffmpeg_options:
+        log("[video] RTSP transport/timeout options DISABLED by config "
+            "(FFmpeg defaults apply: UDP, no socket timeout -- a wedged camera "
+            "can then block a capture thread past Ctrl-C).")
+        return None
+
+    os.environ[RTSP_ENV_VAR] = ffmpeg_options
+    log(f"[video] RTSP options: {ffmpeg_options}"
+        + (f"  (+ OpenCV open/read timeout {open_timeout_ms}/{read_timeout_ms} ms)"
+           if params else ""))
+    return ffmpeg_options
+
+
+def rtsp_options_from_config(cfg, log=print):
+    """Apply the `source.rtsp` block (all keys optional)."""
+    rtsp_cfg = ((cfg or {}).get("source", {}) or {}).get("rtsp", {}) or {}
+    return apply_rtsp_options(
+        transport=rtsp_cfg.get("transport", "tcp"),
+        open_timeout_ms=rtsp_cfg.get("open_timeout_ms", 5000),
+        read_timeout_ms=rtsp_cfg.get("read_timeout_ms", 5000),
+        ffmpeg_options=rtsp_cfg.get("ffmpeg_options"),
+        log=log,
+    )
+
+
 class VideoSource:
     """
     Wraps an OpenCV video capture for a local FILE or a live STREAM, so the
@@ -103,17 +199,7 @@ class VideoSource:
             )
 
         # This is the line that actually opens & prepares the source for decoding.
-        self.capture = cv2.VideoCapture(self.path)
-
-        # For a live stream, keep OpenCV's internal buffer tiny so a slow
-        # consumer reads the freshest frame instead of a growing backlog. This
-        # is a best-effort hint (not all backends honour it); the drop-stale
-        # grab loop in frames() is the real latency guard.
-        if self.is_stream:
-            try:
-                self.capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            except Exception:
-                pass
+        self.capture = self._new_capture()
 
         # VideoCapture doesn't raise on a bad/corrupt file or an unreachable
         # stream; it just isn't "opened". So we check explicitly and complain.
@@ -128,17 +214,38 @@ class VideoSource:
 
         return self
 
+    def _new_capture(self):
+        """Open one capture with this project's stream settings applied.
+
+        THE ONE place a VideoCapture is constructed. `open()` and `_reopen()` used
+        to each build their own with a copy of the buffer-size hint, so a setting
+        added to one silently did not apply after a reconnect -- which is exactly
+        when a stream setting matters most.
+        """
+        if self.is_stream and _STREAM_OPEN_PARAMS:
+            # The params form is the only way to pass open/read timeouts, and it
+            # requires an explicit backend. FFmpeg is what handles rtsp:// here.
+            cap = cv2.VideoCapture(self.path, cv2.CAP_FFMPEG,
+                                   list(_STREAM_OPEN_PARAMS))
+        else:
+            cap = cv2.VideoCapture(self.path)
+        # For a live stream, keep OpenCV's internal buffer tiny so a slow consumer
+        # reads the freshest frame instead of a growing backlog. Best-effort hint
+        # (not all backends honour it); the drop-stale grab loop in frames() is the
+        # real latency guard.
+        if self.is_stream:
+            try:
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                pass
+        return cap
+
     def _reopen(self):
         """Release and re-open a stream capture (used for reconnect)."""
         if self.capture is not None:
             self.capture.release()
             self.capture = None
-        self.capture = cv2.VideoCapture(self.path)
-        if self.is_stream:
-            try:
-                self.capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            except Exception:
-                pass
+        self.capture = self._new_capture()
         return self.capture.isOpened()
 
     def frames(self):
@@ -219,14 +326,25 @@ class VideoSource:
             ok, frame = self.capture.read()
             return frame if ok else None
 
-        # Grab (decode-and-discard) up to a small cap of queued frames quickly,
-        # then retrieve the most recent. grab() returns False when no frame is
-        # ready; the cap stops us spinning forever on a fast source.
+        # Grab (decode-and-discard) whatever is ALREADY BUFFERED, then retrieve the
+        # most recent. The cap must be a TIME budget, not a frame count: with the
+        # FFmpeg backend grab() BLOCKS waiting for the next frame instead of
+        # returning False when the buffer is empty, so a fixed `for _ in range(5)`
+        # discarded 4 of every 5 frames unconditionally -- a silent 5:1 decimation
+        # of a healthy stream, not the backlog drain it was meant to be.
+        #
+        # Budgeting ~5ms fixes that: draining a real backlog is memcpy-fast and
+        # stays inside the window, while a blocking grab on a live 25fps source
+        # takes ~40ms and so ends the loop after the one frame we actually need.
+        drain_budget = 0.005
         grabbed_any = False
-        for _ in range(5):
+        deadline = time.monotonic() + drain_budget
+        while True:
             if not self.capture.grab():
                 break
             grabbed_any = True
+            if time.monotonic() >= deadline:
+                break        # budget spent -> that grab blocked; nothing buffered
         if not grabbed_any:
             # Nothing buffered was grabbable -- fall back to a blocking read so
             # we still wait for the next frame rather than busy-spin.
