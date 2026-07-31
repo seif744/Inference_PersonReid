@@ -2268,6 +2268,40 @@ So M.3 and the tolerance fix are independent guards that both point the right wa
 label available. That is much stronger than either alone, and it is the first time two
 mechanisms have agreed rather than traded.
 
+#### M.9.27 CONFIRMED — tolerance 2.3 s is surgical
+
+Sweep at cross 0.80, cam_219 0.80, `--covis-tolerance 2.3`: **30 identities, max 8, multi 5,
+xmerges 8, below-ceiling 0, min accepted x 0.818.**
+
+    GID 18: cam_206(107)  cam_213(133)  cam_224(137)     <- gained 213/133, the confirmed link
+    GID 27: cam_213(79,88) cam_219(7,46,113) cam_224(3,68,102)   <- walker, still exactly 8
+    GID 12: cam_206(53,69,118) cam_213(140) cam_224(142)  <- still separate, still intact
+
+`xmerges` 7 → 8. **Exactly one merge was added and it is the operator-confirmed 0.818 link.**
+No cluster grew, nothing fused, no below-ceiling merge appeared. Predicted in M.9.25 and
+reproduced exactly.
+
+#### M.9.28 SHIP CANDIDATE (supersedes M.9.17)
+
+    identity.reconcile.threshold:                        0.63  -> 0.80
+    identity.reconcile.per_camera.cam_219.same_camera_threshold:  (0.90) -> 0.80
+    identity.reconcile.covisibility.default_tolerance_sec:  1.0 -> 2.3
+    identity.reconcile.covisibility.pairs -- all five numeric entries: 1.0 -> 2.3
+    (cam_224 <-> cam_219 stays `covisible`)
+
+Addresses four of the five operator complaints on run 20260731_060425:
+
+| complaint | status |
+|---|---|
+| cam_219 reid 1 → 11 → 1 | **fixed** (M.9.6, verified on video) |
+| cam_206 man wearing the walker's reid | **fixed** (cross 0.80, M.9.16) |
+| reid 10 = two different people | **fixed** (cross 0.80, M.9.16) |
+| reid 18 / reid 24 split | **fixed** (tolerance 2.3, M.9.27) |
+| cam_219/6 ↔ cam_224/30 split | **NOT fixed** — 0.688 on 3 bad-angle crops (M.9.18/M.9.24) |
+
+Still open and independent of the above: cam_206's own split (206/12 vs 206/26,43), for which
+`same_camera_rounds` is the candidate and is now finally deployable (M.9.21 resolved).
+
 #### M.9.8 Revised order
 
 1. **Watch the re-render.** `cmp_cam_219_*.mp4` at 8-14 s and 58-75 s, against
