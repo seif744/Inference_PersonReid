@@ -1753,18 +1753,93 @@ under each mode. `explain_merge_failure.py` now prints exactly that, for every s
 camera, under all three modes. **Re-run it before M.5 is touched.** If consensus moves 0.830
 down, M.5 is off the table and the answer is M.3 plus a calibrated cam_219 bar.
 
-#### M.9.5 Revised order
+#### M.9.5 MEASURED — M.5 (scoring mode) is DEAD, and prototype is the best of the three
 
-1. **M.3** — judge the shared-camera claim per camera on the fragments (0.830 vs cam_219's
-   bar, not 0.873 vs the strictest bar of four cameras). Structural, no threshold moves.
-2. **Calibrate cam_219's bar**, the only one never measured, against the now-known fact that
-   one person's own pose variation there reaches 0.830. This is measurement, not tuning:
-   0.90 was a placeholder.
-3. **M.4.1** — cross 0.70, reconfirmed above.
+Fragment-level, run `20260731_060425`, all three modes:
+
+| camera | fragment pair | prototype | max_exemplar | consensus | bar | truth |
+|---|---|---|---|---|---|---|
+| cam_219 | 219/7 ↔ 219/46 | **0.830** | 0.830 | **0.681** | 0.90 | **same person** |
+| cam_224 | 224/30 ↔ 224/102 | 0.773 | 0.842 **PASS** | 0.766 | 0.80 | different |
+| cam_213 | 213/51 ↔ 213/88 | 0.675 | 0.675 | 0.568 | 0.80 | different |
+| cam_206 | 206/12 ↔ 206/48 | 0.616 | 0.616 | 0.594 | 0.90 | different |
+
+Consensus moves the one true-positive pair **down** 0.830 → 0.681, and it compresses
+separation rather than widening it:
+
+- prototype: same-person 0.830 vs best different-person 0.675 → **margin 0.155**
+- consensus: same-person 0.681 vs best different-person 0.594 → **margin 0.087**
+
+**Prototype separates this footage better than consensus does.** The synthetic fixture that
+motivated #45a predicted the opposite; it does not survive contact with the real data. And
+max_exemplar does exactly what it was warned about — it is the only mode that passes a
+different-person pair (224/30 ↔ 224/102 at 0.842, on one lucky crop pair).
+
+Item #45a is closed: **keep `scoring: prototype`.** Delete M.5 from the plan.
+
+#### M.9.6 MEASURED — one bar fixes it, and it cascades
+
+Sweep with cam_219's bar lowered (identical output at 0.85 and 0.80):
+
+| same-camera bars | cross | ids | max | multi | below ceiling |
+|---|---|---|---|---|---|
+| 213=.80, 224=.80 (shipped) | 0.63 | 25 | 7 | 7 | **1** |
+| 213=.80, 224=.80 | 0.70 | 27 | 6 | 7 | 0 |
+| **213=.80, 219=.85, 224=.80** | **0.63** | 25 | 9 | **8** | **0** |
+| 213=.80, 219=.85, 224=.80 | 0.70 | 27 | 9 | 7 | 0 |
+
+At cam_219=0.85 the operator's person assembles correctly as a **9-tracklet identity**:
+
+    GID 1: cam_206(12) cam_213(79,88) cam_219(7,46,113) cam_224(3,68,102)
+
+which reads as one continuous walk: cam_206 (0-6.7 s) → cam_219 (8.4-13.8) → cam_224
+(11.4-27.3) / cam_219 (18.2-37.5) → cam_224 (31.4-40.2) → cam_213 (41.4-51.5) → cam_224
+(53.9-70.2) / cam_219 (58.3-74.7).
+
+**And the poisoning dissolves on its own.** 213/51 leaves for GID 7, 224/30 leaves for
+GID 3, and the 0.649 sub-ceiling merge stops happening — so `below ceiling` reaches 0 **at
+the shipped cross bar of 0.63**. Fixing the origin removed the need for M.4.1. Cross-camera
+identities go 7 → **8**, the highest of any row swept. This is the only setting measured so
+far that improves every column at once.
+
+**Caveat that must not be skipped: this is one subject in one 80-second run.** Decision D9
+language applies — a hypothesis from one run, not a calibration.
+
+#### M.9.7 The fix is ORDER-DEPENDENT, which is what M.3 is for
+
+0.85 and 0.80 produce byte-identical clusters, which is suspicious, and the reason matters:
+**Phase 1 never merges 219/7 ↔ 219/46 at either bar.** With
+`same_camera_reciprocal_best: true`, each fragment must be the *other's* best above-bar
+partner, and 219/7's best partner is 219/113 at **0.969** — the same pose. So the pair is
+refused by mutual-best regardless of the bar, and the union happens in **Phase 2, at cluster
+level**, on a mean-of-means score that lands somewhere in [0.85, 0.90).
+
+So the 0.830 fragment score — the actual evidence that these are one person — never enters
+the decision at all. The bar change works by admitting a *cluster mean*, in an order-
+dependent phase. It is right on this run and it is contingent.
+
+That is precisely the case for **M.3**: judge the shared-camera claim on the best fragment
+pair within each shared camera (0.830 against cam_219's bar) instead of on a cluster mean
+against the strictest bar of four cameras. With M.3, cam_219 at 0.80 admits this merge on
+the evidence that actually supports it. `explain_merge_failure.py` now reports which phase
+united a pair and names the mutual-best partner that blocked Phase 1, so this is checkable
+on any future run.
+
+#### M.9.8 Revised order
+
+1. **Watch the re-render.** `cmp_cam_219_*.mp4` at 8-14 s and 58-75 s, against
+   `output_cam_219.mp4` from the run. Nothing ships before this; it is the only ground truth.
+2. **cam_219 same-camera bar 0.90 → 0.85** (M.9.6). One line, at the shipped cross bar,
+   improving every measured column. Prefer 0.85 over 0.80: identical output, less permissive.
+3. **M.3** — judge the shared-camera claim per camera on the fragment pair (M.9.7). Turns
+   step 2 from an order-dependent cluster-mean accident into a decision resting on the 0.830
+   that actually supports it. Ship behind a flag, default off, measure, then enable.
 4. **M.4.2** — cohesion floor, so a 3-observation scrap cannot join on a 0.760 link and then
-   veto for the cluster.
-5. **M.5** — only if M.9.4's re-run supports it.
-6. **M.2** — opportunistic; no longer on the critical path.
+   veto for the cluster. Independent of the above and still worth having.
+5. ~~**M.4.1** cross 0.70~~ — **no longer needed.** Step 2 takes `below ceiling` to 0 at
+   0.63, and 0.70 costs a cross-camera identity (8 → 7). Leave the cross bar alone.
+6. ~~**M.5** scoring mode~~ — **closed, measured dead** (M.9.5). Keep `prototype`.
+7. **M.2** — opportunistic; no longer on the critical path.
 
 ---
 

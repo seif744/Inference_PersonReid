@@ -123,6 +123,120 @@ def describe_pair(a, b, tracklets, covis_enabled, covis_pairs, sample_tol):
     return None, f"cross-cam, overlap {secs:.1f}s <= tolerance {tol:.1f}s"
 
 
+def _mentions(line, key):
+    """True when a reconcile merge-log line names this tracklet."""
+    return f"({key[0]!r}, {key[1]})" in line
+
+
+def report_already_merged(a, b, gid, tracklets, kw, lines):
+    """They ARE one identity at these settings -- so report BY WHICH MERGE.
+
+    This is the mode that validates a candidate fix, and the distinction it draws
+    is the one that decides whether a fix will generalise:
+
+      PHASE 1 united them  -> the two fragments cleared their own camera's bar on
+                              their own pairwise evidence. Order-independent, so it
+                              will behave the same on other footage.
+      PHASE 2 united them  -> they arrived in one identity through a CLUSTER-level
+                              score, after other merges had reshaped both sides.
+                              Phase 2 re-scores per round and merges in score
+                              order, so this outcome depends on what merged first.
+                              It can be right and still be luck.
+
+    A bar set at or below the fragment score converts the second case into the
+    first, which is why the number matters and not just the outcome.
+    """
+    header("ALREADY ONE IDENTITY -- by which merge, and how robustly")
+    per_cam = kw["same_camera_thresholds"] or {}
+    cap = kw["max_observations_per_side"]
+    proto_a = R._prototype(tracklets[a]["vectors"])
+    proto_b = R._prototype(tracklets[b]["vectors"])
+    rows_a = R._subsample_rows(R._unit_rows(tracklets[a]["vectors"]), cap)
+    rows_b = R._subsample_rows(R._unit_rows(tracklets[b]["vectors"]), cap)
+    score = R.score_observation_sets(rows_a, rows_b, proto_a, proto_b,
+                                     mode=kw["scoring"],
+                                     top_frac=kw["consensus_top_frac"], cap=cap)
+    same_cam = a[0] == b[0]
+    bar = (per_cam.get(a[0], kw["same_camera_threshold"]) if same_cam
+           else kw["threshold"])
+    print(f"  both {_fmt_key(a)} and {_fmt_key(b)} are reid {gid} here.")
+    print(f"  fragment score = {score:.3f} ({kw['scoring']})   "
+          f"applicable bar = {bar:.2f} "
+          f"({'same-camera, ' + a[0] if same_cam else 'cross-camera'})")
+
+    direct = [ln.strip() for ln in lines
+              if _mentions(ln, a) and _mentions(ln, b) and "merge" in ln]
+    if direct:
+        print("\n  A merge line names BOTH fragments:")
+        for ln in direct:
+            print(f"    {ln}")
+        if any("cluster merge" not in ln for ln in direct):
+            print("\n  ROBUST. Phase 1 merged the two fragments directly, on their "
+                  "own pairwise\n  evidence, before any cluster existed. That does "
+                  "not depend on merge order.")
+        else:
+            print("\n  PHASE 2, not Phase 1: both fragments are named, but as "
+                  "CLUSTER representatives.\n  The score that admitted it is a "
+                  "cluster mean, and Phase 2 merges in score order,\n  so this "
+                  "outcome is contingent on what merged before it.")
+        return
+    print("\n  NO merge line names both fragments, so they were united by a Phase 2 "
+          "CLUSTER\n  union (Phase 2 logs cluster representatives, not members).")
+    if same_cam and score < bar:
+        print(f"  And Phase 1 CANNOT have done it: {score:.3f} < {bar:.2f}.")
+    elif same_cam and kw["same_camera_reciprocal_best"]:
+        # Phase 1 was ELIGIBLE and still did not fire. With mutual-best on, each
+        # fragment must be the OTHER's single best above-bar partner -- and a person
+        # with three fragments in one camera has two that look more like each other
+        # than either looks like the third. Naming that partner is the whole
+        # explanation, so compute it rather than leaving the reader to guess.
+        best = {}
+        for k in (a, b):
+            cands = []
+            for other in tracklets:
+                if other == k or other[0] != k[0]:
+                    continue
+                if not R._spans_disjoint(tracklets[k]["span"],
+                                         tracklets[other]["span"]):
+                    continue
+                p = R._prototype(tracklets[other]["vectors"])
+                if p is None:
+                    continue
+                r = R._subsample_rows(R._unit_rows(tracklets[other]["vectors"]), cap)
+                s = R.score_observation_sets(
+                    R._subsample_rows(R._unit_rows(tracklets[k]["vectors"]), cap), r,
+                    R._prototype(tracklets[k]["vectors"]), p, mode=kw["scoring"],
+                    top_frac=kw["consensus_top_frac"], cap=cap)
+                if s >= bar:
+                    cands.append((s, other))
+            best[k] = max(cands) if cands else None
+        print(f"  Phase 1 was ELIGIBLE ({score:.3f} >= {bar:.2f}) and still did not "
+              f"fire, because\n  same_camera_reciprocal_best requires each to be the "
+              f"OTHER's best above-bar partner:")
+        for k in (a, b):
+            if best[k] is None:
+                print(f"    {_fmt_key(k)}: no above-bar partner")
+            else:
+                s, other = best[k]
+                print(f"    {_fmt_key(k)}'s best partner is {_fmt_key(other)} "
+                      f"at {s:.3f}"
+                      + ("  <-- not the other fragment"
+                         if other != (b if k == a else a) else ""))
+        print("\n  So lowering this camera's bar alone can NEVER make Phase 1 merge "
+              "these two.\n  Whatever united them did so at CLUSTER level in Phase 2.")
+    if same_cam:
+        print("\n  ORDER-DEPENDENT either way. The right answer arrived through "
+              "cluster-level\n  scoring after other merges had reshaped both sides -- "
+              "correct here, but\n  contingent on what merged first, and the number "
+              "that admitted it is a mean of\n  cluster means, not the "
+              f"{score:.3f} these two fragments actually score.\n  That is the case "
+              "for M.3: judge the shared-camera claim on the fragment pair.")
+    print("\n  merge lines mentioning either fragment:")
+    for ln in lines:
+        if _mentions(ln, a) or _mentions(ln, b):
+            print(f"    {ln.strip()}")
+
+
 def main():
     if len(sys.argv) < 2 or sys.argv[1].startswith("--"):
         raise SystemExit(__doc__.strip().split("\n\n")[1])
@@ -175,9 +289,10 @@ def main():
         print(f"  {_fmt_key(wanted[0])} -> reid {gid_a};  "
               f"{_fmt_key(wanted[1])} -> reid {gid_b}")
         if gid_a == gid_b:
-            raise SystemExit(f"[explain] those two tracklets are ALREADY one "
-                             f"identity (reid {gid_a}) at these settings -- "
-                             f"nothing refused them.")
+            # Not an error -- this is how a candidate fix is validated. Report WHICH
+            # merge united them and whether that merge was order-dependent.
+            report_already_merged(wanted[0], wanted[1], gid_a, tracklets, kw, lines)
+            return
     else:
         if len(sys.argv) < 4:
             raise SystemExit("[explain] give two reid ids, e.g. "
