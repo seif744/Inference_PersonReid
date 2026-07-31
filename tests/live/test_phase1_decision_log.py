@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.join(ROOT, "src"))
 os.environ.pop("QDRANT_URL", None)
 os.environ.pop("QDRANT_API_KEY", None)
 
-from database.store import PersonVectorStore
+from database.store import EMBEDDING_DIM as DIM, PersonVectorStore
 from identity import decision_log as dlog
 from identity.decision_log import DecisionLog, verify_summary_matches_vector
 from identity.reconcile import reconcile_tracklets
@@ -50,9 +50,17 @@ def build_store(td, people, jitter=0.02, seed=0):
     st = PersonVectorStore(path=os.path.join(td, "q"), url=None)
     for cam, tid, base_ix, nobs, f0 in people:
         if base_ix not in bases:
-            bases[base_ix] = _unit(rng.normal(size=512))
+            bases[base_ix] = _unit(rng.normal(size=DIM))
         for i in range(nobs):
-            v = _unit(bases[base_ix] + jitter * rng.normal(size=512))
+            # jitter is a RELATIVE noise magnitude, so it must be divided by
+            # sqrt(DIM): rng.normal(size=DIM) has norm ~sqrt(DIM), so without the
+            # scaling the perturbation grows with the embedding width and swamps
+            # a unit base vector. At 512-d the unscaled version happened to leave
+            # same-person cosine ~0.91; at 2048-d it fell to ~0.74 and the
+            # cross-camera merge this test asserts stopped happening. Same lesson
+            # _synth.observe() already documents -- see its docstring.
+            v = _unit(bases[base_ix]
+                      + (jitter / np.sqrt(DIM)) * rng.normal(size=DIM))
             st.add_many([v], [{"camera": cam, "track_id": tid,
                                "frame": f0 + i * 10, "run_id": "R"}])
     return st

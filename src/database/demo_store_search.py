@@ -47,7 +47,10 @@ HOLD_OUT = 3   # crops per identity reserved as queries (the rest are stored)
 
 
 def main():
-    extractor = ReIDExtractor(weights=WEIGHTS)
+    # Uses the model config.yaml ships (reid.model / reid.weights). This used to
+    # hardcode a weights/osnet_x1_0_market1501.pth that is not in this tree, so it
+    # had been broken regardless of any backbone change.
+    extractor = ReIDExtractor.from_config()
     store = PersonVectorStore(path=QDRANT_PATH)
     store.reset()                       # clean slate for a repeatable demo
     print(f"store ready at {QDRANT_PATH} (count={store.count()})\n")

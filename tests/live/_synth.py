@@ -22,7 +22,14 @@ _SRC = os.path.abspath(os.path.join(_HERE, "..", "..", "src"))
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
-DIM = 512
+# Track the STORE's vector size rather than hardcoding it. These synthetic vectors
+# go into a real PersonVectorStore, whose dimension guard rejects any other width --
+# and when it was hardcoded at 512, the FastReID switch (2048-d) made the store
+# refuse every insert. Two tests then failed in confusing ways (an IndexError on an
+# empty scroll) instead of saying "wrong dimension", because IdentityStage swallows
+# the store's ValueError. Importing the constant means the width can never drift
+# again; verify_embedding_contract.py separately asserts it matches the live model.
+from database.store import EMBEDDING_DIM as DIM  # noqa: E402
 
 
 def person(seed, dim=DIM):

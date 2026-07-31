@@ -15,14 +15,24 @@ Deliberately CPU-safe and needs no footage.
 
 import sys
 
-from _common import bootstrap, REID_WEIGHTS, header
+from _common import bootstrap, reid_weights, reid_model, header
 
 bootstrap()
 
 import numpy as np
 import torch
 
-from reid.extractor import ReIDExtractor, EMBEDDING_DIM, INPUT_SIZE
+from reid.extractor import ReIDExtractor
+
+# Whichever backbone config.yaml selects (CALIB_REID_MODEL / CALIB_REID_WEIGHTS
+# override). The contract asserted below is backend-INDEPENDENT on purpose --
+# it is the set of invariants ReIDExtractor owns for every model, so a newly
+# added backend is checked by running this script against it, unchanged.
+REID_WEIGHTS = reid_weights()
+REID_MODEL = reid_model()
+# What config.yaml actually ships, ignoring any env override -- used to decide
+# whether the store-dimension check applies to this run.
+_CONFIGURED_MODEL = reid_model(ignore_env=True)
 
 FAILURES = []
 
@@ -39,32 +49,50 @@ def check(name, fn):
         FAILURES.append(name)
 
 
-header("1. CHECKPOINT LOAD -- is any real layer left at random init?")
+header(f"1. CHECKPOINT LOAD ({REID_MODEL}) -- is any real layer at random init?")
 
-import torchreid
+# This section is the one backbone-SPECIFIC check here: it re-derives the load
+# independently of src/reid/backends.py so a bug in that loader cannot hide
+# itself. It therefore knows how the torchreid OSNet family is built; for a
+# non-OSNet backend it is skipped and the backend's own load-time guard is what
+# stands (backends.py raises on any unexpected dropped key).
+from reid.backends import OSNetBackend
 
-raw = torch.load(REID_WEIGHTS, map_location="cpu", weights_only=False)
-state = raw["state_dict"] if "state_dict" in raw else raw
-state = {k.replace("module.", "", 1): v for k, v in state.items()}
-ref = torchreid.models.build_model(name="osnet_ain_x1_0", num_classes=1000,
-                                   loss="softmax", pretrained=False)
-ref_sd = ref.state_dict()
-loaded = {k: v for k, v in state.items()
-          if k in ref_sd and ref_sd[k].shape == v.shape}
-unloaded = [k for k in ref_sd if k not in loaded
-            if "num_batches_tracked" not in k]
-dropped = [k for k in state if k not in loaded]
+if REID_MODEL in OSNetBackend.ARCHS:
+    import torchreid
 
-print(f"  checkpoint keys {len(state)} | model keys {len(ref_sd)} | loaded {len(loaded)}")
-check("only the discarded classifier head is unloaded",
-      lambda: (_ for _ in ()).throw(AssertionError(f"unloaded={unloaded}"))
-      if unloaded != ["classifier.weight", "classifier.bias"]
-      else f"unloaded={unloaded}")
-check("only the classifier head is dropped from the checkpoint",
-      lambda: (_ for _ in ()).throw(AssertionError(f"dropped={dropped}"))
-      if dropped != ["classifier.weight", "classifier.bias"] else None)
+    raw = torch.load(REID_WEIGHTS, map_location="cpu", weights_only=False)
+    state = raw["state_dict"] if "state_dict" in raw else raw
+    state = {k.replace("module.", "", 1): v for k, v in state.items()}
+    ref = torchreid.models.build_model(name=REID_MODEL, num_classes=1000,
+                                       loss="softmax", pretrained=False)
+    ref_sd = ref.state_dict()
+    loaded = {k: v for k, v in state.items()
+              if k in ref_sd and ref_sd[k].shape == v.shape}
+    unloaded = [k for k in ref_sd if k not in loaded
+                if "num_batches_tracked" not in k]
+    dropped = [k for k in state if k not in loaded]
 
-ex = ReIDExtractor(weights=REID_WEIGHTS, device="cpu")
+    print(f"  checkpoint keys {len(state)} | model keys {len(ref_sd)} | loaded {len(loaded)}")
+    check("only the discarded classifier head is unloaded",
+          lambda: (_ for _ in ()).throw(AssertionError(f"unloaded={unloaded}"))
+          if unloaded != ["classifier.weight", "classifier.bias"]
+          else f"unloaded={unloaded}")
+    check("only the classifier head is dropped from the checkpoint",
+          lambda: (_ for _ in ()).throw(AssertionError(f"dropped={dropped}"))
+          if dropped != ["classifier.weight", "classifier.bias"] else None)
+else:
+    print(f"  [SKIP] independent key check knows only the OSNet family; "
+          f"'{REID_MODEL}' relies on its own backend load guard.")
+
+ex = ReIDExtractor(weights=REID_WEIGHTS, model=REID_MODEL, device="cpu")
+
+# The authoritative width/size for THIS run: measured from the loaded model, not
+# imported as a constant. A backend whose real output width disagrees with what
+# the Qdrant collection is sized to is exactly the failure this replaces.
+EMBEDDING_DIM = ex.embedding_dim
+INPUT_SIZE = ex.input_size
+print(f"  loaded: {ex.describe()}")
 
 
 header("2. OUTPUT CONTRACT")
@@ -84,20 +112,50 @@ def _shape_and_norm():
     norms = np.linalg.norm(d, axis=1)
     assert np.allclose(norms, 1.0, atol=1e-5), f"not unit-normalised: {norms}"
     return f"shape={d.shape} norms~1.0"
-check("512-d float32 output, L2-normalised", _shape_and_norm)
+check(f"{EMBEDDING_DIM}-d float32 output, L2-normalised", _shape_and_norm)
 
 
 def _empty_batch():
     out = ex.extract_batch([])
     assert out.shape == (0, EMBEDDING_DIM), f"got {out.shape}"
-    return "returns (0, 512)"
+    return f"returns (0, {EMBEDDING_DIM})"
 check("empty batch is well-shaped", _empty_batch)
 
 
 def _input_size():
-    assert INPUT_SIZE == (256, 128), f"INPUT_SIZE changed to {INPUT_SIZE}"
-    return "INPUT_SIZE=(256,128) H,W -> cv2.resize gets (128,256) W,H"
-check("OSNet input size pinned", _input_size)
+    h, w = INPUT_SIZE
+    assert h > w, (f"input_size {INPUT_SIZE} is not (H, W) with H > W -- person "
+                   f"crops are tall and narrow, so a square/landscape shape here "
+                   f"usually means the tuple got transposed")
+    # Prove the resize is actually applied: a crop of a DIFFERENT shape must still
+    # preprocess to exactly the model's input size. A dropped or transposed resize
+    # produces no error, only worse matching.
+    got = tuple(ex._preprocess(np.zeros((h + 61, w + 17, 3), np.uint8)).shape)
+    assert got == (3, h, w), f"preprocess gave {got}, expected (3, {h}, {w})"
+    return f"input_size={INPUT_SIZE} (H,W); preprocess -> {got}"
+check("input size pinned and the resize is applied", _input_size)
+
+
+def _store_dim_agrees():
+    """Cross-layer guard: database/store.py keeps its own EMBEDDING_DIM so the
+    storage layer does not import the model layer. A disagreement is legitimate
+    ONLY while a backbone swap is mid-flight -- and it means the Qdrant
+    collection must be rebuilt, so it should never pass unnoticed.
+
+    Only meaningful for the SHIPPING model. A comparison run measuring some other
+    backbone (CALIB_REID_MODEL=...) is expected to differ, and failing there would
+    make an A/B look like a regression."""
+    from database.store import EMBEDDING_DIM as STORE_DIM
+    if REID_MODEL != _CONFIGURED_MODEL:
+        return (f"skipped -- measuring {REID_MODEL}, not the configured "
+                f"{_CONFIGURED_MODEL}; store is sized for the latter")
+    assert STORE_DIM == EMBEDDING_DIM, (
+        f"store.py defaults to {STORE_DIM}-d but {REID_MODEL} emits "
+        f"{EMBEDDING_DIM}-d. The pipeline passes the measured width explicitly so "
+        f"a fresh collection is correct, but any EXISTING collection is stale: "
+        f"rebuild it, and update store.py's constant.")
+    return f"both {EMBEDDING_DIM}"
+check("database/store.py's dimension constant matches this model", _store_dim_agrees)
 
 
 header("3. DETERMINISM, BATCH ORDER, BATCH INVARIANCE")
@@ -166,7 +224,7 @@ for label, crop in (("1x1 px", np.full((1, 1, 3), 128, np.uint8)),
         v = ex.extract(c)
         assert np.isfinite(v).all(), "non-finite values"
         assert abs(np.linalg.norm(v) - 1.0) < 1e-4, "not unit norm"
-        return f"norm=1.0 finite, {int((v != 0).sum())}/512 nonzero"
+        return f"norm=1.0 finite, {int((v != 0).sum())}/{EMBEDDING_DIM} nonzero"
     check(f"{label} embeds without NaN", _finite)
 
 

@@ -870,9 +870,14 @@ def main():
             # re-scales every threshold, so it is recorded in the run banner below.
             tap=reid_cfg.get("tap", "post_relu"),
             max_batch=int(reid_cfg.get("max_batch", 32)),
+            # Which backbone. Recorded in the banner for the same reason as the
+            # tap: it defines the feature space every threshold refers to.
+            model=reid_cfg.get("model"),
         )
+        print(f"[main] ReID model: {extractor.describe()}")
         print(f"[main] ReID tap: {reid_cfg.get('tap', 'post_relu')} "
-              f"-- thresholds are tap-specific; never compare score logs across taps.")
+              f"-- thresholds are model- and tap-specific; never compare score "
+              f"logs across either.")
         for name, _ in sources:
             embedders[name] = TrackEmbedder(
                 extractor,
@@ -892,7 +897,14 @@ def main():
         url = os.environ.get("QDRANT_URL") or store_cfg.get("url") or None
         api_key = os.environ.get("QDRANT_API_KEY") or None
         path = store_cfg.get("path", "qdrant_data")
-        store = PersonVectorStore(path=path, url=url, api_key=api_key)
+        # Size the collection from the MODEL THAT IS ACTUALLY LOADED rather than
+        # from a constant, so swapping `reid.model` for a different-width
+        # backbone cannot create (or silently reuse) a mis-sized collection --
+        # the store's dimension guard then reports the mismatch at startup
+        # instead of on the first insert.
+        store = PersonVectorStore(
+            path=path, url=url, api_key=api_key,
+            **({"dim": extractor.embedding_dim} if extractor is not None else {}))
         backend = url if url else f"LOCAL '{path}'"
         print(f"[main] Vector store ready at {backend} "
               f"(existing points: {store.count()}).")

@@ -39,7 +39,10 @@ FRAME_STRIDE = 20                     # skip frames so we don't sample near-dupl
 
 def main():
     detector = PersonDetector(model_path="../yolo11n.pt")
-    extractor = ReIDExtractor(weights="reid/weights/osnet_x1_0_market1501.pth")
+    # Uses the model config.yaml ships (reid.model / reid.weights). This used to
+    # hardcode a weights/osnet_x1_0_market1501.pth that is not in this tree, so it
+    # had been broken regardless of any backbone change.
+    extractor = ReIDExtractor.from_config()
 
     cap = cv2.VideoCapture(VIDEO)
     if not cap.isOpened():

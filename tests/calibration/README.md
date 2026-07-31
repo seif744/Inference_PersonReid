@@ -9,6 +9,7 @@ Run everything from the repo root:
 ```bash
 python tests/calibration/verify_embedding_contract.py
 python tests/calibration/measure_score_separation.py     register_file.avi 90 6
+python tests/calibration/compare_backbones.py          register_file.avi 60 6
 python tests/calibration/measure_reconcile_thresholds.py register_file.avi 90 4
 python tests/calibration/measure_detection.py            register_file.avi 50
 python tests/calibration/compare_detector_models.py      register_file.avi 150
@@ -32,6 +33,7 @@ directory with a distinct camera name and a local Qdrant, so it cannot overwrite
 |---|---|---|---|
 | `verify_embedding_contract.py` | **yes**, exits non-zero | Part D | after any change to `reid/extractor.py` or `reid/service.py` |
 | `measure_score_separation.py` | no | H.1, H.2, H.3, H.5 | footage, ReID weights, or feature tap changes |
+| `compare_backbones.py` | no | — | before changing `reid.model`; ranks backbones with threshold-FREE metrics (AUC, R@1) because a cosine bar means nothing across feature spaces. Refuses to name a winner when the footage saturates |
 | `measure_reconcile_thresholds.py` | no | H.4 | before touching any `identity.reconcile.*` threshold |
 | `measure_detection.py` | no | H.6, H.7 | before proposing any detector-side change |
 | `compare_detector_models.py` | no | H.11 | before changing `detector.model`; answers recall AND whether extra boxes become sustained tracks |

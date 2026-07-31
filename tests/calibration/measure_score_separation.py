@@ -24,7 +24,8 @@ import sys
 import numpy as np
 import torch
 
-from _common import (bootstrap, pick_video, sample_frames, REID_WEIGHTS,
+from _common import (bootstrap, pick_video, sample_frames, reid_weights,
+                     reid_model,
                      DETECT_WEIGHTS, collect_track_embeddings,
                      proven_distinct_pairs, unit, describe, header, margin,
                      print_operating_points, footnote_sample_size)
@@ -40,7 +41,14 @@ NFRAMES = int(sys.argv[2]) if len(sys.argv) > 2 else 60
 STRIDE = int(sys.argv[3]) if len(sys.argv) > 3 else 6
 BANK = 20                     # mirrors live.identity.bank_size / identity.bank_size
 
-ex = ReIDExtractor(weights=REID_WEIGHTS, device="cpu")
+# The BACKBONE comes from config (CALIB_REID_MODEL / CALIB_REID_WEIGHTS override),
+# so an A/B between checkpoints is two runs of this script and no code edit.
+# The TAP deliberately does NOT: this script's whole subject is comparing the two
+# taps, and the equivalence assertion below requires `ex` to be the shipped
+# post-ReLU path. It also reaches into OSNet's own fc block, so it only applies
+# to the torchreid OSNet family.
+ex = ReIDExtractor(weights=reid_weights(), model=reid_model(), device="cpu")
+print(f"[calib] ReID: {ex.describe()}")
 model = ex.model
 
 

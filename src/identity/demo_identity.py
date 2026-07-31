@@ -90,7 +90,10 @@ def evaluate(identities, threshold):
 
 
 def main():
-    extractor = ReIDExtractor(weights=WEIGHTS)
+    # Uses the model config.yaml ships (reid.model / reid.weights). This used to
+    # hardcode a weights/osnet_x1_0_market1501.pth that is not in this tree, so it
+    # had been broken regardless of any backbone change.
+    extractor = ReIDExtractor.from_config()
     identities = load_identities(extractor)
     n_people = len(identities)
     print(f"{n_people} real people. PERFECT result = {n_people} global_ids, "

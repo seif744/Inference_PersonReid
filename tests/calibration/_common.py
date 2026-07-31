@@ -43,20 +43,50 @@ def bootstrap() -> str:
 REID_WEIGHTS = "src/reid/weights/osnet_ain_x1_0.pth"
 
 
-def reid_tap() -> str:
-    """The feature tap the pipeline would use (#39), overridable for comparisons
-    with CALIB_REID_TAP. Read from config for the same reason DETECT_WEIGHTS is:
-    a tap change must not leave the harness measuring the old feature space."""
-    override = os.environ.get("CALIB_REID_TAP")
-    if override:
+def _reid_cfg_value(key: str, env: str, default, ignore_env: bool = False):
+    """One `reid.*` key as the pipeline would resolve it, with an env override.
+
+    Read from config.yaml rather than hardcoded for the same reason
+    detect_weights() is: a model or tap swap must not leave the harness silently
+    measuring the OLD feature space and reporting it as shipped behaviour. The
+    env override is how a comparison run measures more than one -- e.g.
+        CALIB_REID_MODEL=osnet_ibn_x1_0 \
+        CALIB_REID_WEIGHTS=src/reid/weights/osnet_ibn_x1_0.pth \
+          python tests/calibration/measure_score_separation.py register_file.avi 90 6
+    """
+    override = os.environ.get(env)
+    if override and not ignore_env:
         return override
     try:
         import yaml
         with open(os.path.join(project_root(), "config.yaml")) as f:
             cfg = yaml.safe_load(f) or {}
-        return (cfg.get("reid") or {}).get("tap") or "post_relu"
+        return (cfg.get("reid") or {}).get(key) or default
     except Exception:                                          # noqa: BLE001
-        return "post_relu"
+        return default
+
+
+def reid_tap() -> str:
+    """The feature tap the pipeline would use (#39). CALIB_REID_TAP overrides."""
+    return _reid_cfg_value("tap", "CALIB_REID_TAP", "post_relu")
+
+
+def reid_model(ignore_env: bool = False) -> str:
+    """The BACKBONE the pipeline would load (`reid.model`, src/reid/backends.py).
+    CALIB_REID_MODEL overrides -- pair it with CALIB_REID_WEIGHTS.
+
+    ignore_env=True returns what config.yaml SHIPS regardless of the override,
+    which is how a comparison run can tell "the model I am measuring" from "the
+    model the store and thresholds are calibrated for"."""
+    return _reid_cfg_value("model", "CALIB_REID_MODEL", "osnet_ain_x1_0",
+                           ignore_env=ignore_env)
+
+
+def reid_weights() -> str:
+    """The checkpoint the pipeline would load. CALIB_REID_WEIGHTS overrides."""
+    return _reid_cfg_value("weights", "CALIB_REID_WEIGHTS", REID_WEIGHTS)
+
+
 POSE_WEIGHTS = "yolo11n-pose.pt"
 
 

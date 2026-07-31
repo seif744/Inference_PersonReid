@@ -24,6 +24,7 @@ import sys
 import threading
 import time
 from datetime import datetime
+from typing import Optional
 
 import numpy as np
 
@@ -164,11 +165,15 @@ class LivePipeline:
               f"{len(topo.known())} camera(s) [{cams}]; any other camera is fail-open.")
         return topo
 
-    def _build_store(self):
+    def _build_store(self, dim: Optional[int] = None):
         """Build the Qdrant gallery for the offline reconcile, from the top-level
         `store` config (same backend the file path uses: env QDRANT_URL/API_KEY >
         store.url > store.path). Returns None (and disables reconcile) if the
-        store is off or unreachable -- degrade, never crash."""
+        store is off or unreachable -- degrade, never crash.
+
+        dim : vector size, taken from the loaded ReID model so the collection is
+              always sized for the backbone actually running. None keeps the
+              store's own default."""
         store_cfg = self.cfg.get("store", {}) or {}
         if not store_cfg.get("enabled", False):
             print("[live] store.enabled is false -> cannot persist observations; "
@@ -179,7 +184,8 @@ class LivePipeline:
             url = os.environ.get("QDRANT_URL") or store_cfg.get("url") or None
             api_key = os.environ.get("QDRANT_API_KEY") or None
             path = store_cfg.get("path", "qdrant_data")
-            store = PersonVectorStore(path=path, url=url, api_key=api_key)
+            store = PersonVectorStore(path=path, url=url, api_key=api_key,
+                                      **({} if dim is None else {"dim": dim}))
             backend = url if url else f"LOCAL '{path}'"
             print(f"[live] gallery store ready at {backend} "
                   f"(existing points: {store.count()}).")
@@ -196,13 +202,34 @@ class LivePipeline:
         print(f"[live] Starting LivePipeline on {len(self.sources)} source(s): "
               f"{', '.join(n for n, _ in self.sources)} | device={device}")
 
+        # ---- shared model (one extractor; per-camera detectors/embedders) ----
+        # Built BEFORE the store because the store's vector size is taken from
+        # the model that actually loaded (extractor.embedding_dim), not from a
+        # constant -- so swapping reid.model for a different-width backbone
+        # cannot quietly create a mis-sized collection.
+        reid_cfg = self.cfg.get("reid", {}) or {}
+        det_cfg = self.cfg.get("detector", {}) or {}
+        trk_cfg = self.cfg.get("tracker", {}) or {}
+        extractor = ReIDExtractor(
+            weights=reid_cfg["weights"], device=device,
+            # #39/#56. The tap is recorded in the run banner because every
+            # threshold in the config is specific to it.
+            tap=reid_cfg.get("tap", "post_relu"),
+            max_batch=int(reid_cfg.get("max_batch", 32)),
+            # Which backbone -- same reason it is in the banner as the tap.
+            model=reid_cfg.get("model"))
+        print(f"[live] ReID model: {extractor.describe()}")
+        print(f"[live] ReID tap: {reid_cfg.get('tap', 'post_relu')} "
+              f"-- thresholds are model- and tap-specific; never compare score "
+              f"logs across either.")
+
         # ---- offline-reconcile flow: build the gallery store (v5 correct-answer-
         # at-the-end). The live RTSP feed is NEVER recorded; we persist per-track
         # embeddings during the run and re-render from the captured processed
         # frames after Ctrl-C. Needs the store; if it can't be built we fall back
         # to the classic immediate live-annotated output (paced writer).
         if self.reconcile_enabled:
-            self.store = self._build_store()
+            self.store = self._build_store(dim=extractor.embedding_dim)
             if self.store is None:
                 # #59: reconcile silently switching itself off produces a
                 # live-annotated video that LOOKS like a normal result -- provisional
@@ -226,19 +253,6 @@ class LivePipeline:
             print("[live] offline reconcile OFF: writing live-annotated output "
                   "immediately (reids are the online engine's, not reconciled).")
             print("[stop] To stop: press Ctrl-C once.")
-
-        # ---- shared model (one extractor; per-camera detectors/embedders) ----
-        reid_cfg = self.cfg.get("reid", {}) or {}
-        det_cfg = self.cfg.get("detector", {}) or {}
-        trk_cfg = self.cfg.get("tracker", {}) or {}
-        extractor = ReIDExtractor(
-            weights=reid_cfg["weights"], device=device,
-            # #39/#56. The tap is recorded in the run banner because every
-            # threshold in the config is specific to it.
-            tap=reid_cfg.get("tap", "post_relu"),
-            max_batch=int(reid_cfg.get("max_batch", 32)))
-        print(f"[live] ReID tap: {reid_cfg.get('tap', 'post_relu')} "
-              f"-- thresholds are tap-specific; never compare score logs across taps.")
 
         # LIVE-only pose toggle: the pose ensemble is a SECOND model per frame.
         # Skipping it ~halves detection cost -> far fewer dropped frames -> stabler
@@ -469,7 +483,12 @@ class LivePipeline:
             dummy = np.zeros((480, 640, 3), dtype=np.uint8)
             for det in detectors.values():
                 det.track(dummy)
-            extractor.extract_batch([np.zeros((256, 128, 3), dtype=np.uint8)])
+            # Warm up at the backend's OWN input size, not a hardcoded 256x128.
+            # Functionally either works (preprocess resizes anyway), but the point
+            # of a warm-up is to compile the kernels the real frames will hit, and
+            # those are shaped by input_size -- 384x128 for FastReID SBS.
+            h, w = extractor.input_size
+            extractor.extract_batch([np.zeros((h, w, 3), dtype=np.uint8)])
             print("[live] warm-up complete (detector + ReID initialised).")
         except Exception as e:
             print(f"[live] warm-up skipped ({e}).")

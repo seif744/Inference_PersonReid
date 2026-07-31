@@ -82,6 +82,35 @@ def strict_flags():
                          f"        Known: {', '.join(sorted(KNOWN_FLAGS))}")
 
 
+def require_display():
+    """Refuse to open a window when there is nowhere to put it.
+
+    This has to be a PRE-FLIGHT check, not an exception handler. On a headless
+    box Qt does not raise anything Python can catch -- it prints
+    "could not connect to display" and calls abort(), so the process is gone
+    before any `except cv2.error` can run. Checking the environment first is the
+    only way to fail with a useful message instead of a core dump.
+    """
+    if sys.platform.startswith("win") or sys.platform == "darwin":
+        return
+    if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+        return
+    cdir = calib_dir()
+    raise SystemExit(
+        "[calib] no display on this machine (DISPLAY and WAYLAND_DISPLAY are "
+        "both unset).\n"
+        "        Clicking needs a screen; the capture box does not have one.\n\n"
+        "        The frames are already exported. From your LOCAL machine:\n\n"
+        f"          scp <user>@<this-host>:{os.path.join(cdir, 'frame_cam_*.png')} "
+        f"calibration/\n"
+        "          python tests/calibration/click_covisible_points.py --click\n\n"
+        "        then copy calibration/homography_*.json back here and run\n"
+        "        measure_covisible_geometry.py.\n\n"
+        "        `ssh -X` also works if X11 forwarding is set up, but it is slow\n"
+        "        for a 2560x1440 frame and the round trip above is usually less\n"
+        "        trouble.")
+
+
 def calib_dir():
     d = os.path.join(project_root(), "calibration")
     os.makedirs(d, exist_ok=True)
@@ -382,10 +411,18 @@ def main():
         header(f"EXPORT ONE FRAME PER CAMERA  ({cam_a}, {cam_b})")
         export_frame(cam_a)
         export_frame(cam_b)
-        print(f"\n  Copy both PNGs to a machine with a screen and run:")
+        host = os.environ.get("HOSTNAME") or "this-host"
+        headless = not (os.environ.get("DISPLAY")
+                        or os.environ.get("WAYLAND_DISPLAY"))
+        print(f"\n  Clicking needs a SCREEN"
+              f"{' -- this box has none' if headless else ''}. From your local machine:")
+        print(f"\n    scp <user>@{host}:{calib_dir()}/frame_cam_*.png calibration/")
         print(f"    python tests/calibration/click_covisible_points.py --click")
+        print(f"\n  then copy calibration/homography_*.json back here.")
         print(f"\n  Click FLOOR points only -- where things MEET the ground.")
         print(f"  Tile corners, door-frame bases, table/chair feet, rug corners.")
+        print(f"  Aim for 8-12. Pick a different frame with --frame N if these")
+        print(f"  two are crowded with people standing on the landmarks.")
         return
 
     source = None
@@ -395,6 +432,7 @@ def main():
         source = f"from-json:{os.path.basename(path)}"
         header(f"FIT FROM {path}")
     elif flag("--click"):
+        require_display()
         img_a, img_b = load_frames(cam_a, cam_b)
         size_a = [img_a.shape[1], img_a.shape[0]]
         size_b = [img_b.shape[1], img_b.shape[0]]

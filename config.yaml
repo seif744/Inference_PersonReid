@@ -149,9 +149,50 @@ reid:
   # project's out-of-domain CCTV) footage. Swapped from plain osnet_x1_0 because
   # that model's embeddings weren't discriminative enough on this footage
   # (same-person cross-camera ~0.72 vs different-person ~0.55 -- too close).
-  # Multi-source domain-generalization checkpoint (trained on Duke+Market+CUHK03,
-  # evaluated on MSMT17 as the unseen domain) from the torchreid Model Zoo.
-  weights: src/reid/weights/osnet_ain_x1_0.pth
+  # FastReID SBS ResNet101-IBN, trained on MSMT17 (1041 identities -- confirmed
+  # from the checkpoint's classifier shape). Upstream MODEL_ZOO numbers on MSMT17:
+  # Rank@1 84.8% / mAP 62.8%, against 83.9% / 60.6% for the R50-ibn variant.
+  #
+  # NOT IN GIT (537 MB, over GitHub's 100 MB per-file limit -- see .gitignore).
+  # Fetch it onto each machine:
+  #   curl -L -o src/reid/weights/msmt_sbs_R101-ibn.pth \
+  #     https://github.com/JDAI-CV/fast-reid/releases/download/v0.1.1/msmt_sbs_R101-ibn.pth
+  # or move it with deploy.sh / scp the way yolo11m.pt is handled (0.75).
+  #
+  # Previous default, still selectable (model: osnet_ain_x1_0, tap: post_relu):
+  #   src/reid/weights/osnet_ain_x1_0.pth  -- 512-d, torchreid OSNet-AIN.
+  weights: src/reid/weights/msmt_sbs_R101-ibn.pth
+  # WHICH BACKBONE computes the embedding. One of the keys registered in
+  # src/reid/backends.py::BACKENDS -- fastreid_sbs_R101_ibn | fastreid_sbs_R50_ibn
+  # | osnet_ain_x1_0 | osnet_ibn_x1_0 | osnet_x1_0. Must AGREE with `weights`
+  # above; the checkpoint guard fails loud on a mismatch rather than emitting
+  # garbage embeddings (verified: an R50 backend refuses the R101 file).
+  #
+  # R50 vs R101 is one line here plus the matching checkpoint -- same backend,
+  # same 2048-d, so it costs no schema change to compare later.
+  #
+  # =========================== SWITCHING THIS ============================
+  # Two consequences, neither optional:
+  #
+  # 1. EVERY THRESHOLD IN THIS FILE IS VOID. 2048-d post-bnneck FastReID
+  #    features are a different space, not better numbers in the same one.
+  #    Measured on random crops: 60.5% of dimensions are NEGATIVE and 0% are
+  #    exactly zero, against OSNet post-ReLU's 0% negative / 21% zero. Cosines
+  #    can now go negative, so the whole scale has moved -- identity.threshold,
+  #    reconcile.threshold, same/cross_camera_threshold and every number in
+  #    Part H all need re-deriving. NEVER compare a score log across backbones.
+  #
+  # 2. THE QDRANT COLLECTION MUST BE REBUILT. 512-d vectors and 2048-d vectors
+  #    cannot share a collection; the store's dimension guard says so at
+  #    startup. Wipe it (main.py --reset, or delete qdrant_data/) before the
+  #    first run on the new backbone.
+  #
+  # Measure before trusting it, on identical footage:
+  #   python tests/calibration/measure_score_separation.py register_file.avi 90 6
+  #   CALIB_REID_MODEL=osnet_ain_x1_0 CALIB_REID_WEIGHTS=src/reid/weights/osnet_ain_x1_0.pth \
+  #     python tests/calibration/measure_score_separation.py register_file.avi 90 6
+  # =======================================================================
+  model: fastreid_sbs_R101_ibn
   # FEATURE TAP (#39). Where in the network the embedding is taken from.
   #   post_relu -- what has always shipped. torchreid's OSNet ends in
   #                fc = Sequential(Linear, BatchNorm1d, ReLU) and eval-mode
@@ -179,7 +220,15 @@ reid:
   #   python tests/calibration/measure_score_separation.py register_file.avi 90 6
   #   python tests/calibration/sweep_reconcile_thresholds.py <run_id> --cross 0.4,0.5,0.6,0.7
   #   python tests/calibration/rerender_from_clips.py <run_id> --cross <chosen>
-  tap: post_relu
+  #
+  # ONLY APPLIES TO THE OSNet BACKENDS. FastReID has no tap to choose: upstream's
+  # EmbeddingHead returns the post-bnneck feature unconditionally at eval, and its
+  # MODEL.HEADS.NECK_FEAT setting affects the TRAINING losses only. So with a
+  # fastreid_* model this must be `n/a` -- the backend RAISES on anything else
+  # rather than accept a key that looks load-bearing and does nothing.
+  # (Convenient side effect: FastReID is post-BN by construction, which is the
+  # side our own #39 measurement preferred.)
+  tap: n/a
   # #56: crops per forward pass. The batch used to be sized by however many people
   # were in view, which is an OOM on a smaller GPU exactly when the scene is
   # busiest. Chunking is embedding-invariant (measured 5.2e-08) because eval-mode

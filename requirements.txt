@@ -11,9 +11,22 @@ ultralytics==8.4.89        # YOLO11 detector + ByteTrack tracker
 # falls back to CPU otherwise. Same pin works on the CPU dev box AND the GPU
 # server; the server only needs a compatible NVIDIA driver. (For a specific CUDA
 # version, install torch/torchvision from the matching PyTorch wheel index first.)
-torch==2.12.1              # OSNet + detection inference backend (CPU or CUDA)
+torch==2.12.1              # ReID + detection inference backend (CPU or CUDA)
 torchvision==0.27.1        # required by torchreid / ultralytics
-torchreid==0.2.5           # OSNet model definition
+torchreid==0.2.5           # OSNet model definition (no longer the default model,
+                           # but osnet_* stay selectable via reid.model)
+
+# FastReID (the CURRENT default backbone, SBS ResNet101-IBN) is deliberately NOT
+# pinned here: it has no setup.py and is not pip-installable at all. The model
+# definition is VENDORED into src/reid/vendor/fastreid/ (5 files, torch-only) --
+# see that directory's PROVENANCE.md for the upstream commit and the exact edits.
+# Importing upstream as a package is not viable regardless: its
+# modeling/__init__.py eagerly imports RegNet, which needs `yacs` at module
+# scope, and fastreid/utils pulls termcolor + tabulate for coloured logging. None
+# of that is needed for a forward pass, so none of it is a dependency here.
+# The CHECKPOINT is not in git either (537 MB, over GitHub's 100 MB file limit):
+#   curl -L -o src/reid/weights/msmt_sbs_R101-ibn.pth \
+#     https://github.com/JDAI-CV/fast-reid/releases/download/v0.1.1/msmt_sbs_R101-ibn.pth
 
 # torchreid's PyPI wheel declares NO runtime dependencies (only dev/test extras),
 # so pip installs none of what it actually imports. These three are NOT optional:

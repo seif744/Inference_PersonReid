@@ -364,6 +364,37 @@ The pipeline is correct; the **embedding model is the ceiling** on this domain.
   That's why re-ranking and verification exist as a safety net on top of raw
   cosine, and why the verifier logs decisions instead of claiming to be a
   finished, trained classifier.
+- **Current default (2026-07-31): FastReID SBS ResNet101-IBN, MSMT17.**
+  `reid.model: fastreid_sbs_R101_ibn`, from the vendored definition in
+  `src/reid/vendor/fastreid/` (FastReID has no `setup.py`, so it cannot be
+  pip-installed; see that directory's `PROVENANCE.md`). **2048-d, 384×128 input,
+  post-bnneck features, GeM pooling with a learned exponent (p=2.138).** Upstream
+  MSMT17 numbers: Rank@1 84.8% / mAP 62.8%. There is no feature tap to choose —
+  FastReID's `EmbeddingHead` returns the post-bnneck feature unconditionally at
+  eval, so the backend requires `reid.tap: n/a` and raises otherwise. That means
+  the full sphere is available by construction: measured on random crops, **60.5%
+  of dimensions are negative and 0% exactly zero**, against OSNet post-ReLU's 0%
+  negative / 21% zero — the property the #39 tap experiment was chasing.
+  **Every threshold in `config.yaml` predates this switch and is therefore void**,
+  and the Qdrant collection must be rebuilt (512-d → 2048-d). Neither has been
+  done yet; see the migration note below.
+- **Swapping the backbone is a config edit, not a refactor.** `reid.model` in
+  `config.yaml` selects a backend registered in `src/reid/backends.py`
+  (`fastreid_sbs_R101_ibn` | `fastreid_sbs_R50_ibn` | `osnet_ain_x1_0` |
+  `osnet_ibn_x1_0` | `osnet_x1_0`). A backend owns the
+  architecture, checkpoint load, preprocessing recipe and feature tap;
+  `reid/extractor.py` keeps the backend-invariant contract (batching, the shared
+  model's forward lock, L2-normalization, empty-crop rejection) so a backbone
+  trial cannot silently break the invariants
+  `tests/calibration/verify_embedding_contract.py` asserts. The Qdrant
+  collection is sized from `extractor.embedding_dim` — measured from the loaded
+  model — so a different-width backbone needs a collection rebuild but cannot
+  quietly create a mis-sized one. The calibration harness reads the same config
+  keys (`CALIB_REID_MODEL` / `CALIB_REID_WEIGHTS` override), so an A/B is two
+  runs of `measure_score_separation.py` with no code edit.
+  **A backbone change voids every threshold in `config.yaml`**, exactly like the
+  feature tap: it is a different feature space, not better numbers in the same
+  one. Derive thresholds *once*, after the backbone is chosen — not before.
 - **If overlap reappears, the fix is still model-side**, roughly cheapest
   first:
   1. Try other available pretrained checkpoints (already done once here).

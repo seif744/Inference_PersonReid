@@ -4,7 +4,7 @@ extractor.py  --  STAGE 5:  ReID feature extraction.
 ============================ THE BIG PICTURE ================================
 This module has EXACTLY ONE job:
 
-    OpenCV BGR person crop  ->  L2-normalized 512-d embedding.
+    OpenCV BGR person crop  ->  L2-normalized embedding.
 
 That's it. It does NOT assign identities, search a database, or know anything
 about cameras, tracks, timestamps, YOLO, ByteTrack, or Qdrant. It is a pure
@@ -16,47 +16,40 @@ person looks like." Deciding WHO they are (matching, gallery, global ids) is a
 separate, stateful concern with its own failure modes (camera topology, time
 windows, motion). Mixing the two is how ReID systems rot. Keep this dumb.
 
---------------------------------- THE MODEL --------------------------------
-OSNet-AIN x1_0 (torchreid). Same OSNet family as before, with Adaptive Instance
-Normalization layers added for better generalization to unseen (out-of-domain)
-camera footage -- swapped in from plain osnet_x1_0 for exactly that reason. We
-depend ONLY on torchreid's model DEFINITION, not on its training machinery --
-so this file stays a thin inference path we can later re-point at a vendored
-osnet.py for TensorRT without changing the public API.
+--------------------- WHAT LIVES HERE vs IN A BACKEND -----------------------
+WHICH network runs is a `backends.py` concern (see that file's header). This
+file owns only the things that must be true no matter which network it is:
 
-Embedding dimension is 512. This is a property of the CHECKPOINT (osnet_ain_x1_0's
-feature layer width, same as osnet_x1_0), not a free choice. It is also the
-vector size the Qdrant collection will use downstream, so if the backbone ever
-changes to a different width, that number propagates outward.
+  * batching, and chunking it at max_batch so a crowded frame cannot OOM;
+  * the forward lock that serialises the ONE shared model across camera threads;
+  * L2-normalization -- applied here, once, so no backend can forget it;
+  * the numpy hand-off and the empty-crop rejection.
 
------------------------------- PREPROCESSING -------------------------------
-The model was trained on inputs prepared a specific way. Inference MUST match
-training preprocessing byte-for-byte in spirit, or embeddings silently degrade
-(no error -- just worse matching). The required recipe, in order:
+Those are exactly the invariants tests/calibration/verify_embedding_contract.py
+asserts. Keeping them out of the per-model code means a backbone experiment
+cannot silently break them, which matters because every one of these failure
+modes is invisible: no error, no crash, just worse matching.
 
-  1. BGR -> RGB        OpenCV gives BGR; the model was trained on RGB.
-  2. resize to 256x128 (H x W). OSNet's canonical person-ReID input. People are
-                       tall and narrow, hence the 2:1 aspect ratio. Feeding a
-                       different size still runs (OSNet is fully convolutional +
-                       global pooling) but shifts the feature statistics away
-                       from training -> worse accuracy. Pin it.
-  3. /255              scale 0..255 -> 0..1.
-  4. (x-mean)/std      per-channel ImageNet standardization. These constants are
-                       the ImageNet TRAIN-SET channel statistics. ReID training
-                       started from ImageNet weights and never changed the
-                       normalization, so we must reuse the exact same numbers.
-                       Change them and every activation drifts off-distribution.
+The default backend is OSNet-AIN x1_0 (`osnet_ain_x1_0`), selectable via
+`reid.model` in config.yaml.
 
-NOTE we keep ImageNet *normalization* but NOT ImageNet *weights* -- the loaded
-checkpoint is fine-tuned for person ReID, which is what makes the embedding
-separate identities instead of object categories.
+--------------------------- EMBEDDING DIMENSION ----------------------------
+EMBEDDING_DIM below is the default backend's width (512) and is what the Qdrant
+collection is sized to. It is a property of the CHECKPOINT, not a free choice.
+Prefer the per-instance `extractor.embedding_dim`, which is MEASURED from the
+loaded model -- the module constant is the historical default kept for the
+calibration harness and for `database/store.py`'s guard.
+
+If a backend of a different width is adopted, that number propagates outward:
+the Qdrant collection is rebuilt, and every threshold in config.yaml is void
+because it is a different feature space (same rule as the tap flag, #39).
 
 ------------------------------ WHY L2-NORMALIZE ----------------------------
 We divide each embedding by its L2 norm so every vector lands on the unit
 hypersphere. Then cosine similarity between two people is just a dot product,
 and Euclidean distance becomes a monotonic function of cosine -- so downstream
 matching (and Qdrant's COSINE metric) is well-defined and scale-invariant. The
-raw magnitude of an OSNet feature carries no identity information; only its
+raw magnitude of a ReID feature carries no identity information; only its
 DIRECTION does.
 ============================================================================
 """
@@ -64,30 +57,29 @@ DIRECTION does.
 import threading
 from typing import List, Optional
 
-import cv2
 import numpy as np
 import torch
-import torchreid
+
+from reid.backends import (DEFAULT_BACKEND, IMAGENET_MEAN, IMAGENET_STD,
+                           OSNET_INPUT_SIZE, build_backend)
 
 
 # --- Constants (see module docstring for the "why" of each) ----------------
 
-# Model input as (Height, Width). OSNet's canonical person-ReID resolution.
-INPUT_SIZE = (256, 128)
-
-# Embedding width produced by osnet_ain_x1_0's feature layer -- same 512 width
-# as osnet_x1_0, verified against the checkpoint's classifier.weight shape.
+# Default-backend input as (Height, Width) and output width. Re-exported from
+# backends.py so the long-standing `from reid.extractor import EMBEDDING_DIM,
+# INPUT_SIZE` imports in the calibration harness keep working; per-instance
+# `.input_size` / `.embedding_dim` are the authoritative values for a given run.
+INPUT_SIZE = OSNET_INPUT_SIZE
 EMBEDDING_DIM = 512
 
-# ImageNet train-set per-channel statistics, RGB order, on the 0..1 scale.
-# Shaped (3,1,1) so they broadcast over a (3,H,W) tensor.
-IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+__all__ = ["ReIDExtractor", "EMBEDDING_DIM", "INPUT_SIZE",
+           "IMAGENET_MEAN", "IMAGENET_STD"]
 
 
 class ReIDExtractor:
     """
-    Loads OSNet-AIN x1_0 once and turns person crops into embeddings.
+    Loads one ReID backend and turns person crops into embeddings.
 
     Typical use:
         extractor = ReIDExtractor(weights="weights/osnet_ain_x1_0.pth")
@@ -95,10 +87,11 @@ class ReIDExtractor:
     """
 
     def __init__(self, weights: str, device: Optional[str] = None,
-                 max_batch: int = 32, tap: str = "post_relu"):
+                 max_batch: int = 32, tap: Optional[str] = None,
+                 model: Optional[str] = None):
         """
-        weights : path to a person-ReID OSNet checkpoint (.pth). NOT ImageNet
-                  weights -- those do not separate identities.
+        weights : path to a person-ReID checkpoint (.pth). NOT ImageNet weights
+                  -- those do not separate identities.
         device  : "cuda", "cpu", or None to auto-pick. Kept explicit so the
                   same code runs on the CPU dev box and a GPU deployment box
                   without edits.
@@ -109,6 +102,15 @@ class ReIDExtractor:
                   mode (running stats, not per-batch), so chunking cannot change a
                   single embedding -- verified by the batch-invariance check in
                   tests/calibration/verify_embedding_contract.py. 0 = unbounded.
+        tap     : #39. Where in the network the feature is read from. Meaning is
+                  backend-specific and it is passed through UNCHANGED -- including
+                  None, so each backend applies its own default rather than
+                  inheriting OSNet's. That matters because the tap is not a
+                  universal concept: FastReID's eval feature is always post-bnneck
+                  and its backend REJECTS a tap rather than ignore one.
+        model   : `reid.model` -- which backend to load. None = the shipped
+                  default (osnet_ain_x1_0), which is what every threshold in
+                  config.yaml was derived against.
         """
         self.max_batch = max(0, int(max_batch))
         # #50: the ONE thing that genuinely needs serialising across cameras is the
@@ -119,64 +121,83 @@ class ReIDExtractor:
         # model, contradicting that lock's own docstring. Owning it here keeps the
         # critical section to exactly the shared resource.
         self._fwd_lock = threading.Lock()
-        self.tap = str(tap or "post_relu")
-        self._tap_warned = False
+        self.tap = tap
         self.device = torch.device(
             device if device is not None
             else ("cuda" if torch.cuda.is_available() else "cpu")
         )
 
-        # Build the ARCHITECTURE only (pretrained=False): we supply our own
-        # ReID-trained weights below. num_classes here is irrelevant -- it only
-        # sizes the classifier head, which we deliberately discard.
-        model = torchreid.models.build_model(
-            name="osnet_ain_x1_0",
-            num_classes=1000,
-            loss="softmax",
-            pretrained=False,
-        )
+        self.backend = build_backend(model or DEFAULT_BACKEND, weights=weights,
+                                     device=self.device, tap=self.tap)
 
-        # Load our checkpoint EXPLICITLY so the load is transparent and owned by
-        # this file (rather than hidden inside a framework helper). The only two
-        # keys we DROP are classifier.{weight,bias}: they are the training-time
-        # identity head, meaningless for features.
-        # weights_only=False: PyTorch >=2.6 defaults to weights_only=True, which
-        # rejects the numpy scalars pickled into these legacy torchreid
-        # checkpoints. Safe here -- we only ever point this at checkpoints we
-        # downloaded ourselves from the trusted torchreid Model Zoo.
-        checkpoint = torch.load(weights, map_location="cpu", weights_only=False)
-        # Some Model Zoo checkpoints are the bare state_dict; others (like this
-        # AIN one) are a full training checkpoint wrapping it under "state_dict",
-        # with a "module." prefix left over from DataParallel training.
-        state_dict = checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
-        state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
-        model_sd = model.state_dict()
-        to_load = {
-            k: v for k, v in state_dict.items()
-            if k in model_sd and model_sd[k].shape == v.shape
-        }
-        dropped = [k for k in state_dict if k not in to_load]
-        if dropped != ["classifier.weight", "classifier.bias"]:
-            # Anything else missing means the checkpoint doesn't match osnet_ain_x1_0
-            # -- fail loud rather than emit garbage embeddings.
-            raise RuntimeError(
-                f"Unexpected checkpoint keys dropped: {dropped}. "
-                f"Expected only the classifier head. Wrong architecture or file?"
-            )
-        model.load_state_dict(to_load, strict=False)
+    @classmethod
+    def from_config(cls, cfg: Optional[dict] = None, *,
+                    device: Optional[str] = None,
+                    config_path: str = "config.yaml") -> "ReIDExtractor":
+        """Build the extractor the PIPELINE would build, from config.yaml.
 
-        # eval() is REQUIRED for two reasons:
-        #   1. it freezes BatchNorm to use running stats (not per-batch stats),
-        #      so one crop and a batch of crops give identical embeddings;
-        #   2. in eval mode OSNet's forward returns the 512-d FEATURE, whereas
-        #      in train mode it returns classifier logits.
-        model.eval()
-        self.model = model.to(self.device)
+        Exists so demo and diagnostic scripts cannot drift from the shipping
+        model. Before this, five scripts hardcoded a
+        `weights/osnet_x1_0_market1501.pth` that is not in this tree at all, so
+        they had been broken since long before the FastReID switch -- and a
+        backbone change would silently have left any that DID work measuring the
+        old model.
+
+        cfg    : an already-loaded config dict (the whole file, or just its
+                 `reid:` block). None reads `config_path`.
+        device : overrides `reid.device`. Pass "cpu" to force the dev box.
+        """
+        if cfg is None:
+            import yaml
+            with open(config_path) as f:
+                cfg = yaml.safe_load(f) or {}
+        reid = cfg.get("reid", cfg) or {}
+        if "weights" not in reid:
+            raise KeyError(
+                f"no `reid.weights` in the config given to from_config() "
+                f"(keys seen: {sorted(reid)[:8]}). Pass the whole config.yaml "
+                f"dict or its reid: block.")
+        dev = device if device is not None else reid.get("device")
+        # "auto" is this project's config vocabulary, not torch's -- torch.device
+        # ("auto") raises. None means "let __init__ pick", which is the same thing.
+        if isinstance(dev, str) and dev.strip().lower() in ("", "auto"):
+            dev = None
+        return cls(weights=reid["weights"], device=dev,
+                   max_batch=int(reid.get("max_batch", 32)),
+                   tap=reid.get("tap"),
+                   model=reid.get("model"))
+
+    # --- what the backend decided, surfaced for the rest of the pipeline ----
+
+    @property
+    def model(self):
+        """The underlying torch module. Exposed because the calibration harness
+        asserts eval mode on it and measure_score_separation.py reaches into
+        OSNet's own layers to compare taps."""
+        return self.backend.model
+
+    @property
+    def embedding_dim(self) -> int:
+        """MEASURED output width of the loaded model. Pass this to
+        PersonVectorStore(dim=...) so the collection can never be sized for a
+        different backbone than the one actually running."""
+        return self.backend.embedding_dim
+
+    @property
+    def input_size(self):
+        """(H, W) this backend's checkpoint was trained at."""
+        return self.backend.input_size
+
+    def describe(self) -> str:
+        """One line for a run banner."""
+        return f"{self.backend.describe()} on {self.device}"
+
+    # --- the contract -------------------------------------------------------
 
     @torch.no_grad()
     def extract(self, crop: np.ndarray) -> np.ndarray:
         """
-        One BGR crop -> (512,) L2-normalized float32 embedding.
+        One BGR crop -> (D,) L2-normalized float32 embedding.
 
         Convenience wrapper over extract_batch for the common single-crop call.
         """
@@ -185,7 +206,7 @@ class ReIDExtractor:
     @torch.no_grad()
     def extract_batch(self, crops: List[np.ndarray]) -> np.ndarray:
         """
-        A list of BGR crops -> (N, 512) L2-normalized float32 embeddings.
+        A list of BGR crops -> (N, D) L2-normalized float32 embeddings.
 
         Batching is a REAL production need, not gratuitous abstraction: a single
         frame yields many person boxes, and running them through the network in
@@ -197,9 +218,9 @@ class ReIDExtractor:
         building the graph: less memory, faster.
         """
         if len(crops) == 0:
-            # Explicit empty case: return a well-shaped (0, 512) array so callers
+            # Explicit empty case: return a well-shaped (0, D) array so callers
             # can concatenate results without special-casing.
-            return np.empty((0, EMBEDDING_DIM), dtype=np.float32)
+            return np.empty((0, self.embedding_dim), dtype=np.float32)
 
         # #56: the batch was unbounded in the number of PEOPLE. A crowded frame
         # (or a burst across four cameras) built one tensor sized by whatever
@@ -216,7 +237,7 @@ class ReIDExtractor:
         batch = batch.to(self.device)
 
         with self._fwd_lock:                              # #50: shared model only
-            features = self._forward_tapped(batch)        # (N, 512), raw features
+            features = self.backend.forward(batch)        # (N, D), raw features
 
         # L2-normalize along the feature dim. eps guards the degenerate case of
         # an all-zero feature (never seen in practice) from producing NaNs.
@@ -225,72 +246,18 @@ class ReIDExtractor:
         # Back to CPU/NumPy for the rest of the (non-torch) pipeline.
         return features.cpu().numpy().astype(np.float32)
 
-    def _forward_tapped(self, batch):
-        """Run the model and take features at the configured TAP (#39).
-
-        torchreid's OSNet ends in `fc = Sequential(Linear, BatchNorm1d, ReLU)`, and
-        eval-mode forward() returns the output of that whole block -- so the shipped
-        embedding is POST-ReLU, confined to the non-negative orthant. Measured
-        consequence: 21.0% of dimensions are exactly zero, 0% negative, so the
-        cosine between ANY two embeddings is >= 0 and the usable range is squeezed
-        upward -- which is why different people score as high as 0.78-0.94.
-
-        Tapping POST-BN instead (before the ReLU) keeps the negative half of the
-        space. Measured on register_file.avi, post-BN improved the separation margin
-        in EVERY scoring mode at BOTH sample sizes (+0.055 -> +0.086 at 48 frames,
-        +0.108 -> +0.157 at 90) and lowered the different-person ceiling
-        (0.845 -> 0.782 and 0.892 -> 0.858). The DIRECTION is the stable result; the
-        magnitudes are not.
-
-        CHANGING THE TAP VOIDS EVERY THRESHOLD IN THE SYSTEM -- it is a different
-        feature space, not a better version of the same one. That is why it is a
-        flag and why it defaults to the shipped behaviour.
-        """
-        if self.tap != "post_bn":
-            return self.model(batch)
-        fc = getattr(self.model, "fc", None)
-        if fc is None or not hasattr(fc, "__getitem__") or len(fc) < 2:
-            # Not the Sequential(Linear, BN, ReLU) we expect -- do not guess at a
-            # different architecture's internals, just use the shipped tap.
-            if not self._tap_warned:
-                print("[reid] tap 'post_bn' requested but this model's `fc` is not "
-                      "the expected Sequential(Linear, BatchNorm1d, ReLU); using "
-                      "the default post-ReLU tap.")
-                self._tap_warned = True
-            return self.model(batch)
-        # featuremaps -> global pool -> fc[:2] (Linear, BatchNorm1d), stopping
-        # before the ReLU. Mirrors torchreid's own eval-mode forward.
-        v = self.model.featuremaps(batch)
-        v = torch.nn.functional.adaptive_avg_pool2d(v, 1).view(v.size(0), -1)
-        for layer in list(fc)[:2]:
-            v = layer(v)
-        return v
-
     def _preprocess(self, crop: np.ndarray) -> torch.Tensor:
         """
-        One BGR uint8 crop -> normalized (3, 256, 128) float32 tensor on CPU.
+        One BGR uint8 crop -> normalized (3, H, W) float32 tensor on CPU.
 
-        Kept as a private method (not a standalone util) because it is only ever
-        meaningful paired with this exact model's expectations.
+        The RECIPE belongs to the backend (it is checkpoint-specific and not
+        shareable -- see backends.py). What stays here is the one policy that is
+        the same for every model: a crop with no pixels is an error, not an
+        input.
         """
         if crop is None or crop.size == 0:
             # A zero-area box (can happen at frame edges) has no pixels to
             # describe. Fail loud -- silently embedding a blank crop would inject
             # a meaningless vector into matching.
             raise ValueError("Empty crop passed to ReIDExtractor.")
-
-        # 1. BGR -> RGB.
-        rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-
-        # 2. Resize to (W, H) -- cv2 takes (width, height), our constant is
-        #    (H, W), hence the reversed indexing. INTER_LINEAR matches the
-        #    bilinear interpolation used during training.
-        rgb = cv2.resize(rgb, (INPUT_SIZE[1], INPUT_SIZE[0]),
-                         interpolation=cv2.INTER_LINEAR)
-
-        # 3. HWC uint8 -> CHW float32 in 0..1.
-        tensor = torch.from_numpy(rgb).float().div_(255.0).permute(2, 0, 1)
-
-        # 4. Per-channel ImageNet standardization.
-        tensor = (tensor - IMAGENET_MEAN) / IMAGENET_STD
-        return tensor
+        return self.backend.preprocess(crop)

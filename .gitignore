@@ -1,6 +1,17 @@
 # YOLO model weights (auto-downloaded on first run; don't commit binaries)
 *.pt
 
+# ReID checkpoints. Only `*.pt` was ignored before, so src/reid/weights/
+# osnet_ain_x1_0.pth (53 MB) is already TRACKED -- left as is, since untracking it
+# would break the fresh-clone path that currently gets it for free.
+# New checkpoints must not follow it: FastReID's released files are full training
+# checkpoints (msmt_sbs_R101-ibn.pth is 537 MB for ~170 MB of parameters), which is
+# over GitHub's 100 MB per-file hard limit -- a push carrying one is REJECTED, not
+# merely large. Move them with deploy.sh / scp, the same way yolo11m.pt is handled
+# (REMEDIATION_PLAN.md 0.75).
+*.pth
+!src/reid/weights/osnet_ain_x1_0.pth
+
 # Test / output artifacts
 detection_test.jpg
 *.mp4

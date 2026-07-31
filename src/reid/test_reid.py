@@ -81,7 +81,10 @@ def summarize(name, sims):
 
 
 def main():
-    extractor = ReIDExtractor(weights=WEIGHTS)
+    # Uses the model config.yaml ships (reid.model / reid.weights). This used to
+    # hardcode a weights/osnet_x1_0_market1501.pth that is not in this tree, so it
+    # had been broken regardless of any backbone change.
+    extractor = ReIDExtractor.from_config()
     print(f"device: {extractor.device}\n")
 
     embs = load_embeddings_by_identity(extractor)

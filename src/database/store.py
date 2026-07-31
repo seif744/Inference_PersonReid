@@ -20,8 +20,13 @@ WHY a wrapper instead of calling qdrant_client everywhere:
 ------------------------------- KEY CHOICES -------------------------------
 * Vector size = 512, metric = COSINE. These MUST match ReIDExtractor's output
   (512-d, L2-normalized). Cosine is the "0.82 same / 0.55 different" score you
-  already saw. If the backbone ever changes size, change EMBEDDING_DIM here and
-  recreate the collection -- old vectors of a different size are incompatible.
+  already saw. If the backbone ever changes size, recreate the collection -- old
+  vectors of a different size are incompatible.
+  Both entry points (main.py, live/pipeline.py) now pass `dim` from the loaded
+  model (`extractor.embedding_dim`, measured not assumed), so a `reid.model` swap
+  sizes a FRESH collection correctly on its own. EMBEDDING_DIM below remains the
+  default for direct callers, and verify_embedding_contract.py asserts the two
+  agree -- a disagreement means an existing collection is stale.
 
 * Point ids are UUIDs. Each stored embedding is one OBSERVATION of a person at a
   moment; UUIDs guarantee we never collide across cameras, restarts, or workers.
@@ -44,7 +49,10 @@ from qdrant_client.models import Distance, PointStruct, VectorParams, Filter
 # Must match ReIDExtractor.EMBEDDING_DIM. Duplicated as a constant here (not
 # imported from reid) on purpose: the storage layer must not depend on the model
 # layer. If they ever disagree, the dimension guard below fails loudly.
-EMBEDDING_DIM = 512
+# 2048 since the switch to FastReID SBS R101-IBN (was 512 for OSNet-AIN). Any
+# collection created before that switch holds 512-d vectors and is unusable --
+# the guard below reports it at startup.
+EMBEDDING_DIM = 2048
 DEFAULT_COLLECTION = "persons"
 
 

@@ -21,6 +21,10 @@ bootstrap()
 from detector import PersonDetector, Detection
 from live.identity_engine import IdentityEngine
 from identity.reconcile import reconcile_tracklets
+# Synthetic vectors here go into a real PersonVectorStore, whose dimension guard
+# rejects any other width. Track the store's constant instead of hardcoding, so a
+# backbone swap cannot leave this script inserting the wrong shape.
+from database.store import EMBEDDING_DIM as DIM
 
 RESULTS = []
 
@@ -39,8 +43,8 @@ QUALITY = {"blur": 100, "brightness": 120, "area": 9000,
 
 def two_people(seed=0):
     rng = np.random.default_rng(seed)
-    a = rng.normal(size=512); a /= np.linalg.norm(a)
-    b = rng.normal(size=512); b /= np.linalg.norm(b)
+    a = rng.normal(size=DIM); a /= np.linalg.norm(a)
+    b = rng.normal(size=DIM); b /= np.linalg.norm(b)
     return a, b
 
 
@@ -59,9 +63,13 @@ def check_single_tracklet():
         with tempfile.TemporaryDirectory() as td:
             st = PersonVectorStore(path=os.path.join(td, "q"), url=None)
             for t in range(1, ntrack + 1):
-                base = rng.normal(size=512)
+                base = rng.normal(size=DIM)
                 for f in range(5):
-                    v = base + 0.01 * rng.normal(size=512)
+                    # 0.01 is a RELATIVE noise level, so scale by 1/sqrt(DIM):
+                    # rng.normal(size=DIM) has norm ~sqrt(DIM), so unscaled it
+                    # grows with the embedding width (same trap _synth.observe
+                    # documents). Keeps these vectors' cosine width-independent.
+                    v = base + (0.01 / np.sqrt(DIM)) * rng.normal(size=DIM)
                     v /= np.linalg.norm(v)
                     st.add_many([v.astype(np.float32)],
                                 [{"camera": "cam_a", "track_id": t,

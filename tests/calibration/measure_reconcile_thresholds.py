@@ -21,7 +21,8 @@ import sys
 
 import numpy as np
 
-from _common import (bootstrap, pick_video, sample_frames, REID_WEIGHTS,
+from _common import (bootstrap, pick_video, sample_frames, reid_weights,
+                     reid_model, reid_tap,
                      DETECT_WEIGHTS, collect_track_embeddings,
                      proven_distinct_pairs, header, footnote_sample_size)
 
@@ -38,7 +39,12 @@ STRIDE = int(sys.argv[3]) if len(sys.argv) > 3 else 4
 SAME_CAM_THR = 0.90        # identity.reconcile.same_camera_threshold
 CROSS_THR = 0.63           # identity.reconcile.threshold
 
-ex = ReIDExtractor(weights=REID_WEIGHTS, device="cpu")
+# Backbone AND tap come from config (env-overridable) -- these thresholds are
+# specific to one feature space, so measuring a different model or tap than the
+# pipeline will run makes every number below inapplicable.
+ex = ReIDExtractor(weights=reid_weights(), model=reid_model(), tap=reid_tap(),
+                   device="cpu")
+print(f"[calib] ReID: {ex.describe()}")
 det = PersonDetector(model_path=DETECT_WEIGHTS, confidence_threshold=0.4,
                      person_class_id=0, tracker_config="bytetrack.yaml",
                      pose_ensemble=None, iou=0.60)
