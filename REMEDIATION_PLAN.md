@@ -1669,6 +1669,103 @@ python tests/calibration/sweep_reconcile_thresholds.py $RUN      # M.1: must rep
 Send back both outputs in full. The first decides between M.2, M.3 and M.4; the second says
 whether the measurement loop can be trusted at all.
 
+### M.9 MEASURED, 2026-07-31 — both commands run on `20260731_060425`
+
+**The measurement loop is now trustworthy.** The sweep's shipped row reproduces the live run
+exactly: 25 identities, max cluster 7, 7 spanning >1 camera. M.1 holds.
+
+#### M.9.1 The defect, in two numbers
+
+cam_219, one person, same camera:
+
+| pair | apart | pose | score | cam_219 bar | outcome |
+|---|---|---|---|---|---|
+| 219/7 ↔ 219/113 | **45 s** | same (sitting) | **0.969** | 0.90 | merged |
+| 219/7 ↔ 219/46 | **4 s** | different (sitting → walking) | **0.830** | 0.90 | **REFUSED** |
+
+**The bar sits inside one person's own pose variation.** Time apart is irrelevant; pose is
+everything. That single refusal is the whole symptom — everything else in M.2/M.3/M.4 is
+its consequence. And cam_219's 0.90 is the one bar in the config with **no measurement
+behind it**: it is there because it was *"deliberately LEFT at the global 0.90 ... to avoid
+confounding this run's comparison"*.
+
+His timeline in cam_219 is `reid 1` (8.4-13.8 s, sitting) → `reid 11` (18.2-37.5 s, walking)
+→ `reid 1` again (58.3-74.7 s, sitting again). The operator reported the first two; the
+third confirms the mechanism is pose, not time.
+
+#### M.9.2 What poisoned the cluster, and the correction to M.2/M.4
+
+`reid 11` is a clean single trajectory (224/3 → 219/46 → 224/68 → 213/79 → 213/88 →
+224/102, 11-70 s, 199 observations). `reid 1` is his two sitting fragments **plus three
+foreign members**, and the three hard vetoes all come from the foreign ones:
+
+| blocker | verdict | admitted to reid 1 at |
+|---|---|---|
+| 213/51 ↔ 219/46, 213/51 ↔ 224/3 | 1.6 s wall-clock overlap > 1.0 s tolerance | **0.757** (via 206/12) |
+| 224/30 ↔ 224/3 | 0.8 s, 3 of 3 sampled instants co-occur — real | **0.760** (via 206/12) |
+
+Both blockers are scraps: 213/51 is 6 observations over 1.6 s, 224/30 is **3 observations
+over 0.8 s**. Neither is the operator's person, and 213/51 ↔ 213/88 scores 0.675, so the
+cross-camera veto is probably *correct* that 213/51 is somebody else. **The veto's unit is
+the cluster; the truth's unit is the member.** A 1.6-second scrap admitted on a 0.757 link
+is vetoing on behalf of the 60 observations of the real person it was filed with.
+
+**Two corrections to what M.2-M.4 assumed:**
+
+1. **M.2 (occupancy vs envelope) is NOT the fix here.** Zero phantom overlaps: every
+   blocking overlap is real co-presence, and 224/30's three sampled instants all fall inside
+   224/3. The envelope bug is real but is not what blocks this merge. M.2 drops to
+   opportunistic. (It still needs the duplicate-box question answered: 3 observations fully
+   inside a 45-observation tracklet could be a second box on one body, which the
+   `.annotations.json` sidecar could settle by IoU. Worth a tool addition, not a fix.)
+2. **Thresholds DO reach the blockers, via membership.** I had this wrong: the *pair* is
+   threshold-immune, but cluster *membership* is not. At cross 0.80 both 0.757 and 0.760
+   links fail, reid 1 becomes `{206/12, 219/7, 219/113}`, and **all three vetoes disappear**
+   — every remaining pair in the grid is `ok`. The merge becomes possible, then still fails
+   on cam_219's 0.90 vs 0.830. So M.4.1 and M.3 are complementary, not alternatives.
+
+#### M.9.3 M.4.1 reconfirmed under production settings
+
+The sweep, now with covisibility and Phase-1 mutual-best ON as production runs them:
+
+| cross | ids | max | multi | xmerges | below ceiling | min x |
+|---|---|---|---|---|---|---|
+| **0.63** (shipped) | 25 | 7 | 7 | 14 | **1** | 0.649 |
+| **0.70** | 27 | 6 | **7** | 12 | **0** | 0.732 |
+| 0.75 | 28 | 6 | 7 | 11 | 0 | 0.757 |
+| 0.80 | 31 | 6 | 6 | 8 | 0 | 0.818 |
+
+0.70 remains the free move: the sub-ceiling merge goes away and cross-camera identities do
+not drop. This is the first time that result has been produced by a sweep that matches
+production. 0.80 additionally sheds both poisoning scraps at the cost of `multi` 7 → 6.
+
+#### M.9.4 M.5 (scoring mode) is now DOUBTFUL — do not ship it on the old evidence
+
+Cluster vs cluster, reid 1 × reid 11: prototype **0.873**, max_exemplar 0.873, consensus
+**0.653**. Consensus scores the pair *far lower*, the opposite of the synthetic fixture's
+prediction — because these are two multi-person clusters with few matching view pairs, so
+"the top 25% of pairs" averages in mismatches. The 0.873 is itself evidence for the
+average-person effect (two means both pulled toward the population centre score higher than
+any real observation pair does).
+
+That says nothing yet about the number that matters, the *fragment* pair 219/7 ↔ 219/46
+under each mode. `explain_merge_failure.py` now prints exactly that, for every shared
+camera, under all three modes. **Re-run it before M.5 is touched.** If consensus moves 0.830
+down, M.5 is off the table and the answer is M.3 plus a calibrated cam_219 bar.
+
+#### M.9.5 Revised order
+
+1. **M.3** — judge the shared-camera claim per camera on the fragments (0.830 vs cam_219's
+   bar, not 0.873 vs the strictest bar of four cameras). Structural, no threshold moves.
+2. **Calibrate cam_219's bar**, the only one never measured, against the now-known fact that
+   one person's own pose variation there reaches 0.830. This is measurement, not tuning:
+   0.90 was a placeholder.
+3. **M.4.1** — cross 0.70, reconfirmed above.
+4. **M.4.2** — cohesion floor, so a 3-observation scrap cannot join on a 0.760 link and then
+   veto for the cluster.
+5. **M.5** — only if M.9.4's re-run supports it.
+6. **M.2** — opportunistic; no longer on the critical path.
+
 ---
 
 ## Part I — Historical context

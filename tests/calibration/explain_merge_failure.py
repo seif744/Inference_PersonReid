@@ -248,23 +248,40 @@ def main():
     if shared:
         header("WHAT THE SAME-CAMERA CLAIM IS ACTUALLY ABOUT (M.3)")
         print("  Per shared camera, the best fragment-vs-fragment score -- the "
-              "comparison\n  the per-camera bar was calibrated on:")
+              "comparison\n  the per-camera bar was calibrated on, as opposed to a "
+              "mean of cluster means.\n  Under ALL THREE modes, because a mode "
+              "change is only worth making if it moves\n  THIS number in the right "
+              "direction (the cluster-level table above can move the\n  other way "
+              "-- two multi-person clusters have few matching view pairs).\n")
+        print(f"    {'camera':<10}{'best fragment pair':<36}"
+              + "".join(f"{m:>15}" for m in R.SCORING_MODES) + f"{'bar':>7}")
         for cam in sorted(shared):
             best = None
             for x in sorted(k for k in set_a if k[0] == cam):
                 for y in sorted(k for k in set_b if k[0] == cam):
-                    s = R.score_observation_sets(
-                        R._subsample_rows(rows[x], cap),
-                        R._subsample_rows(rows[y], cap),
-                        protos[x], protos[y], mode=kw["scoring"],
-                        top_frac=kw["consensus_top_frac"], cap=cap)
-                    if best is None or s > best[0]:
-                        best = (s, x, y)
+                    scores = {
+                        m: R.score_observation_sets(
+                            R._subsample_rows(rows[x], cap),
+                            R._subsample_rows(rows[y], cap),
+                            protos[x], protos[y], mode=m,
+                            top_frac=kw["consensus_top_frac"], cap=cap)
+                        for m in R.SCORING_MODES}
+                    # Ranked by the mode IN FORCE, so "best pair" means the pair
+                    # reconcile would actually have picked.
+                    if best is None or scores[kw["scoring"]] > best[0]:
+                        best = (scores[kw["scoring"]], x, y, scores)
             cbar = per_cam.get(cam, kw["same_camera_threshold"])
-            s, x, y = best
-            print(f"    {cam}: {_fmt_key(x)} vs {_fmt_key(y)} = {s:.3f} "
-                  f"vs its own bar {cbar:.2f} "
-                  f"{'PASSES' if s >= cbar else 'FAILS'}")
+            _, x, y, scores = best
+            cells = ""
+            for m in R.SCORING_MODES:
+                s = scores[m]
+                cells += f"{s:>10.3f} {'PASS' if s >= cbar else 'fail':<4}"
+            print(f"    {cam:<10}{_fmt_key(x) + ' vs ' + _fmt_key(y):<36}"
+                  f"{cells}{cbar:>7.2f}")
+        print("\n  A fragment pair that FAILS its own camera's bar is one person's "
+              "two appearance\n  modes scoring below a bar set for two different "
+              "people. That is the defect at\n  its root -- everything downstream "
+              "is the consequence.")
 
     # ---- the conflict grid -------------------------------------------------
     covis_enabled, covis_pairs = kw["covisibility"]
