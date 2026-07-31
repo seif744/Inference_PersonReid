@@ -145,6 +145,51 @@ source.rtsp                                 tcp, 5000 ms   (#28/#29)
 live.reconcile.keep_frames                  true           enables 0.3
 ```
 
+### 0.75 The machine, and what is already on it
+
+Development happens on a **CPU-only WSL2 box** (no CUDA). Everything with a camera
+or a GPU happens on the **A6000 server**, and the two are synced by git:
+
+```bash
+# dev box                          # A6000
+git push origin research           git pull origin research
+```
+
+`deploy.sh` rsyncs instead, and is the only way to move gitignored files (model
+weights). `yolo11m.pt` is gitignored, so a fresh clone downloads it on first run --
+or `scp` it if the server has no outbound network.
+
+Server project root: `~/seifer_work/Inference_PersonReid`. Qdrant runs there in
+Docker (`docker compose up -d`, REST 6333, gRPC 6334 already mapped).
+
+**A corpus already exists on that server. A new agent does NOT need to capture a
+run to start working on reconcile:**
+
+| run_id | Observations | Cameras | Notes |
+|---|---|---|---|
+| `20260730_093723` | 4209 | 4 | The J.6-J.12 analysis. No clips (predates the sidecar) |
+| `20260730_111232` | 5048 | cam_213/219/224 | **The best corpus.** Clips + sidecars kept. Operator confirmed reid 5, 6 and 10 each held more than one person |
+| `20260730_120551` | 1482 | cam_213/219/224 | ~2 min. Clips + sidecars kept |
+
+So the sweep and the re-render (§0.3) can be run against real data immediately:
+
+```bash
+RUN=20260730_111232
+python tests/calibration/sweep_reconcile_thresholds.py "$RUN" --cross 0.63,0.70
+python tests/calibration/rerender_from_clips.py "$RUN" --cross 0.63
+```
+
+**cam_206 has been absent from every run since `093723`** -- it was dropped from the
+launch command by a shell error and not re-added. It is the camera with the
+detection-recall complaint (5 people present, 1 detected) and the only one whose
+per-camera bar has never been measured under yolo11m. Put it back in the next run.
+
+For a NEW run, get the id out of the log rather than reading it off the screen:
+
+```bash
+RUN=$(grep -o 'run_id=[0-9_]*' run.log | tail -1 | cut -d= -f2)
+```
+
 ### 0.8 Reading order for a fresh session
 
 Section 0 (this) -> **Part A** (what NOT to retry, with evidence) -> **Part J**
