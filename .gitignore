@@ -38,17 +38,25 @@ models/
 
 # Deploy target (SSH creds/path for deploy.sh) -- never commit
 .deploy.env
-# Acceptance/stage tests -- kept local. These drive the live pipeline with
-# SYNTHETIC frames (tests/live/_synth.py), so they are dev harness rather than a
-# shipped suite. Untracked with `git rm -r --cached tests` (files stay on disk).
+# Acceptance/stage tests -- the SYNTHETIC harness below drives the live pipeline
+# with fake frames, so it is dev tooling rather than a shipped suite and stays
+# local. Everything ELSE under tests/ is tracked -- including tests/live/_synth.py,
+# which the harness and the plan-item regression tests both import. Leaving
+# _synth.py untracked while tracking its importers made `python tests/run_all.py`
+# fail on every fresh clone with ModuleNotFoundError; do not un-track it again.
 #
-# `tests/*` rather than `tests/` so a subtree can be re-included below: git cannot
-# re-include anything whose PARENT DIRECTORY is excluded, and `tests/` excludes the
-# directory itself. `tests/*` excludes only its contents, which leaves negation working.
+# Listed file-by-file rather than as `tests/*` plus negations: plan-item tests now
+# live under tests/live/ alongside the harness, and a blanket exclude would need
+# `git add -f` for each new one -- a test silently left off the remote is exactly
+# the failure this list exists to prevent.
+tests/live/run_stage3_acceptance.py
+tests/live/test_stage2_parallel_inference.py
+tests/live/test_stage3_*.py
+tests/live/test_stage6_offline_reconcile.py
 
-# EXCEPTION -- tests/calibration/ IS tracked. Unlike the synthetic stage tests, it
-# measures on REAL footage and produces the numbers REMEDIATION_PLAN.md Part H depends
-# on, so those scripts are the source of truth for every threshold decision and must not
+# tests/calibration/ IS tracked. Unlike the synthetic stage tests, it measures on
+# REAL footage and produces the numbers REMEDIATION_PLAN.md Part H depends on, so
+# those scripts are the source of truth for every threshold decision and must not
 # live only on one machine. See tests/calibration/README.md.
 
 # Local design/planning notes -- kept out of git by choice. NOTE: because these are
