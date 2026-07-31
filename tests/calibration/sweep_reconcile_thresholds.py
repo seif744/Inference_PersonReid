@@ -149,7 +149,8 @@ def main():
     # resolver), then the sweep overrides only the axes it is sweeping. The FIRST
     # row of a default sweep must therefore reproduce the live run's identity count
     # -- that equality is what makes every other row meaningful.
-    base_kw = reconcile_settings(owns=("--cross", "--same", "--scoring"))
+    base_kw = reconcile_settings(owns=("--cross", "--same", "--scoring"),
+                                 extra_flags=("--url", "--path"))
     crosses = [float(x) for x in
                (arg("--cross") or f"{base_kw['threshold']:.2f},0.70,0.75,0.80"
                 ).split(",")]

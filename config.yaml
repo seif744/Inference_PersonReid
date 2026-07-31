@@ -508,6 +508,37 @@ identity:
     # production and the flag is only needed to force it on. See Part M.7 item M-c.
     same_camera_reciprocal_best: true
 
+    # ITERATE PHASE 1 (REMEDIATION_PLAN.md M.9.11). OFF = one pass, which is what
+    # has always shipped.
+    #
+    # Phase 1's own comment used to claim that a person fragmented into 3+ pieces
+    # would be consolidated later by Phase 2's rounds. That is false: Phase 2's
+    # `mergeable_cross` requires a CROSS-camera member pair, so two clusters that
+    # both sit in one camera are excluded outright and the promised consolidation
+    # never happens.
+    #
+    # Measured on run 20260731_060425, cam_206, ONE person in three fragments:
+    #     206/26 <-> 206/43 = 0.916  merged (each other's best)
+    #     206/12 <-> 206/43 = 0.906  ABOVE the 0.90 bar, REFUSED
+    # 12's best partner is 43; 43's best is 26. Mutual-best rejected an edge that
+    # cleared the bar by 0.006, 12 was orphaned, and it was then captured
+    # cross-camera at 0.771 into a DIFFERENT person's identity -- the operator's
+    # "it misidentified someone in cam_206 as reid 1, then a few seconds later they
+    # get reid 6". No bar fixes this: the edge is already above the bar, and
+    # lowering cam_206 to 0.85/0.80 leaves 206/12 exactly where it was while fusing
+    # cam_206's crowd (25 -> 21 -> 20 identities).
+    #
+    # ON lets a fragment compete against the CLUSTER its sibling formed instead of
+    # losing once and never being reconsidered. It relaxes nothing: every merge
+    # still clears that camera's bar and still has to be a mutual best. Round 1 is
+    # identical to the single pass by construction, so OFF is exactly the old
+    # behaviour.
+    #
+    # Test it alone, on a captured run, and watch cam_206 at 0-7s:
+    #   python tests/calibration/sweep_reconcile_thresholds.py <id> --same-rounds
+    #   python tests/calibration/rerender_from_clips.py <id> --same-rounds
+    same_camera_rounds: false
+
     # CROSS-CAMERA SIMULTANEITY VETO (#38, Phase 7). conflict() used to skip every
     # cross-camera pair, so two tracklets overlapping IN TIME in cameras that
     # cannot both see one person still merged on appearance alone. A person in

@@ -1825,16 +1825,464 @@ the evidence that actually supports it. `explain_merge_failure.py` now reports w
 united a pair and names the mutual-best partner that blocked Phase 1, so this is checkable
 on any future run.
 
+#### M.9.9 OPERATOR VERDICT on the matched re-render (A = shipped, B = cam_219 0.85)
+
+Watched on `20260731_060425`, both renders from the same code path, differing only in
+cam_219's same-camera bar. Verbatim in substance, as Part L.4 requires:
+
+| camera | observation | reading |
+|---|---|---|
+| cam_219 | *"the guy did not change, he remained reid 1 throughout"* | **the reported defect is FIXED.** 219/7 + 219/46 + 219/113 are one identity |
+| cam_206 | *"the lighting is pretty bad BUT it misidentified someone there as reid 1 when the reid 1 in cam_219 never was there, then a few seconds later gets assigned to reid 6"* | **confirmed false merge.** cam_206/12 is NOT him. It joined on the 0.818 link |
+| cam_224 / cam_206 | *"at the end of cam_224 the person id'ed as reid 12 is the same as the reid 12 in cam_206 for those first few seconds"* | **confirmed CORRECT** cross-camera link. GID 12 = cam_206(53,69,118) + cam_213(140) + cam_224(142) |
+
+**The cam_206 false merge is PRE-EXISTING, not caused by the bar change.** The shipped run's
+own summary already reads `GID 1: cam_206 (0012) + cam_213 (0051) + cam_219 (0007 + 0113) +
+cam_224 (0030)`, and GID 6 is `cam_206(26,43)` in both A and B. cam_206's behaviour is
+byte-identical between the two renders. So on the evidence so far the bar change is a strict
+improvement: it fixed cam_219 and changed nothing in cam_206.
+
+#### M.9.10 The cam_206 defect is the SAME defect, one camera over
+
+The operator's *"reid 1 for a few seconds, then reid 6"* in cam_206 is one person split
+across 206/12 and 206/26+43, with the first fragment captured by someone else's identity:
+
+- cam_206's same-camera bar is the **global 0.90** — like cam_219's was, it has never been
+  calibrated for this footage.
+- 206/26 + 206/43 merged at **0.916**, so with `same_camera_reciprocal_best` on, 26's best
+  partner is 43. If 206/12 scores below 0.916 against either, mutual-best refuses it and
+  206/12 is orphaned — **exactly the mechanism that orphaned 219/7** (M.9.7).
+- An orphan is then free to be captured cross-camera, which is what the 0.818 link did.
+
+If that is what the numbers say, then the general finding is that **the uncalibrated 0.90
+default is the root defect, not one camera's setting** — and the fix is per-camera
+calibration plus M.3, not a patch for cam_206. If 206/12 instead scores *far* below its own
+siblings, the bar is not the answer and M.4.2's cohesion floor is.
+
+`explain_merge_failure.py <run> --tracklets cam_206:12,cam_206:26` decides which, and it is
+the next measurement.
+
+#### M.9.11 MEASURED — cam_206's bar is NOT the answer, and Phase 1 has a structural hole
+
+`explain_merge_failure.py --tracklets cam_206:12,cam_206:26`:
+
+    cam_206   206/12 vs 206/43   prototype 0.906 PASS   max_exemplar 0.948 PASS   bar 0.90
+
+**206/12's edge to its own sibling is ABOVE cam_206's bar.** It was refused by
+mutual-best: 206/26 + 206/43 merged at 0.916, so 43's best partner is 26, and 12 —
+whose best partner *is* 43 — is nobody's best. It was orphaned by 0.010 of cosine, then
+captured cross-camera at 0.771 into the operator's identity. That is the cam_206
+mislabel, fully explained.
+
+Sweeping cam_206's bar confirms it is the wrong lever:
+
+| same-camera bars | ids | 206/12 lands in | new same-camera clusters |
+|---|---|---|---|
+| 219=.85 | 25 | GID 1 (wrong) | — |
+| 219=.85, **206=.85** | **21** | GID 1 (wrong) | `GID 7: cam_206(27,29,67,75,83)` |
+| 219=.85, **206=.80** | **20** | GID 1 (wrong) | + `GID 9: cam_206(32,53,69,118)` |
+
+206/12 does not move at any bar, while cam_206 loses 4-5 identities to new
+multi-tracklet clusters in the camera with five people and bad lighting. **Do not lower
+cam_206's bar.** M.9.10's hypothesis is refuted.
+
+**The real defect: Phase 1 ran exactly one pass, and its comment lied about the
+consequence.** It claimed a 3+ way fragmentation would be consolidated later by Phase
+2's rounds. Phase 2 cannot: `mergeable_cross` requires a cross-camera member pair, so
+two clusters that both sit in one camera are excluded outright
+(`NOT_MERGEABLE_CROSS`). The promised second chance never existed.
+
+**Implemented**, behind `identity.reconcile.same_camera_rounds`, default **off**:
+Phase 1 now iterates like Phase 2, re-deriving mutual-best from current clusters each
+round. Round 1 is identical to the old pass by construction, so off == old behaviour,
+which the full suite confirms.
+
+**And iterating alone would have relaxed the guard** — the new regression test caught
+it before it shipped. With only two clusters left in a round, mutual-best is *vacuous*
+(the one remaining pair is trivially each other's best), and a stranger at 0.910 / 0.890
+against the two fragments scored 0.905 against their mean and merged. So a same-camera
+merge now additionally requires **every cross-member pair** to clear the bar: merging
+asserts all these fragments are one person, so every fragment must agree, and a mean
+must not let a majority outvote a member that disagrees. Same insight as M.3.
+
+    chain     C vs A 0.906, C vs B 0.974  -> both clear 0.90, merges
+    stranger  S vs A 0.910, S vs B 0.890  -> B disagrees, refused
+
+For singleton clusters that is exactly the old single-pair test, so round 1 is
+unaffected. `tests/live/test_reconcile_same_camera_rounds.py`, 17 checks.
+
+**Open question the measurement must answer:** `_cluster_prototype` averages tracklet
+prototypes **unweighted**, so 206/26's 4 observations pull the cluster centre as hard as
+206/43's 149. That can pull the centre away from the orphan it is supposed to recover.
+Rounds are *necessary* for cam_206; whether they are *sufficient* there depends on that
+geometry, and observation-weighted prototypes are the follow-up if they are not.
+
+#### M.9.12 The cam_219 fix passes by 0.003 — take 0.80, not 0.85
+
+The merge log at cam_219=0.85 shows which merge fixed the operator's bug:
+
+    same-camera cluster merge ('cam_213', 79) + ('cam_219', 7) (cosine 0.853 >= 0.85)
+
+**It cleared the bar by 0.003.** At 0.86 it fails. Combined with M.9.7 (the union
+happens at cluster level, in an order-dependent phase, on a mean of means) this is far
+too thin to ship as-is.
+
+0.80 produces byte-identical clusters on this run and has real margin: 0.853 against
+0.80 at cluster level, and 0.830 against 0.80 at the fragment level that M.3 would use.
+**Prefer cam_219 = 0.80.** This reverses M.9.6's "prefer 0.85, less permissive" — same
+measured output, an order of magnitude more headroom, and it is the value M.3 will still
+work at.
+
+#### M.9.13 OPERATOR VERDICT on render C (cam_219=0.80 + `same_camera_rounds`)
+
+| observation | reading |
+|---|---|
+| *"the person marked reid 10 in cam_219 is completely different from the person marked reid 10 in cam_224. These are 2 DIFFERENT people"* | **confirmed FALSE cross-camera merge.** GID 10 = cam_206(34) + cam_219(6) + cam_224(5) |
+| *"in cam_206 the different guy is still assigned reid 1 for the first 8 seconds then gets reid 6"* | **rounds did NOT fix it.** 206/12 (t=0..6.7 s, 17 obs) is still captured into the walker's identity |
+| *"you may have made the assumption that if reid 10 is in 224 then he HAS to be in 219; it's a possibility BUT not a 100% guarantee"* | **methodologically correct, and a caution this analysis needs.** See below |
+
+**On the assumption.** A conflict-free timeline is *"not disproven"*, never *"confirmed"* —
+and with four overlapping cameras almost any timeline is conflict-free. The GID 1 argument
+in M.9.6 leaned on temporal coherence as corroboration; it is not. Only labels are. Two of
+the eight multi-camera identities at cross 0.63 are now labelled WRONG (GID 1's cam_206
+member, and GID 10 entirely), which means **`multi` was inflated by false merges and cannot
+be read as a quality signal on its own.** Every future sweep row must be read with the
+labels, not with "multi should stay healthy".
+
+#### M.9.14 GID 10: the merge asserts a pair that was NEVER SCORED
+
+The operator's question was "if embeddings are being checked, why is this happening?" They
+were checked — just not between the two tracklets the result claims are one person:
+
+    cross-camera cluster merge ('cam_206', 34) + ('cam_219', 6)  cosine 0.779
+    cross-camera cluster merge ('cam_206', 34) + ('cam_224', 5)  cosine 0.732
+
+**cam_219/6 vs cam_224/5 was never compared.** Both attached to the hub cam_206/34, and
+union-by-transitivity produced the identity. This is the failure the cross-threshold comment
+predicted — *"clusters grow by union, so two weak links in a row fuse three strangers"* —
+except both links are ABOVE the measured 0.661 stranger ceiling, so the ceiling did not
+catch it either.
+
+It is the same structural defect just fixed in Phase 1 (M.9.11's `all_member_pairs_clear`),
+one lane over: **a merge is judged on a cluster mean while the pairs it actually asserts go
+unchecked.** The symmetric fix is to require the implied member pairs to clear a floor.
+Which floor is a real question, because cross-camera appearance is legitimately weaker than
+same-camera — a person's front in cam A and back in cam C can both match a side view in
+cam B without matching each other. Requiring the full cross bar may be too strict;
+requiring "no member pair below the measured different-person ceiling" uses a measured
+number rather than a new tunable. **Measure `219/6 vs 224/5` before choosing.**
+
+#### M.9.15 Two labelled false merges bracket the cross bar
+
+| link | cosine | operator label |
+|---|---|---|
+| 206/12 → the walker's cluster | **0.771** | WRONG |
+| 206/34 → 219/6 | **0.779** | WRONG |
+| 206/34 → 224/5 | 0.732 | WRONG |
+| the walker's own links (219/46+224/3, +224/102, 213/79+219/46, 213/79+219/7) | 0.966, 0.948, 0.887, 0.853 | RIGHT |
+
+There is a clean gap: every labelled-correct link is **≥ 0.853**, every labelled-wrong one is
+**≤ 0.779**. A cross bar anywhere in 0.78–0.85 removes all three confirmed false merges and
+keeps the walker's identity whole. That is the first time this project has had *labels* on
+both sides of the cross bar rather than a heuristic — and it says 0.63 is far too low, by
+about 0.15, not by the 0.07 the ceiling suggested.
+
+Cost to measure, not assume: which of the other cross-camera links die with them.
+
+#### M.9.16 MEASURED — the cross bar is bracketed to (0.779, 0.837); take 0.80
+
+**First, a negative result that kills M.9.14's proposed guard.** `219/6 vs 224/5`, the pair
+the GID 10 merge asserts and never scored, is **0.713** — above the cross bar, above the
+0.661 stranger ceiling. So an all-member-pairs guard would NOT have caught this false merge
+at either candidate floor. The hub-merge structure is real but it is not what needs fixing
+here; the bar is. **Do not implement the cross-camera all-pairs guard on this evidence.**
+
+Sweep at cam_219=0.80, with `same_camera_rounds`:
+
+| cross | ids | max | multi | xmerges | min accepted x |
+|---|---|---|---|---|---|
+| 0.63 | 25 | 9 | 8 | 13 | 0.662 |
+| **0.78** | 31 | 8 | 5 | 7 | 0.837 |
+| **0.80** | 31 | 8 | 5 | 7 | 0.837 |
+| 0.85 | 33 | 8 | 4 | 5 | 0.860 |
+
+At 0.78 and 0.80 (identical output) **all three operator-confirmed false merges are gone and
+nothing labelled correct is lost**:
+
+- the walker becomes `GID 27: cam_213(79,88) cam_219(7,46,113) cam_224(3,68,102)` — all 8 of
+  his tracklets, and **cam_206(12) is out**
+- **GID 10 is dissolved entirely** — 206/34, 219/6, 224/5 all separate
+- `GID 12: cam_206(53,69,118) cam_213(140) cam_224(142)` survives intact — the operator's
+  confirmed-CORRECT cam_206 ↔ cam_224 link, which is the positive control
+
+`multi` falls 8 → 5, and that is the *correct* direction here. Every multi-camera identity
+lost was either confirmed wrong or held together by a scrap: GID 10 (confirmed wrong),
+GID 1's cam_206/12 (confirmed wrong, 0.771), GID 3's cam_224/30 (3 observations, 0.727),
+GID 7's cam_213/51 (6 observations over 1.6 s, 0.696), GID 11's cam_206/48 (3 observations,
+0.662). **This is why `multi` must never be read without labels** (M.9.13).
+
+**The decision boundary is bracketed.** Labelled-wrong tops out at 0.779; labelled-right
+bottoms out at 0.837 (GID 12). Any bar in that 0.058-wide gap works on this run, and 0.80
+sits near its midpoint. 0.78 is only 0.001 clear of the highest false merge, so it has no
+margin. **cross = 0.80.**
+
+This is the first cross-bar value in the project's history chosen from labels on *both*
+sides rather than from a one-sided ceiling. The two previous cross-bar changes (0.63 → 0.70,
+reverted) had only the ceiling. Note the honest caveat unchanged: one run, one operator
+session, ~11 subjects.
+
+#### M.9.17 SHIP CANDIDATE — two lines
+
+    identity.reconcile.threshold: 0.63 -> 0.80
+    identity.reconcile.per_camera.cam_219.same_camera_threshold: (absent, 0.90) -> 0.80
+
+`same_camera_rounds` stays **false**. It fixes a real structural hole (M.9.11) and is tested,
+but it changed nothing measurable on this run — it did not move 206/12, because 206/12's
+problem was capture by a 0.771 link, not failure to reach its siblings. Shipping a change
+whose only measured effect is nil adds risk for no benefit. It stays in the codebase, off,
+until a run exercises it. cam_206 stays at 0.90 (M.9.11: lowering it is actively harmful).
+
+Expected on the next live run: **more identities, fewer cross-camera links** (31 vs 25, 5 vs
+8 on this footage). That is the intended direction, not a regression — do not "fix" it by
+lowering the bar again without labels.
+
+#### M.9.18 RETRACTED — M.9.16's "clean bracket" is wrong; the bands OVERLAP
+
+Two more operator labels, and they destroy the separation M.9.16 claimed:
+
+| pair | cosine | label | how it failed |
+|---|---|---|---|
+| cam_219/6 ↔ cam_224/30 | **0.688** | **SAME person** | below the 0.80 bar → split |
+| cam_206/107 ↔ cam_213/133 | **0.818** | **SAME person** | TEMPORAL_CONFLICT, 1.3 s > 1.0 s |
+| cam_206/12 ↔ the walker | 0.771 | different | — |
+| cam_206/34 ↔ cam_219/6 | 0.779 | different | — |
+
+**A labelled-TRUE link at 0.688 sits below two labelled-FALSE links at 0.771 and 0.779.
+No cross-camera threshold separates them.** M.9.16's bracket of (0.779, 0.837) was an
+artifact of having labels only on the strong end. This is exactly J.6's finding — the
+per-subject same/different boundaries overlap — now reproduced on the CROSS-camera axis with
+operator labels instead of statistics.
+
+The consequence is structural, and it kills the shape of the whole M.4 line of attack:
+**the cross bar cannot be tuned to correctness on this footage.** Any value trades a false
+merge for a false split. A third lever is required, and appearance is not it.
+
+Note WHAT the 0.688 pair is: cam_224/30 is **3 observations over 0.8 s at a bad angle**. Its
+prototype is three crops of one difficult instant. The pair is unlinkable not because the bar
+is wrong but because the evidence does not exist. See M.9.20.
+
+#### M.9.19 A CONFIRMED FALSE VETO — the covisibility config is wrong
+
+`cam_206/107 ↔ cam_213/133` is one person (operator-labelled) and was refused by
+`TEMPORAL_CONFLICT_CROSS_CAMERA`: **1.3 s of wall-clock overlap against a 1.0 s tolerance.**
+This is the first *labelled* instance of the failure invariant L.2.2 exists to prevent — a
+wrong veto manufacturing a second identity for someone who has one — and item M-h predicted
+it: only `cam_224 ↔ cam_219` is declared `covisible`, while the room's cameras overlap and
+`ts` is RECEIVE time (#15) carrying jitter, decode-cost differences and frame-rate
+quantisation.
+
+**cam_213 is implicated in every false veto found so far**, at margins of 0.3-0.6 s over a
+1.0 s tolerance:
+
+    cam_213/133 <-> cam_206/107   1.3 s   (blocks a confirmed-same person)
+    cam_213/51  <-> cam_219/46    1.6 s   (blocked the original reid 1 / reid 11 merge)
+    cam_213/51  <-> cam_224/3     1.6 s   (same)
+
+cam_213's tracklets are short (6-12 observations, 1.6-3.8 s spans), so a 1.3-1.6 s "overlap"
+is most of a tracklet's life — the quantity being compared is barely longer than the noise
+in it. Either those camera pairs genuinely see one person at once, or the tolerance is inside
+the jitter; both mean the veto is asserting an impossibility that is not one.
+
+**This must be settled before any further threshold work**, because the veto runs BEFORE
+scoring: while it is wrong, every bar is being calibrated against a candidate space that has
+had true pairs removed from it. `--no-covisibility` bounds what it is costing.
+
+#### M.9.20 The operator's own answer: prefer UNRESOLVED to a wrong number
+
+*"in cam_224 he is at a bad angle so it goes from unresolved to reid 31 but I still don't
+think it should show the wrong reid."*
+
+That is a product requirement, and it points at a lever no threshold provides.
+`cam_224/30` has **3 observations** — exactly `min_tracklet_observations`, so it survives
+suppression by one observation and is then minted as its own identity, which puts a WRONG
+number on screen. At `min_tracklet_observations: 4` it is suppressed instead and renders as
+UNRESOLVED, which is what the operator asked for: no claim rather than a false claim.
+
+This is the honest response to M.9.18. When the evidence cannot support an identity claim,
+the fix is not to move a bar until the claim lands somewhere — it is to decline to claim.
+Sweep `--min-obs 4,5` at cross 0.80 and count how many tracklets go from "wrong number" to
+"no number".
+
+#### M.9.21 The rounds change has still never run — stale deployment, twice
+
+Both `explain` runs and both sweeps report:
+
+    settings: ... reciprocal=on same_reciprocal=on covisibility=on/6 pairs
+    tracklet reconcile: same-camera reciprocal-best ON -- 10 merged, 24 above-bar pair(s) refused
+
+No `same_rounds=` field, and the log line lacks the `over N round(s)` text this batch added.
+So the box is still running the pre-rounds code and `--same-rounds` has been silently
+ignored in every run that passed it. `validate_flags` would have failed loudly on exactly
+this — and it is in the same un-deployed batch. **Nothing about Phase 1 rounds has been
+measured yet; treat M.9.11 as untested.**
+
+#### M.9.22 MEASURED — the veto is LOAD-BEARING. Do not switch it off.
+
+`--no-covisibility` at cross 0.80: 28 identities, **max 13**, min accepted x 0.805.
+
+It does recover the confirmed-true link:
+
+    GID 18: cam_206(107)  cam_213(133)  cam_224(137)      <- the reid 18/24 person, whole
+
+and it creates a confirmed-FALSE one, at a score 0.013 lower:
+
+    GID 12: cam_206(53,69,118) cam_213(79,88,140) cam_219(7,46,113) cam_224(3,68,102,142)
+
+That 13-tracklet cluster fuses **two separately operator-confirmed people**: the walker
+(cam_213/79,88 + cam_219/7,46,113 + cam_224/3,68,102) and the GID 12 man whose cam_206 ↔
+cam_224 link the operator verified by eye. The veto had been the only thing keeping them
+apart.
+
+So the answer to M.9.19 is not "the veto is wrong", it is **"the veto's TOLERANCES are wrong
+for at least one camera pair"**. Switching it off trades a true 0.818 for a false 0.805 —
+another overlapping pair of labels, 13 thousandths apart. Global on/off is not the lever;
+per-pair tolerance is.
+
+**The open question that decides the fix:** which member pair blocks the walker ↔ GID 12
+fusion when the veto is ON? If it is *not* cam_206 ↔ cam_213, then raising cam_206 ↔ cam_213
+alone recovers GID 18 without enabling the fusion — a clean, targeted win. If it *is* that
+pair, the two outcomes are inseparable by tolerance and this lever is exhausted too.
+
+#### M.9.23 MEASURED — `min_tracklet_observations` is not a discriminator either
+
+| min_obs | ids | what changed |
+|---|---|---|
+| 3 (shipped) | 31 | — |
+| **4** | 27 | `cam_224(30)` gone (**wrong** number removed, as intended) **and `cam_224(142)` gone** (**right** link removed) |
+| **5** | 24 | also `cam_206(26)` gone — **and `GID 1: cam_206(12,43)` appears** |
+
+M.9.20's proposal half-works and half-backfires. Both `cam_224/30` and `cam_224/142` are
+**3-observation cam_224 tracklets**; one was linked WRONGLY (0.688 to cam_219/6) and the
+other CORRECTLY (0.860 to cam_206/69, operator-verified). Suppression cannot tell them apart,
+because the thing it measures — observation count — is identical. So raising the bar removes
+a false claim and a true claim together. It is a blunt instrument, not a fix.
+
+**But min_obs 5 produced the most informative accident of the whole investigation:**
+
+    GID 1: cam_206(12,43)
+
+**cam_206's split closed.** Suppressing `cam_206/26` (4 observations) freed cam_206/43's
+mutual-best slot, so 43's best partner became 12 at 0.906 and the pair merged. That is
+M.9.11's mechanism confirmed from the opposite direction: the orphaning was caused *entirely*
+by 26 occupying the slot, and removing 26 — or letting 12 compete against the {26,43} cluster
+in a second round — closes it. **Phase 1 rounds should achieve the same result without
+discarding a real tracklet**, and remain untested (M.9.21).
+
+#### M.9.24 Where this leaves the whole approach: appearance is exhausted
+
+Every global knob now trades one operator-confirmed error for another, and the margins are
+inside the noise of the embedding:
+
+| lever | recovers | costs | gap |
+|---|---|---|---|
+| cross bar | 0.688 true pair | 0.771 / 0.779 false pairs | **inverted** |
+| covisibility off | 0.818 true link | 0.805 false merge | **0.013** |
+| min_obs 4 | removes 0.688 false claim | removes 0.860 true link | identical evidence |
+
+This is J.6's overlapping-boundaries finding, reproduced three more times on three different
+axes with operator labels rather than statistics. **No global threshold on appearance
+separates the remaining errors on this footage.** Four rounds of threshold tuning were
+reverted before this investigation; the reason is now measured rather than suspected.
+
+Two levers remain that are NOT global appearance thresholds:
+
+1. **Per-pair covisibility tolerance** (M.9.22) — uses topology, not similarity. Free to
+   measure offline, and the only clean win still on the table.
+2. **Evidence density.** The recurring subject of every remaining defect is a **3-4
+   observation tracklet**: `cam_224/30` (3), `cam_224/142` (3), `cam_206/26` (4),
+   `cam_206/48` (3), `cam_213/51` (6). At `reid.interval_sec: 0.4` a one-second appearance
+   yields 2-3 observations, so these prototypes are three crops of one instant. Halving the
+   interval doubles them. **This is the first item in the entire investigation that genuinely
+   requires a new live run**, because it changes what gets recorded rather than how it is
+   clustered.
+
+Geometry (ADR-003) is the third, and is the principled answer to an exhausted appearance
+signal — but it is a subsystem, not a setting.
+
+#### M.9.25 MEASURED — the veto's own evidence separates cleanly. The tolerance is the bug.
+
+Every labelled veto in this investigation, sorted by overlap:
+
+| overlap | verdict | pair | case |
+|---|---|---|---|
+| 1.2 s | **WRONG** | cam_219/113 ↔ cam_213/140 | one of 7 blockers of walker ↔ GID 12 |
+| 1.3 s | **WRONG** | cam_206/107 ↔ cam_213/133 | splits the reid 18 / 24 man |
+| 1.6 s | **WRONG** | cam_213/51 ↔ cam_219/46 | blocked the original reid 1 / reid 11 |
+| 1.6 s | **WRONG** | cam_213/51 ↔ cam_224/3 | same |
+| 3.0 s | RIGHT | cam_213/88 ↔ cam_206/43 | walker vs the cam_206 man |
+| 3.1 s | RIGHT | cam_219/46 ↔ cam_206/69 | walker vs GID 12 |
+| 3.1 s | RIGHT | cam_224/68 ↔ cam_206/69 | walker vs GID 12 |
+| 3.8 s | RIGHT | cam_213/79 ↔ cam_206/43 | walker vs the cam_206 man |
+| 5.5 s | RIGHT | cam_224/3 ↔ cam_206/53 | walker vs GID 12 |
+| 8.0 s | RIGHT | cam_219/46 ↔ cam_206/53 | walker vs GID 12 |
+| 8.6 s | RIGHT | cam_224/102 ↔ cam_206/118 | walker vs GID 12 |
+| 10.5 s | RIGHT | cam_219/113 ↔ cam_206/118 | walker vs GID 12 |
+
+**Wrong vetoes: 1.2-1.6 s. Right vetoes: 3.0-10.5 s. A gap of (1.6, 3.0), midpoint 2.3 s.**
+The shipped tolerance is **1.0 s — below every wrong veto**, so it fires on all four.
+
+This is the first lever in the whole investigation that fixes confirmed errors **without
+costing another one.** Every labelled case comes out correct at any tolerance in that gap.
+And the config comment already had the right intent — *"tolerances are generous on purpose:
+`ts` is RECEIVE time, so it carries network jitter, decode-cost differences and frame-rate
+quantisation. 1.0s vetoes only sustained overlap, not timing noise"* — the reasoning was
+sound and the number was simply three times too small. Genuine co-presence in this room runs
+3-10 s; 1.2-1.6 s is the noise floor of a receive-time clock.
+
+The 7 blockers of walker ↔ GID 12 do **not** include cam_206 ↔ cam_213, and 6 of the 7 are
+≥ 3.1 s, so raising the tolerance to 2.3 s releases only the 1.2 s one and the fusion stays
+blocked six ways over.
+
+`--covis-tolerance S` added to the offline tools to sweep this axis (`--no-covisibility` was
+all-or-nothing and could not express it).
+
+#### M.9.26 M.3 would block the same false fusion INDEPENDENTLY, on appearance alone
+
+From the same output, walker vs GID 12:
+
+    cluster mean (in force)          0.823   PASSES the 0.80 bar
+    cam_213: 213/88 vs 213/140       0.712   fails
+    cam_224: 224/102 vs 224/142      0.730   fails
+
+The two clusters share cam_213 and cam_224, and **every fragment pair inside those shared
+cameras scores 0.09-0.11 BELOW the bar while the mean of the cluster means passes it.** So
+M.3 — judge the shared-camera claim on the fragment pairs — refuses this merge on appearance
+evidence, with no temporal veto involved at all.
+
+Checked against the labelled cases M.3 must not break:
+
+- walker's own assembly, 213/79 + 219/7: shares cam_219, fragment 219/7 ↔ 219/46 = **0.830 ≥ 0.80** → kept
+- reid 18 ↔ reid 24: camera-disjoint, no same-camera claim, 0.818 ≥ 0.80 → kept
+
+So M.3 and the tolerance fix are independent guards that both point the right way on every
+label available. That is much stronger than either alone, and it is the first time two
+mechanisms have agreed rather than traded.
+
 #### M.9.8 Revised order
 
 1. **Watch the re-render.** `cmp_cam_219_*.mp4` at 8-14 s and 58-75 s, against
    `output_cam_219.mp4` from the run. Nothing ships before this; it is the only ground truth.
-2. **cam_219 same-camera bar 0.90 → 0.85** (M.9.6). One line, at the shipped cross bar,
-   improving every measured column. Prefer 0.85 over 0.80: identical output, less permissive.
-3. **M.3** — judge the shared-camera claim per camera on the fragment pair (M.9.7). Turns
+2. **cam_219 same-camera bar 0.90 → 0.80** (M.9.6, revised by M.9.12). Identical measured
+   output to 0.85 but the deciding merge clears by 0.053 instead of 0.003.
+3. **`same_camera_rounds: true`** (M.9.11), if the sweep shows 206/12 moving to GID 6
+   without cam_206 over-merging. Implemented and tested; needs one offline measurement.
+4. **M.3** — judge the shared-camera claim per camera on the fragment pair (M.9.7). Turns
    step 2 from an order-dependent cluster-mean accident into a decision resting on the 0.830
    that actually supports it. Ship behind a flag, default off, measure, then enable.
-4. **M.4.2** — cohesion floor, so a 3-observation scrap cannot join on a 0.760 link and then
+5. **Observation-weighted `_cluster_prototype`** — only if step 3 does not move 206/12
+   (M.9.11's open question). A 4-observation fragment should not pull a cluster centre as
+   hard as a 149-observation one.
+6. **M.4.2** — cohesion floor, so a 3-observation scrap cannot join on a 0.760 link and then
    veto for the cluster. Independent of the above and still worth having.
 5. ~~**M.4.1** cross 0.70~~ — **no longer needed.** Step 2 takes `below ceiling` to 0 at
    0.63, and 0.70 costs a cross-camera identity (8 → 7). Leave the cross bar alone.

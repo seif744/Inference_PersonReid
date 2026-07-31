@@ -99,7 +99,9 @@ def main():
     # `same_camera_reciprocal_best`, so the video it produced was rendered from a
     # clustering that does not ship -- and the video is the ONLY ground truth this
     # project has. See REMEDIATION_PLAN.md Part M.
-    base_kw = reconcile_settings(owns=("--cross", "--scoring"))
+    base_kw = reconcile_settings(owns=("--cross", "--scoring"),
+                                 extra_flags=("--url", "--path", "--out",
+                                              "--fps", "--dir"))
     crosses = [float(x) for x in
                (arg("--cross") or f"{base_kw['threshold']:.2f}").split(",")]
     scorings = (arg("--scoring", "") or "").split(",")

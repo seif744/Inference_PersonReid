@@ -202,6 +202,7 @@ def resolve_reconcile_kwargs(cfg, log=print):
         "covisibility": resolve_covisibility(recon, log=log),
         "same_camera_reciprocal_best": bool(
             recon.get("same_camera_reciprocal_best", False)),
+        "same_camera_rounds": bool(recon.get("same_camera_rounds", False)),
     }
 
 
@@ -224,6 +225,7 @@ def describe_reconcile_kwargs(kw):
         + f" min_obs={kw['min_tracklet_observations']}"
         f" reciprocal={'on' if kw['require_reciprocal_best'] else 'OFF'}"
         f" same_reciprocal={'on' if kw['same_camera_reciprocal_best'] else 'OFF'}"
+        f" same_rounds={'on' if kw.get('same_camera_rounds') else 'OFF'}"
         f" covisibility={'on/' + str(len(covis_pairs)) + ' pairs' if covis_on else 'OFF'}")
 
 
@@ -485,6 +487,7 @@ def reconcile_tracklets(store, threshold, run_id=None,
                         max_observations_per_side=64,
                         covisibility=None,
                         same_camera_reciprocal_best=False,
+                        same_camera_rounds=False,
                         quality_out=None):
     """
     Rebuild global ids from camera-local tracklets.
@@ -795,22 +798,18 @@ def reconcile_tracklets(store, threshold, run_id=None,
         members.pop(loser, None)
         return True
 
+    def current_roots():
+        roots = defaultdict(set)
+        for k in keys:
+            roots[find(k)].add(k)
+        return roots
+
     # Phase 1: repair same-camera track fragmentation with a higher threshold.
     # A pair is a merge candidate iff it shares a camera, its spans are disjoint,
     # and it clears THAT CAMERA's bar (both tracklets are in the same camera here,
     # so the bar is unambiguous -- a[0] == b[0]).
-    same_pairs = []
-    for i, a in enumerate(keys):
-        for b in keys[i + 1:]:
-            if a[0] != b[0]:
-                continue
-            if not _spans_disjoint(tracklets[a]["span"], tracklets[b]["span"]):
-                continue
-            s = pair_score({a}, {b}, protos[a], protos[b])
-            if s >= cam_bar(a[0]):
-                same_pairs.append((s, a, b))
-
-    # RECIPROCAL BEST in Phase 1 (opt-in). Phase 2 has always required mutual
+    #
+    # RECIPROCAL BEST in Phase 1. Phase 2 has always required mutual
     # nearest-neighbour; Phase 1 never did, so it merged EVERY above-bar pair in
     # score order. That is how one weak edge drags a stranger into a cluster: in
     # cam_224, tracklet 58's best partner was 16 at 0.937, yet 58+112 (0.823) and
@@ -818,38 +817,122 @@ def reconcile_tracklets(store, threshold, run_id=None,
     # refuses both WITHOUT moving any threshold, which is why it is worth more than
     # another bar sweep -- it removes the trade instead of repositioning it.
     #
-    # The cost is the mirror image: a person genuinely fragmented into three or
-    # more pieces has only ONE mutual-best pair per round here, so the rest wait
-    # for Phase 2's rounds to consolidate them. Phase 2 re-scores from scratch each
-    # round, so chains still close, just later.
-    same_best = {}
-    if same_camera_reciprocal_best:
-        for s, a, b in same_pairs:
-            if s > same_best.get(a, (-1.0, None))[0]:
-                same_best[a] = (s, b)
-            if s > same_best.get(b, (-1.0, None))[0]:
-                same_best[b] = (s, a)
-
-    def same_pair_mutual(a, b):
-        if not same_camera_reciprocal_best:
-            return True
-        return (same_best.get(a, (None, None))[1] == b
-                and same_best.get(b, (None, None))[1] == a)
+    # ---- WHY THIS NOW RUNS IN ROUNDS (Part M.9.11) -------------------------
+    # The comment here used to say: "a person fragmented into three or more pieces
+    # has only ONE mutual-best pair per round, so the rest wait for Phase 2's rounds
+    # to consolidate them -- chains still close, just later." THAT WAS FALSE, and it
+    # cost a real identity. Phase 2 cannot close a same-camera chain at all:
+    # `mergeable_cross` requires at least one CROSS-camera member pair, so a pair of
+    # clusters that both sit in one camera is excluded outright
+    # (dlog.NOT_MERGEABLE_CROSS). The promised later consolidation never happens.
+    #
+    # Measured on run 20260731_060425, cam_206, one person in three fragments:
+    #     206/26 <-> 206/43  = 0.916   merged (each other's best)
+    #     206/12 <-> 206/43  = 0.906   ABOVE cam_206's 0.90 bar, REFUSED
+    # 12's best partner is 43, but 43's best is 26, so mutual-best rejected an edge
+    # that was above the bar by 0.006. 12 was left orphaned, then captured
+    # cross-camera at 0.771 into a DIFFERENT person's identity -- which the operator
+    # saw as "it misidentified someone in cam_206 as reid 1, then a few seconds
+    # later they get reid 6". Lowering cam_206's bar cannot fix it (the edge already
+    # clears the bar) and measurably makes cam_206 worse (25 -> 20 identities).
+    #
+    # So Phase 1 now iterates like Phase 2: re-score from CURRENT clusters each
+    # round, re-derive mutual-best, merge, repeat until a round merges nothing.
+    # Round 1 is identical to the old single pass by construction -- every cluster
+    # is a single tracklet then -- so `same_camera_rounds=False` reproduces the old
+    # behaviour exactly, and the flag defaults off.
+    #
+    # ---- WHY EVERY MEMBER PAIR MUST CLEAR THE BAR, not just the cluster mean ----
+    # Iterating alone WOULD have relaxed the guard, and the regression test caught it:
+    # once a round has only two clusters left, mutual-best is VACUOUS (the single
+    # remaining pair is trivially each other's best), so a borderline stranger walks
+    # in on a cluster-mean score. In the fixture, a stranger at 0.910 against one
+    # fragment and 0.890 against the other scored 0.905 against their mean and merged
+    # -- precisely the weak-edge capture mutual-best was added to prevent.
+    #
+    # So a same-camera merge additionally requires EVERY cross-member pair to clear
+    # the bar. Merging asserts "all of these fragments are one person", so every
+    # fragment has to agree; a mean lets a majority outvote a member that disagrees.
+    # Same insight as M.3: judge the claim on the fragments, not on a mean of them.
+    #
+    #   chain    C vs A 0.906, C vs B 0.974  -> both clear 0.90, merges
+    #   stranger S vs A 0.910, S vs B 0.890  -> B disagrees, refused
+    #
+    # For singleton clusters this is exactly the old single-pair test, so round 1 --
+    # and therefore `same_camera_rounds=False` -- is unchanged by it.
+    def all_member_pairs_clear(ma, mb, bar):
+        for x in ma:
+            for y in mb:
+                if pair_score({x}, {y}, protos[x], protos[y]) < bar:
+                    return False
+        return True
 
     accepted_same = set()
     rejected_not_mutual = 0
-    for s, a, b in sorted(same_pairs, reverse=True):
-        if not same_pair_mutual(a, b):
-            rejected_not_mutual += 1
-            continue
-        if union(a, b):
-            log(f"  tracklet reconcile: same-camera merge {a} + {b} "
-                f"(cosine {s:.3f})")
-            accepted_same.add((a, b))
+    same_round = 0
+    while True:
+        # Phase 1 runs before Phase 2, so every cluster is still single-camera.
+        by_camera = defaultdict(list)
+        for root, ms in current_roots().items():
+            cams = {m[0] for m in ms}
+            if len(cams) == 1:
+                by_camera[next(iter(cams))].append(root)
+
+        same_pairs = []
+        for cam, roots_here in by_camera.items():
+            roots_here.sort()
+            for i, a in enumerate(roots_here):
+                for b in roots_here[i + 1:]:
+                    ma, mb = members[a], members[b]
+                    # conflict() subsumes the old _spans_disjoint check and stays
+                    # correct once a side holds more than one tracklet.
+                    if conflict(ma, mb):
+                        continue
+                    proto_a = _cluster_prototype(ma, protos)
+                    proto_b = _cluster_prototype(mb, protos)
+                    if proto_a is None or proto_b is None:
+                        continue
+                    s = pair_score(ma, mb, proto_a, proto_b)
+                    if s < cam_bar(cam):
+                        continue
+                    if not all_member_pairs_clear(ma, mb, cam_bar(cam)):
+                        continue
+                    same_pairs.append((s, a, b))
+
+        same_best = {}
+        if same_camera_reciprocal_best:
+            for s, a, b in same_pairs:
+                if s > same_best.get(a, (-1.0, None))[0]:
+                    same_best[a] = (s, b)
+                if s > same_best.get(b, (-1.0, None))[0]:
+                    same_best[b] = (s, a)
+
+        def same_pair_mutual(a, b, _best=same_best):
+            if not same_camera_reciprocal_best:
+                return True
+            return (_best.get(a, (None, None))[1] == b
+                    and _best.get(b, (None, None))[1] == a)
+
+        merged_here = 0
+        for s, a, b in sorted(same_pairs, reverse=True):
+            if not same_pair_mutual(a, b):
+                rejected_not_mutual += 1
+                continue
+            if union(a, b):
+                log(f"  tracklet reconcile: same-camera merge {a} + {b} "
+                    f"(cosine {s:.3f})"
+                    + (f" [round {same_round + 1}]" if same_round else ""))
+                accepted_same.add((a, b))
+                merged_here += 1
+        same_round += 1
+        if not merged_here or not same_camera_rounds:
+            break
+
     if same_camera_reciprocal_best:
         log(f"  tracklet reconcile: same-camera reciprocal-best ON -- "
-            f"{len(accepted_same)} merged, {rejected_not_mutual} above-bar pair(s) "
-            f"refused for not being each other's best")
+            f"{len(accepted_same)} merged over {same_round} round(s), "
+            f"{rejected_not_mutual} above-bar pair(s) refused for not being each "
+            f"other's best")
 
     # ---- Phase 1 instrumentation, subject-centric so the margin is meaningful.
     # Runs AFTER the merges above and reads only `protos` / `tracklets`, so it
@@ -910,12 +993,6 @@ def reconcile_tracklets(store, threshold, run_id=None,
                     extra={"note": "count of peers excluded for time overlap"}),
                 dlog.TEMPORAL_CONFLICT_CROSS_CAMERA: _na_gate(),
             }, accepted_partner=partner, context="same_camera")
-
-    def current_roots():
-        roots = defaultdict(set)
-        for k in keys:
-            roots[find(k)].add(k)
-        return roots
 
     # Phase 2 runs in ROUNDS, re-scoring from scratch each round, so a chain of
     # 3+ mutually-similar fragments (e.g. A's best match is B, but B's own best

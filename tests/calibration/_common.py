@@ -123,7 +123,32 @@ def flag(name: str) -> bool:
     return name in sys.argv
 
 
-def reconcile_settings(cfg=None, log=print, owns=()):
+# Every flag the reconcile tools understand. An argv token starting with `--` that
+# is NOT here is a hard error, because the alternative is what already happened:
+# `--same-rounds` was passed to a deployment whose code predated the flag, argv
+# ignored it in silence, and two "different" sweeps came back byte-identical. A
+# measurement that quietly measures the wrong thing is worse than a crash.
+KNOWN_FLAGS = {
+    "--cross", "--same", "--same-global", "--min-obs", "--scoring", "--top-frac",
+    "--no-reciprocal", "--same-reciprocal", "--no-same-reciprocal",
+    "--same-rounds", "--no-same-rounds", "--no-covisibility", "--covis-tolerance",
+}
+
+
+def validate_flags(extra=()):
+    """Refuse unknown `--flags`. Catches typos AND a stale deployment."""
+    allowed = KNOWN_FLAGS | set(extra)
+    unknown = [t for t in sys.argv[1:] if t.startswith("--") and t not in allowed]
+    if unknown:
+        raise SystemExit(
+            f"[calib] unknown flag(s) {unknown}.\n"
+            f"        Known: {', '.join(sorted(allowed))}\n"
+            f"        If you expected one of these to exist, this deployment is "
+            f"OLDER than the flag -- deploy the code and re-run. Silently ignoring "
+            f"it would hand you a measurement of the wrong thing.")
+
+
+def reconcile_settings(cfg=None, log=print, owns=(), extra_flags=()):
     """Reconcile kwargs AS PRODUCTION WOULD RUN THEM, plus argv overrides.
 
     `owns` names flags the CALLER parses itself, so they are left alone here. The
@@ -150,10 +175,15 @@ def reconcile_settings(cfg=None, log=print, owns=()):
       --no-reciprocal        turn Phase 2 mutual-best OFF
       --same-reciprocal      turn Phase 1 mutual-best ON
       --no-same-reciprocal   turn Phase 1 mutual-best OFF
+      --same-rounds          iterate Phase 1 until it merges nothing (M.9.11)
+      --no-same-rounds       single Phase 1 pass (the old behaviour)
       --no-covisibility      disable the cross-camera simultaneity veto
+      --covis-tolerance S    override every numeric veto tolerance with S seconds
+                             (pairs declared `covisible` stay covisible)
     """
     from identity.reconcile import resolve_reconcile_kwargs
 
+    validate_flags(extra_flags)
     kw = resolve_reconcile_kwargs(cfg if cfg is not None else load_config(), log=log)
 
     def mine(f):
@@ -178,8 +208,22 @@ def reconcile_settings(cfg=None, log=print, owns=()):
         kw["same_camera_reciprocal_best"] = True
     if flag("--no-same-reciprocal"):
         kw["same_camera_reciprocal_best"] = False
+    if flag("--same-rounds"):
+        kw["same_camera_rounds"] = True
+    if flag("--no-same-rounds"):
+        kw["same_camera_rounds"] = False
     if flag("--no-covisibility"):
         kw["covisibility"] = (False, {})
+    # Override every NUMERIC tolerance, leaving `covisible` pairs covisible. The
+    # veto's own labelled evidence separates cleanly by magnitude -- wrong vetoes
+    # at 1.2-1.6 s, right ones at 3.0-10.5 s (M.9.25) -- so this axis needs to be
+    # sweepable, and `--no-covisibility` (all or nothing) could not express it.
+    if mine("--covis-tolerance") is not None:
+        tol = float(mine("--covis-tolerance"))
+        enabled, pairs = kw["covisibility"]
+        kw["covisibility"] = (enabled,
+                              {k: (None if v is None else tol)
+                               for k, v in pairs.items()})
     return kw
 
 

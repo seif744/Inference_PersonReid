@@ -242,7 +242,7 @@ def main():
         raise SystemExit(__doc__.strip().split("\n\n")[1])
     run_id = sys.argv[1]
 
-    kw = reconcile_settings()
+    kw = reconcile_settings(extra_flags=("--url", "--path", "--tracklets"))
     url = arg("--url", "http://localhost:6333") or None
     store = PersonVectorStore(path=arg("--path", "qdrant_data"), url=url)
 
@@ -368,10 +368,16 @@ def main():
               "change is only worth making if it moves\n  THIS number in the right "
               "direction (the cluster-level table above can move the\n  other way "
               "-- two multi-person clusters have few matching view pairs).\n")
-        print(f"    {'camera':<10}{'best fragment pair':<36}"
+        # EVERY pair, not just the best one. The best pair says whether the merge
+        # COULD happen; the WEAKEST says whether it survives the all-member-pairs
+        # rule that Phase 1 rounds apply (M.9.11) -- one disagreeing fragment is
+        # enough to refuse a merge, so a table showing only the best hides the
+        # number that actually decides.
+        print(f"    {'camera':<10}{'fragment pair':<32}"
               + "".join(f"{m:>15}" for m in R.SCORING_MODES) + f"{'bar':>7}")
         for cam in sorted(shared):
-            best = None
+            cbar = per_cam.get(cam, kw["same_camera_threshold"])
+            rated = []
             for x in sorted(k for k in set_a if k[0] == cam):
                 for y in sorted(k for k in set_b if k[0] == cam):
                     scores = {
@@ -381,22 +387,27 @@ def main():
                             protos[x], protos[y], mode=m,
                             top_frac=kw["consensus_top_frac"], cap=cap)
                         for m in R.SCORING_MODES}
-                    # Ranked by the mode IN FORCE, so "best pair" means the pair
-                    # reconcile would actually have picked.
-                    if best is None or scores[kw["scoring"]] > best[0]:
-                        best = (scores[kw["scoring"]], x, y, scores)
-            cbar = per_cam.get(cam, kw["same_camera_threshold"])
-            _, x, y, scores = best
-            cells = ""
-            for m in R.SCORING_MODES:
-                s = scores[m]
-                cells += f"{s:>10.3f} {'PASS' if s >= cbar else 'fail':<4}"
-            print(f"    {cam:<10}{_fmt_key(x) + ' vs ' + _fmt_key(y):<36}"
-                  f"{cells}{cbar:>7.2f}")
+                    rated.append((scores[kw["scoring"]], x, y, scores))
+            # Ranked by the mode IN FORCE, so the top row is the pair reconcile
+            # would have picked and the bottom row is the one that can veto it.
+            rated.sort(reverse=True)
+            for i, (_, x, y, scores) in enumerate(rated):
+                cells = "".join(
+                    f"{scores[m]:>10.3f} {'PASS' if scores[m] >= cbar else 'fail':<4}"
+                    for m in R.SCORING_MODES)
+                tag = ("  <- best" if i == 0 and len(rated) > 1 else
+                       "  <- WEAKEST (this one can veto)"
+                       if i == len(rated) - 1 and len(rated) > 1 else "")
+                print(f"    {cam if i == 0 else '':<10}"
+                      f"{_fmt_key(x) + ' vs ' + _fmt_key(y):<32}"
+                      f"{cells}{cbar:>7.2f}{tag}")
         print("\n  A fragment pair that FAILS its own camera's bar is one person's "
               "two appearance\n  modes scoring below a bar set for two different "
               "people. That is the defect at\n  its root -- everything downstream "
               "is the consequence.")
+        print("  If the BEST pair passes but the WEAKEST fails, the merge is "
+              "blocked by the\n  all-member-pairs rule, not by the bar -- a "
+              "different fix (see M.9.11).")
 
     # ---- the conflict grid -------------------------------------------------
     covis_enabled, covis_pairs = kw["covisibility"]
