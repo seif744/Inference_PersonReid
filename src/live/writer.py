@@ -24,6 +24,8 @@ from datetime import datetime
 
 import cv2
 
+from quiet import suppressed_native_stderr
+
 
 class WriterStage(threading.Thread):
     def __init__(self, cam, writer_queue, stop_event, out_path, fps=20.0,
@@ -45,10 +47,25 @@ class WriterStage(threading.Thread):
         # Prefer software H.264; fall back to mp4v (matches the file path).
         candidates = (["avc1", "h264", "H264", "mp4v"] if self.codec == "h264"
                       else ["mp4v"])
-        for cc in candidates:
+        for i, cc in enumerate(candidates):
             fourcc = cv2.VideoWriter_fourcc(*cc)
-            writer = cv2.VideoWriter(self.out_path, fourcc, self.fps, (w, h))
-            if writer.isOpened():
+            # OpenCV/FFmpeg report an unavailable codec by printing to fd 2 from C++
+            # and returning a closed writer, so try/except cannot quiet it. Every
+            # candidate but the LAST is expected to fail on some builds -- h264 is
+            # never available here -- so silence those and let the last one speak,
+            # because if even mp4v fails the reason must be visible.
+            if i < len(candidates) - 1:
+                with suppressed_native_stderr():
+                    writer = cv2.VideoWriter(self.out_path, fourcc, self.fps, (w, h))
+                    opened = writer.isOpened()
+            else:
+                writer = cv2.VideoWriter(self.out_path, fourcc, self.fps, (w, h))
+                opened = writer.isOpened()
+            if opened:
+                if i > 0:
+                    print(f"[writer:{self.cam}] codec {candidates[0]!r} unavailable "
+                          f"in this OpenCV build; using {cc!r} (expected on this "
+                          f"deployment, not an error).")
                 print(f"[writer:{self.cam}] {self.out_path} ({cc}, {self.fps:g} fps, {w}x{h})")
                 return writer
             writer.release()

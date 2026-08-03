@@ -46,6 +46,7 @@ from video_source import VideoSource, is_stream_path
 from detector import PersonDetector, resolve_detector_cfg
 from drawing import draw_detections, draw_hud
 from interrupt_guard import InterruptGuard, print_stop_hint
+from quiet import suppressed_native_stderr
 
 
 def load_dotenv(path=".env"):
@@ -439,10 +440,23 @@ def render_final_videos(jobs, cfg, shared, store, run_id,
                         fourcc_name = {"h264": "avc1", "avc1": "avc1",
                                        "mp4v": "mp4v"}.get(want, "mp4v")
                         fourcc = cv2.VideoWriter_fourcc(*fourcc_name)
-                        writer = cv2.VideoWriter(out_path, fourcc, out_fps, (w, h))
-                        if not writer.isOpened() and fourcc_name != "mp4v":
+                        if fourcc_name != "mp4v":
+                            # Expected to fail on a build without an h264 encoder,
+                            # and it reports that from C++ straight to fd 2 -- four
+                            # red lines that have twice been read as the run
+                            # failing. Silence the PROBE only; the mp4v fallback
+                            # below is never suppressed.
+                            with suppressed_native_stderr():
+                                writer = cv2.VideoWriter(out_path, fourcc, out_fps,
+                                                         (w, h))
+                                opened = writer.isOpened()
+                        else:
+                            writer = cv2.VideoWriter(out_path, fourcc, out_fps, (w, h))
+                            opened = writer.isOpened()
+                        if not opened and fourcc_name != "mp4v":
                             print(f"[render] {name}: codec {want!r} unavailable in "
-                                  f"this OpenCV build; falling back to mp4v.")
+                                  f"this OpenCV build; using mp4v (expected on this "
+                                  f"deployment, not an error).")
                             writer = cv2.VideoWriter(
                                 out_path, cv2.VideoWriter_fourcc(*"mp4v"),
                                 out_fps, (w, h))
