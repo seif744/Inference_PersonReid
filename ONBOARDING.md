@@ -34,6 +34,12 @@ and no external identity service.
 (FastReID) → Qdrant (+ recorded floor position) → live identity engine (provisional
 ids) → offline reconcile (final ids, geometric reachability veto) → render`
 
+> **State in one line (2026-08-03):** the FastReID wiring is correct and verifiable
+> (`tools/preflight.py --load-model`); the **thresholds are not** — two people
+> currently produce 21 identities (§3.4), and that is the bottleneck, not the model
+> and not geometry. The deployment is an **office where people sit at desks**, which
+> constrains geometry in ways §6.6 spells out.
+
 ---
 
 ## 2. Hardware and infrastructure — read this before running anything
@@ -97,6 +103,13 @@ cam_224**.
   cam_219+cam_224 are the **only** pair a floor frame can be fitted for (section 6).
 - cam_206 and cam_213 overlap nothing, so **no geometry is derivable for them from
   imagery at all.** Not a code gap — a fact about where the cameras are.
+- **The deployment is an OFFICE. People sit at desks and work.** This is
+  load-bearing and was only established on 2026-08-03, after most of the design
+  above. Consequences: most people are stationary for long stretches; a seated
+  person's bounding box bottom is a **chair or desk edge, not their feet**; and
+  tracks are long and stable but re-appearances are common (people get up, walk
+  about, come back). See §6.6 for exactly what this does to geometry, and §5.7 for
+  what it does not.
 - **cam_206 has been missing from every run since `20260730_093723`** — dropped
   from a launch command by a shell error and never re-added. It is *also* the
   camera with the detection-recall complaint ("5 people present, 1 detected") and
@@ -225,17 +238,34 @@ verified on site; one or more independently measured reference distances.
   bringing cam_206 and cam_213 in. `group_distances` is where a real-world distance
   would go, and it ships empty.
 
-### 3.4 Thresholds are still void, and the Qdrant collection may still be stale
+### 3.4 Thresholds are void — and this is now the project's biggest problem
 
-1. **Appearance thresholds are void.** Every bar in `config.yaml` was derived in
-   OSNet-AIN's 512-d post-ReLU space. Measured evidence: at the configured
-   `same_camera_threshold: 0.90`, only **50%** of same-person fragments merge; 100%
-   merge at 0.75. Unchanged, and now referring to a feature space that is not
-   running.
-2. **The Qdrant collection must be rebuilt** on any machine still holding 512-d
-   vectors. The store's dimension guard reports it at startup.
+**This is the bottleneck. Not geometry, not the backbone.** Every bar in
+`config.yaml` was derived in OSNet-AIN's 512-d post-ReLU space and none has been
+re-anchored to FastReID's 2048-d post-bnneck space.
 
-### 3.5 Known trap while 3.4(2) is outstanding
+Measured on run `20260803_121136` (two people, 70 s, cam_219 + cam_224):
+
+| observed | meaning |
+|---|---|
+| 29 tracklets → **21 identities** | ~10× over-fragmentation. Two people should be 2–4 ids |
+| `ABSOLUTE_THRESHOLD` failed **76 of 96** decisions | the bar, not the model, is rejecting nearly everything |
+| `BELOW_ABSOLUTE_THRESHOLD` excluded **834** candidates | same story at candidate level |
+| best **rejected** same-person score **0.671** vs a **0.90** bar | the bar is roughly 0.2 too high for this space |
+| cross-camera merges landed at 0.937, 0.706, 0.670 | against a 0.63 cross bar — barely clearing |
+
+Earlier evidence pointing the same way: at `same_camera_threshold: 0.90` only
+**50%** of same-person fragments merge; 100% merge at 0.75.
+
+**Fixing this needs no camera time** — sweep on a finished run (§8.3). It is the
+highest-value work available, and geometry cannot substitute for it: a veto can only
+*refuse* merges, so at best it would turn 21 identities into 22.
+
+Second, unrelated: **the Qdrant collection must be rebuilt** on any machine still
+holding 512-d vectors. `python tools/preflight.py` reports it and `--fix-store`
+rebuilds it.
+
+### 3.5 Known trap while the collection rebuild is outstanding
 
 `IdentityStage` **swallows** the store's dimension `ValueError`. Running against a
 stale 512-d collection therefore **silently drops observations** rather than
@@ -383,6 +413,25 @@ A sloppier calibration therefore yields **fewer** vetoes, never wrong ones.
 - **`run_id=` is only printed when reconcile is enabled**, so a run that dies early
   leaves `RUN` empty and every downstream command fails confusingly.
 
+### 5.7 Sitting is not a problem for ReID generally — only for foot-point geometry
+
+Worth stating because §6.6 reads alarming. In an office, seated people are the
+*easy* case for the appearance model: stable pose, stable lighting, consistent
+illumination, and long uninterrupted tracks. The hard cases are transitions and
+re-appearances, which is exactly what the offline reconcile exists for.
+
+Two things already handle the common office failure with no geometry involved:
+
+- two people visible **simultaneously in one camera** can never be merged — the
+  same-camera temporal-overlap veto is a hard rule and is on today;
+- reconcile rebuilds identity from scratch over the whole run, so a person who sits,
+  leaves and returns can be re-joined after the fact in a way the live engine
+  structurally cannot.
+
+What sitting specifically breaks is the assumption that **the bottom of a bounding box
+is a point on the floor**. That assumption belongs to `src/geometry/` alone. Nothing
+else in the pipeline makes it.
+
 ---
 
 ## 6. The geometry workstream — how to actually use it
@@ -436,7 +485,55 @@ python tools/fit_floor_frame.py <run_id> \
   --metric-reference "floor_plan:corridor width, cam_219 doorframe to far wall:3.42:2.10"
 ```
 
-### 6.3 The fit is graded by people it is *proven* must be apart
+### 6.3 WHAT A CALIBRATION RECORDING MUST CONTAIN — and the first attempt failed
+
+**Read this before recording anything.** The first real attempt
+(run `20260803_121136`) failed, and it failed on requirements that look like
+nitpicks and are not:
+
+```
+1 confident match: cam_219:10 <-> cam_224:2, overlap 6.3s -> 16 foot pairs
+RANSAC: 6/16 inliers (38%)          [needs 55%]
+held-out error: median 203.7 px     [~3 people wide in cam_219]
+```
+
+Diagnosis: **16 points along one person's 6-second walk are nearly collinear.** A
+homography maps a *plane* to a plane and cannot be recovered from a line.
+`cv2.findHomography` still returns a matrix — it is simply meaningless away from that
+line, which is what 38% inliers and a 203 px error look like.
+
+A second attempt at `--min-cosine 0.65` got *worse* (8% inliers) because it admitted
+a **stationary** person: 106 of 122 correspondences came from one tracklet that never
+moved. Those 106 are mutually consistent (they are the same point), so RANSAC scored
+them as a model and rejected everything else — while producing a flattering 9.7 px
+median that described nothing but the blob.
+
+**The requirements, in order of how often they are the reason it fails:**
+
+| requirement | why |
+|---|---|
+| **8–12 DISTINCT floor locations** | this, not the correspondence count, determines the plane. The tool now reports distinct locations and refuses below 8 |
+| **Stand still 3–4 s at each spot** | observations are sampled every ~0.5 s, so a pause plants several points at one location |
+| **Spread over the room's extent** | corners of the overlap, the middle, near each camera. A loop or a straight line is degenerate however long it is |
+| **NOBODY SEATED** | the foot point is the box bottom, so a chair or desk edge encodes a plane that does not exist — and those points are self-consistent enough for RANSAC to *prefer* them |
+| **Feet visible** | behind a desk is the same failure as seated |
+| **≥1 moment with two people in one camera while a third track runs in the other** | required by the validation (§6.3); one person alone fits a homography and cannot verify it |
+
+**One person is enough for the fit, and is actually ideal** — no matching ambiguity.
+More people matter only for the validation. The mistake is thinking this needs a
+crowd; it needs *coverage*.
+
+The tool now reports arrangement before it reports any residual:
+
+```
+arrangement of the 19 point(s) in the target frame:
+   span 900 x 660 px  (35% x 46% of the frame)
+   collinearity 0.733   (0 = all on one line, 1 = spread evenly in both directions)
+```
+
+Below 0.15 it refuses and says the fix is footage, not a flag.
+
+### 6.4 The fit is graded by people it is *proven* must be apart
 
 Fitting from appearance matches to constrain appearance is circular. The **grading**
 is not: two tracklets co-occurring in ONE camera are provably two people, so a
@@ -448,7 +545,7 @@ Read the triangle pass rate and the held-out RMS before trusting anything
 downstream — the held-out p95 becomes `position_error_units`, which is what protects
 every true co-visible match from the same-instant rule.
 
-### 6.4 Then, in order
+### 6.5 Then, in order
 
 ```bash
 # 1. RECORD (additive, safe). Set geometry.enabled: true, then capture. For a run
@@ -474,7 +571,56 @@ identity count must not drop — that is the exact number the topology veto dest
 If G2/G3 fail: raise `safety_factor`, or set `geometry.reconcile.enabled: false` and
 **keep recording**. Recording cannot hurt; only the veto changes identities.
 
-### 6.5 Running on recorded footage — and the timestamp trap
+### 6.6 SITTING: what it does to geometry at runtime
+
+The deployment is an office (§2.4), so this is not an edge case. A seated person's
+recorded position is **wrong** — displaced by however far the chair is from their
+feet, projected onto the floor, which at a shallow camera angle can be metres.
+
+But wrong is not the same as useless, because the error is **stable and tied to
+where they are sitting**:
+
+| what is being compared | position error | veto behaviour |
+|---|---|---|
+| two colleagues at **different desks** | both wrong, but *differently* | **correctly refuses** the merge — this is the win |
+| same person, same desk, two tracklets | both wrong *identically* | distance ≈ 0 → correctly allows |
+| **same person, seated then standing** | displaced by the seat height | ⚠️ **risk of a false veto** |
+| people walking about | correct | works as designed |
+
+Row 1 is the operator's actual complaint (*"multiple other people in the room are
+also called reid 6"*), and it still works: **the map does not have to be truthful to
+be discriminative.** Two people at two desks reliably land in two different wrong
+places.
+
+Row 3 is the genuine risk. Someone stands up, their apparent position jumps, and over
+a couple of seconds that reads as impossible speed → false veto → an unrecoverable
+split. Two honest caveats:
+
+- **The median-over-pairings rule does NOT protect against this.** It defends against
+  *occasional* bad points. Someone seated for a whole tracklet has every pairing
+  wrong in the same direction, so the median is wrong too.
+- **It partly self-corrects, by accident.** The speed ceiling is measured from your
+  own footage *including* those stand-up jumps, so they inflate p99.9, the envelope
+  widens, and fewer vetoes fire. It fails in the safe direction — but it also makes
+  the check weaker.
+
+**Nothing currently detects "this person is not standing."** `clipped` catches frame
+edges only. The proposed fix (not built) is a per-camera regression of box height
+against foot position — a standing person's height is a predictable function of where
+their feet are, so a much shorter box means seated, crouching or occluded. That would
+let seated observations fail open *on purpose* rather than by luck, and would exclude
+them from calibration automatically.
+
+**Honest verdict for an office.** The veto is **less powerful here than in a
+corridor**, and that is worth knowing before switching it on. Its power comes from
+"close in time, far apart" — but most office false merges are *time-separated*
+(a colleague at the same desk an hour later), where `distance / elapsed` is tiny and
+geometry is silent. What it does still catch, and nothing else does, is two people
+seen by cam_219 and cam_224 **at the same moment** standing apart that appearance
+scores 0.9 — covisibility deliberately never vetoes that pair, because one person
+legitimately can be in both. Real, but narrow.
+
+### 6.7 Running on recorded footage — and the timestamp trap
 
 `--mode live` on files. The file-batch path records **no** geometry —
 `IdentityService._commit` stores neither `bbox` nor `ts`, so there is nothing to
@@ -554,6 +700,12 @@ exist and because they document what the corpus contained:
 | `20260730_120551` | 1482 | 213/219/224 | ~2 min. Clips + sidecars kept |
 | `20260731_060425` | — | 4 | the run all 11 operator labels came from |
 
+**The one run that DOES exist (captured 2026-08-03, after the wipe):**
+
+| run_id | Observations | Cameras | Notes |
+|---|---|---|---|
+| `20260803_121136` | 1480 (cam_219 604, cam_224 876) | 219 + 224 | 70 s, **two people, only one moving**. Clips + sidecars kept. 29 tracklets → 21 identities → the threshold evidence in §3.4. **Too degenerate to fit a floor frame** (§6.3), but perfectly good for the appearance sweep, and you know its ground truth: two people |
+
 **These hold OSNet 512-d vectors.** They cannot be swept for FastReID appearance
 thresholds — the sweep reads embeddings out of Qdrant.
 
@@ -596,7 +748,7 @@ exercise the veto on real footage. A prior 3-camera run reconciled 35 tracklets 
 
 ## 8. Running things
 
-### 8.0 Is this machine configured correctly? Run this first
+### 8.1 Is this machine configured correctly? Run this first
 
 ```bash
 python tools/preflight.py                 # seconds, loads no models
@@ -617,7 +769,7 @@ previous backbone's 512-d accepts nothing at 2048-d, the store only *warns*, and
 nothing to reconcile, with no failure anywhere. That is the most likely way a first
 run after the backbone switch goes wrong (§3.5).
 
-### 8.1 Correctness checks (fast, dev box)
+### 8.2 Correctness checks (fast, dev box)
 
 ```bash
 python tests/run_all.py                                   # 19 test files
@@ -638,7 +790,7 @@ python tests/live/test_geometry_floor_frame.py      # bbox -> floor, and every r
 python tests/live/test_geometry_not_recomputed.py   # the invariant, via the AST
 ```
 
-### 8.2 Comparing backbones
+### 8.3 Comparing backbones
 
 ```bash
 # single camera, from a video
@@ -653,7 +805,7 @@ across feature spaces. It **refuses to name a winner** when the footage saturate
 which `register_file.avi` does: FastReID R101 and OSNet-AIN both score prototype
 AUC 1.0000 and R@1 48/48 there.
 
-### 8.3 Threshold calibration (server, needs a run)
+### 8.4 Threshold calibration (server, needs a run)
 
 ```bash
 RUN=<a real run id>                     # never paste a placeholder
@@ -670,7 +822,7 @@ you are explaining, nothing below it means anything.
 
 `cross_camera_threshold` **cannot** be calibrated from a single-camera run.
 
-### 8.4 Wipe the store without running the pipeline
+### 8.5 Wipe the store without running the pipeline
 
 ```bash
 python -c "import sys; sys.path.insert(0,'src'); from database.store import PersonVectorStore; s=PersonVectorStore(url='http://localhost:6333'); s.reset(); print('points:', s.count())"
@@ -680,33 +832,55 @@ python -c "import sys; sys.path.insert(0,'src'); from database.store import Pers
 
 ## 9. If you are picking this up cold — do this
 
-1. Read `CLAUDE.md`, then `REMEDIATION_PLAN.md` §0 → Part A → Part J.
-2. Read `ADR-003D` and `ARCHITECTURE.md` §§3 (the geometry component), 5, 6.
-3. On the dev box: `python tools/preflight.py --load-model` (verifies the FastReID
-   config and the Qdrant collection width), then `python tests/run_all.py` — 19
-   files, seconds. Together these confirm the model/store wiring and the geometry
-   maths without needing a GPU.
-4. On the A6000: `git pull origin research`, fetch the checkpoint (2.3), start
-   Qdrant, run `verify_embedding_contract.py`.
-5. **Watch `output_register_file.mp4` from run `20260731_134913`** and answer two
-   questions: does any one person carry more than one id? does any one id cover
-   more than one person? The first means the bar is too high, the second too low.
-   Record the answer with `review_links.py --label`.
-6. **Fit a floor frame from `20260730_111232`** (`tools/fit_floor_frame.py`) — it
-   needs no camera time and tells you immediately whether geometry is viable on this
-   deployment. Read the triangle pass rate.
-7. Configure the cameras (2.4), including **cam_206**, set `geometry.enabled: true`,
-   and capture a fresh multi-camera run.
-8. Only then re-derive appearance thresholds (8.3) and try the veto (6.4).
+**The single highest-value thing available is re-anchoring the thresholds (§3.4),
+and it needs no camera time.** Two people currently produce 21 identities. Do that
+before anything geometric.
+
+1. Read `CLAUDE.md`, then `REMEDIATION_PLAN.md` §0 → Part A → Part J, then §3.4 and
+   §6.6 here.
+2. On the dev box: `python tools/preflight.py --load-model` then
+   `python tests/run_all.py` — 19 files, seconds. Confirms the FastReID wiring, the
+   Qdrant width and the geometry maths with no GPU.
+3. On the A6000: sync the code (`./deploy.sh` **from the dev box**, or
+   `git pull origin research`), fetch the checkpoint (§2.3), start Qdrant, then
+   `python tools/preflight.py --load-model` again there.
+4. **Sweep the thresholds on `20260803_121136`.** You know its ground truth: two
+   people. Aim for 2–4 identities without fusing them:
+   ```bash
+   python tests/calibration/sweep_reconcile_thresholds.py 20260803_121136 \
+     --cross 0.45,0.55,0.63 \
+     --same "cam_219=0.90,cam_224=0.80 ; cam_219=0.75,cam_224=0.75 ; cam_219=0.65,cam_224=0.65"
+   ```
+5. **Re-render the best candidate and WATCH it** (§5.2 — a cluster count cannot tell
+   you whether a cluster is one person or three):
+   ```bash
+   python tests/calibration/rerender_from_clips.py 20260803_121136 --cross <best> --same "..."
+   ```
+   Record the verdict with `review_links.py --label`. Two people is a small sample;
+   do not treat a bar chosen from it as final.
+6. Only then, if you still want geometry: record a **deliberate calibration walk**
+   to §6.3's requirements — 8–12 distinct spots, standing, nobody seated — then
+   `fit_floor_frame.py` → `backfill_geometry.py` → re-render with `--geometry`.
+7. Put **cam_206** back in the next capture (§2.4); it has been missing since
+   2026-07-30 and its recall problem has never been measured under yolo11m.
 
 ---
 
 ## 10. Open questions
 
-- **Does the floor frame actually fit on this footage?** Unknown — no run has been
-  put through `tools/fit_floor_frame.py` yet. Everything in section 6 is
-  unit-tested but has never met a real correspondence. This is the single highest-value
-  next step, and it costs no camera time (step 6 above).
+- **Does the floor frame fit on this footage?** **First attempt failed** (§6.3):
+  degenerate correspondences, 38% then 8% RANSAC inliers. Not yet answered, because
+  no recording has met §6.3's requirements — the failures so far are about *coverage
+  of the floor*, not about the maths. Still open, and cheap to retry once a
+  deliberate calibration walk exists.
+- **Is the veto worth having in an OFFICE at all?** §6.6 argues it is real but
+  narrow: it catches co-temporal look-alikes across cam_219/cam_224, and stays silent
+  on the time-separated merges that probably dominate here. Nobody has measured which
+  kind your false merges actually are — the decision log
+  (`analyze_decision_log.py`) could answer it from a run you already have.
+- **Should the "is this person standing" check be built?** (§6.6) It would make
+  seated observations fail open on purpose rather than by luck, and exclude them from
+  calibration automatically. Not built.
 - **Is the FastReID switch better?** Unproven. The only footage that could test the
   cross-camera-domain-shift argument holds OSNet vectors, so it needs a new capture
   or a re-embedding script (which does not exist).
