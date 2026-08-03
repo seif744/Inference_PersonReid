@@ -35,14 +35,16 @@
 
 ```
 YOLO11 → ByteTrack → ReIDExtractor → TrackEmbedder → [ Identity Service ] → Qdrant
-                     (crop→512-d)     (attach to      (assigns global_id)   (ANN index)
+                     (crop→2048-d)    (attach to      (assigns global_id)   (ANN index)
                                        tracks)
 ```
 
 Upstream (already built) gives us, per frame, a set of **tracked detections**,
 each with:
 - a **per-camera** `track_id` (stable while the person is visible on that camera),
-- a 512-d **L2-normalized appearance embedding**,
+- an **L2-normalized appearance embedding** — 2048-d under the current backend
+  (FastReID SBS R101-IBN); the width is a property of `reid.model`, and **nothing
+  in this document depends on it**, which is the point of section 4,
 - a bounding box, a camera id, and a timestamp.
 
 The Identity Service turns those into a **`global_id`**: one stable number per
@@ -64,8 +66,11 @@ memoryless** by design, and that is exactly why it must not decide identity:
 2. **Appearance alone is ambiguous — we measured it.** With an out-of-domain
    checkpoint the same-person and different-person cosine distributions
    **overlapped outright**, so no fixed threshold on the embedding separated
-   people cleanly; even with today's OSNet-AIN, where the gap is cleaner, a
-   borderline pair can still confuse a lone threshold (see [`ARCHITECTURE.md`
+   people cleanly. That has not been solved by a better backbone: after the switch
+   to FastReID SBS R101-IBN the thresholds were never re-anchored to the new
+   feature space, and run `20260803_121136` turned **two people into 21
+   identities** with 76 of 96 decisions failing on the absolute threshold. A
+   borderline pair still confuses a lone threshold (see [`ARCHITECTURE.md`
    section 6, "Known
    limitations"](../../ARCHITECTURE.md#6-known-limitations-model-not-plumbing)
    for the current measured distributions). Identity must be resolved with *more*
@@ -73,8 +78,10 @@ memoryless** by design, and that is exactly why it must not decide identity:
 
 3. **Separation of concerns / testability.** The model is a pure function: same
    input → same output, trivially unit-testable and swappable — proven in
-   practice by the Market1501 → MSMT17 → OSNet-AIN checkpoint swaps, each a
-   one-line change with **zero** change to identity logic. Fuse the two and
+   practice by the Market1501 → MSMT17 → OSNet-AIN → **FastReID SBS R101-IBN**
+   swaps, each a one-line `reid.model` change with **zero** change to identity
+   logic — the last one even changed the embedding WIDTH (512 → 2048) and the input
+   size (256×128 → 384×128) without touching this layer. Fuse the two and
    every model swap risks the identity behavior, and neither can be tested in
    isolation.
 

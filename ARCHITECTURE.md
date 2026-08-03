@@ -342,9 +342,13 @@ Design principles this drives:
   Re-ranking (Upgrade 1) and verification (Upgrade 2) exist to combine
   appearance with additional structure (neighbourhood overlap, observation
   history, crop quality) before a decision is made — not to replace the
-  embedding model. Swapping the ReID *checkpoint* (same OSNet architecture,
-  same 512 dimensions) stays in-bounds of that constraint; introducing a
-  transformer backbone would not.
+  embedding model. This constraint held through the FastReID switch, which was a
+  bigger change than ADR-002 anticipated — a **different architecture and a
+  different width** (OSNet 512-d at 256×128 → FastReID R101-IBN 2048-d at 384×128)
+  — and still required **zero** change to identity logic, because `backends.py`
+  owns the architecture and preprocessing while `extractor.py` owns the invariant
+  contract. What would breach the constraint is a model that stops producing one
+  L2-normalised vector per crop.
 - The hard same-camera-overlap physical exclusion is never overridden by a
   soft signal — a physical impossibility is a different kind of fact than a
   similarity score, and stays a hard veto in both the legacy and new decision
@@ -447,10 +451,12 @@ The pipeline is correct; the **embedding model is the ceiling** on this domain.
 - **If overlap reappears, the fix is still model-side**, roughly cheapest
   first:
   1. Try other available pretrained checkpoints (already done once here).
-  2. Fine-tune OSNet on crops collected from your own cameras (crop saving is
-     currently disabled — you'd re-enable on-disk crops first) with a
-     metric-learning loss (triplet / ArcFace) — directly targets a specific
-     deployment's domain gap.
+  2. Fine-tune the backbone on crops from your own cameras with a metric-learning
+     loss (triplet / ArcFace) — directly targets a specific deployment's domain
+     gap. **Currently shelved** (ADR-003D §1): there is no labelled pair set, and
+     the on-disk crop path was *removed*, not merely disabled — `crop_saver.py`
+     wrote nothing and was deleted, so this needs a real crop writer first, not a
+     config flag.
   3. Synthetic pretraining (RandPerson) and/or MetaBIN (see [section
      5](#5-adr-002-why-re-ranking--verification-not-just-a-better-threshold)) — the
      "textbook" fix, but there is currently no training pipeline in this repo

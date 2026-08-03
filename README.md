@@ -47,20 +47,32 @@ sudo apt-get update && sudo apt-get install -y \
 #    -> details in section 2
 python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
 
-# 4. start the Qdrant gallery (Docker)          -> details in section 4
+# 4. fetch the ReID checkpoint (537 MB, gitignored)  -> details in section 3
+curl -L -o src/reid/weights/msmt_sbs_R101-ibn.pth \
+  https://github.com/JDAI-CV/fast-reid/releases/download/v0.1.1/msmt_sbs_R101-ibn.pth
+
+# 5. start the Qdrant gallery (Docker)          -> details in section 4
 docker compose up -d
 
-# 5. run it                                     -> details in section 6
+# 6. CHECK THE CONFIG BEFORE RUNNING ANYTHING   -> details in section 3
+python tools/preflight.py --load-model
+
+# 7. run it                                     -> details in section 6
 #    (a) video files (CPU is fine):
 python main.py --videos /path/cam_a.mp4 /path/cam_b.mp4
-#    (b) OR live RTSP (GPU; Ctrl-C to reconcile + write the final videos):
-python main.py --mode live --videos "rtsp://USER:PASS@HOST:554/ch01/0" "rtsp://..."
+#    (b) OR live RTSP (GPU; Ctrl-C ONCE to reconcile + write the final videos).
+#        Put credentials in .env + source.env_urls, not on the command line:
+python main.py --mode live
 ```
 
 Output: `output_<cam>.mp4` per camera (same person = same reid id/colour
-everywhere) + a console run summary. The ReID weight is already in the repo;
-`yolo11n.pt` auto-downloads on first run. Sanity-check your install first with
-the tests in [section 2, "Verify the install"](#verify-the-install).
+everywhere) + a console run summary. `yolo11m.pt` auto-downloads on first run.
+
+**Do not skip step 6.** Every problem it checks for is *silent* — above all a Qdrant
+collection left at a previous backbone's width, which the store only warns about and
+`IdentityStage` then swallows, so the run persists nothing, reconcile has nothing to
+reconcile, and no error appears anywhere. It exits non-zero if a run would produce
+garbage.
 
 ---
 
@@ -188,7 +200,7 @@ installs automatically.
 > **This list is verified, not inferred.** It was checked by building a venv
 > containing *only* `requirements.txt` and running both paths end to end
 > (file-batch and `--mode live`) on real footage: detection, pose-ensemble
-> splitting, tracking, OSNet embedding, the Qdrant gallery, reconcile, and the
+> splitting, tracking, ReID embedding, the Qdrant gallery, reconcile, and the
 > final re-render. `scipy` was found *only* by that run — static import analysis
 > had missed it.
 
@@ -445,15 +457,19 @@ See [ARCHITECTURE.md → section 7, "Key
 configuration"](ARCHITECTURE.md#7-key-configuration-configyaml) for what every
 knob does.
 
-> **`reid.device: cpu` does not pin the whole pipeline to the CPU.** It sets the
-> device for **one** thing: the OSNet ReID extractor on the file-batch path.
+> **`reid.device` does not pin the whole pipeline to one device.** It sets the
+> device for **one** thing: the ReID extractor on the **file-batch** path. Note
+> also that `auto` is not a torch device string — it means "let the extractor pick".
 > Specifically:
 >
 > | Component | Device it uses |
 > |---|---|
 > | YOLO detection + pose (both paths) | **whatever Ultralytics picks — CUDA automatically if a GPU is visible.** `src/detector.py` never passes a `device=`, so this ignores `reid.device` entirely. |
-> | ReID / OSNet, file-batch path | `reid.device` (`cpu` by default) |
-> | ReID / OSNet, live path (`--mode live`) | `live.run.device` (`auto` → GPU if present). `reid.device` is **not** consulted here. |
+> | ReID extractor, file-batch path | `reid.device` |
+> | ReID extractor, live path (`--mode live`) | `live.run.device` (`auto` → GPU if present). `reid.device` is **not** consulted here. |
+
+> `python tools/preflight.py` prints both keys side by side, so "I set it to cuda
+> and it still ran on CPU" is answerable in one command.
 >
 > So on a GPU box with the shipped config, a file run detects on the GPU and
 > embeds on the CPU. To force everything onto the CPU, set `reid.device: cpu`
@@ -589,7 +605,9 @@ Cross-camera people: 1
 | `ModuleNotFoundError: No module named 'gdown'` (or `'tensorboard'`) on `import torchreid` | You installed from an older `requirements.txt`. torchreid declares no runtime dependencies, so these must be pinned explicitly — re-run `pip install -r requirements.txt` (see [section 2](#2-install-the-python-environment)). |
 | Run stalls trying to `pip install lap>=0.5.12` when tracking starts (or fails there with no network) | `lap` missing — ultralytics only ships it in an optional extra. Re-run `pip install -r requirements.txt`; the pin is now explicit. |
 | Run stopped with Ctrl-C but `output_<cam>.mp4` has per-camera (unreconciled) ids | Ctrl-C was pressed **repeatedly**, force-quitting the finalize step (3 presses). Press it **once** and wait — see [section 6, "Stopping a run"](#stopping-a-run--and-why-not-to-spam-ctrl-c). |
-| `Unexpected checkpoint keys dropped` | Wrong/corrupt ReID weights, or `reid.model` and `reid.weights` disagree. Re-fetch `msmt_sbs_R101-ibn.pth` ([section 3](#3-model-weights)). |
+| `Unexpected checkpoint keys dropped` | Wrong/corrupt ReID weights, or `reid.model` and `reid.weights` disagree. Run `python tools/preflight.py --load-model`, then re-fetch `msmt_sbs_R101-ibn.pth` ([section 3](#3-model-weights)). |
+| Run completes but `Store: 0 observations` / all ids provisional | The Qdrant collection is at the wrong width for the current backbone. **This is silent** — the store warns, `IdentityStage` swallows the error. `python tools/preflight.py` reports it; `--fix-store` rebuilds it. |
+| One person gets many different reid ids | Thresholds are too strict for the running feature space. They were derived under a previous backbone and have not been re-anchored — sweep them offline on a finished run with `tests/calibration/sweep_reconcile_thresholds.py`, no camera time needed. |
 | `ValueError` about vector dimension at startup, or observations silently missing | The Qdrant collection still holds 512-d vectors from the previous backbone. Rebuild it ([section 3](#3-model-weights)). |
 | Hangs on first run for a while | `yolo11n.pt` is downloading; subsequent runs are fast. |
 | Very slow on CPU | Set `source.resize_width: 1280` and/or `source.max_frames` for tests. |
@@ -701,10 +719,14 @@ model is trained or fine-tuned here. Each component and its role:
 | **OSNet-AIN x1_0** (`osnet_ain_x1_0.pth`) — previous default | Same role, 512-d at 256×128. Retained because every threshold in `config.yaml` was calibrated in this feature space. Multi-source checkpoint (DukeMTMC-reID + Market1501 + CUHK03, eval MSMT17). | [torchreid / deep-person-reid](https://github.com/KaiyangZhou/deep-person-reid) | Zhou et al., *Omni-Scale Feature Learning for Person Re-ID*, ICCV 2019; *Learning Generalisable Omni-Scale Representations…*, IEEE TPAMI 2021 |
 | **Qdrant** | **Vector store** (not a model) — this pipeline's own gallery: stores every observation embedding + payload and serves nearest-neighbour search. | [Qdrant](https://github.com/qdrant/qdrant) | — |
 
-**Libraries:** [torchreid](https://github.com/KaiyangZhou/deep-person-reid)
-(Zhou & Xiang, *Torchreid: A Library for Deep Learning Person Re-ID in Pytorch*,
-2019) provides the OSNet backbone, preprocessing, and feature utilities; PyTorch;
-OpenCV; NumPy; PyYAML.
+**Libraries:** the **shipping** backbone is vendored from
+[fast-reid](https://github.com/JDAI-CV/fast-reid) — 5 torch-only files under
+`src/reid/vendor/fastreid/`, because FastReID ships no `setup.py` and cannot be
+pip-installed (see its `PROVENANCE.md`).
+[torchreid](https://github.com/KaiyangZhou/deep-person-reid) (Zhou & Xiang,
+*Torchreid: A Library for Deep Learning Person Re-ID in Pytorch*, 2019) remains a
+dependency and provides the OSNet backbones and feature utilities; PyTorch; OpenCV;
+NumPy; PyYAML.
 
 **Dependency licenses:** Ultralytics YOLO11 is **AGPL-3.0**, torchreid is
 **MIT**, Qdrant is **Apache-2.0**. Because this project builds on AGPL-3.0 code

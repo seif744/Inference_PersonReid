@@ -682,8 +682,10 @@ python -c "import sys; sys.path.insert(0,'src'); from database.store import Pers
 
 1. Read `CLAUDE.md`, then `REMEDIATION_PLAN.md` §0 → Part A → Part J.
 2. Read `ADR-003D` and `ARCHITECTURE.md` §§3 (the geometry component), 5, 6.
-3. On the dev box: `python tests/run_all.py` — 18 files, seconds. This verifies the
-   geometry maths without a GPU.
+3. On the dev box: `python tools/preflight.py --load-model` (verifies the FastReID
+   config and the Qdrant collection width), then `python tests/run_all.py` — 19
+   files, seconds. Together these confirm the model/store wiring and the geometry
+   maths without needing a GPU.
 4. On the A6000: `git pull origin research`, fetch the checkpoint (2.3), start
    Qdrant, run `verify_embedding_contract.py`.
 5. **Watch `output_register_file.mp4` from run `20260731_134913`** and answer two

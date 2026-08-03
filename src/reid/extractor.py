@@ -66,10 +66,18 @@ from reid.backends import (DEFAULT_BACKEND, IMAGENET_MEAN, IMAGENET_STD,
 
 # --- Constants (see module docstring for the "why" of each) ----------------
 
-# Default-backend input as (Height, Width) and output width. Re-exported from
-# backends.py so the long-standing `from reid.extractor import EMBEDDING_DIM,
-# INPUT_SIZE` imports in the calibration harness keep working; per-instance
-# `.input_size` / `.embedding_dim` are the authoritative values for a given run.
+# The DEFAULT BACKEND's input as (Height, Width) and output width -- i.e.
+# `backends.DEFAULT_BACKEND` (osnet_ain_x1_0), NOT the model that ships. Re-exported
+# from backends.py so the long-standing `from reid.extractor import EMBEDDING_DIM,
+# INPUT_SIZE` imports keep resolving.
+#
+# READ THIS BEFORE USING EITHER. They describe the fallback, not the run. What
+# actually ships is `reid.model: fastreid_sbs_R101_ibn` -- 2048-d at 384x128 -- so
+# these two constants are 512 and (256, 128) and are WRONG for it by design. The
+# authoritative values are the per-instance `.embedding_dim` / `.input_size`,
+# measured off the loaded net. `database.store.EMBEDDING_DIM` is separately 2048
+# because a fresh collection must match the SHIPPING model; the two are not
+# supposed to be equal.
 INPUT_SIZE = OSNET_INPUT_SIZE
 EMBEDDING_DIM = 512
 

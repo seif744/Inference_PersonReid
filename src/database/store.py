@@ -46,12 +46,25 @@ import numpy as np
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, PointStruct, VectorParams, Filter
 
-# Must match ReIDExtractor.EMBEDDING_DIM. Duplicated as a constant here (not
-# imported from reid) on purpose: the storage layer must not depend on the model
-# layer. If they ever disagree, the dimension guard below fails loudly.
-# 2048 since the switch to FastReID SBS R101-IBN (was 512 for OSNet-AIN). Any
-# collection created before that switch holds 512-d vectors and is unusable --
-# the guard below reports it at startup.
+# The width a FRESH collection is created at when no `dim` is passed: the width of
+# the model that SHIPS (FastReID SBS R101-IBN, 2048-d; was 512 for OSNet-AIN).
+# Not imported from `reid` on purpose -- the storage layer must not depend on the
+# model layer.
+#
+# It does NOT equal `reid.extractor.EMBEDDING_DIM`, and it is not meant to. That one
+# is the width of `backends.DEFAULT_BACKEND` (osnet_ain, 512-d), kept only so old
+# `from reid.extractor import EMBEDDING_DIM` imports resolve. An earlier version of
+# this comment claimed the two "must match", which was simply untrue and sent
+# readers looking for a bug.
+#
+# Neither constant decides anything at runtime: both entry points pass `dim` from
+# `extractor.embedding_dim`, MEASURED off the loaded net, so a `reid.model` swap
+# sizes a fresh collection correctly on its own. Verify with
+# `python tools/preflight.py --load-model`.
+#
+# A collection created before the FastReID switch holds 512-d vectors and is
+# unusable: the guard below reports it, `IdentityStage` then SWALLOWS the insert
+# error, and the run silently persists nothing. `tools/preflight.py` fails on it.
 EMBEDDING_DIM = 2048
 DEFAULT_COLLECTION = "persons"
 

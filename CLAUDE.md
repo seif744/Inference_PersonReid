@@ -160,12 +160,19 @@ in doubt, raise `geometry.reconcile.safety_factor`; never lower it.
   its importers were tracked, and `python tests/run_all.py` failed on every fresh
   clone.
 
-## 8. Before you commit
+## 8. Before you run, and before you commit
 
 ```bash
+python tools/preflight.py --load-model                    # BEFORE any run
 python tests/run_all.py                                   # 19 files, CPU, seconds
 python tests/calibration/verify_embedding_contract.py     # after ANY src/reid/ change
 ```
+
+`preflight.py` verifies the configured stack and exits non-zero when a run would
+**silently** produce garbage — chiefly a Qdrant collection at the previous backbone's
+width, which the store only warns about and `IdentityStage` swallows, so the run
+persists nothing and every id stays provisional with no error anywhere. It also
+reports which `device` key each path reads, and that the thresholds are stale.
 
 `verify_embedding_contract.py` is the only asserting script, and everything it
 covers is a **silent** failure mode: a broken BGR→RGB swap, a transposed resize, a
