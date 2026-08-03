@@ -596,6 +596,27 @@ exercise the veto on real footage. A prior 3-camera run reconciled 35 tracklets 
 
 ## 8. Running things
 
+### 8.0 Is this machine configured correctly? Run this first
+
+```bash
+python tools/preflight.py                 # seconds, loads no models
+python tools/preflight.py --load-model    # also builds the net and MEASURES it
+python tools/preflight.py --fix-store     # DESTRUCTIVE: rebuild a wrong-width collection
+```
+
+Verifies the whole configured stack and exits non-zero if a run would **silently**
+produce garbage: `reid.model` vs `reid.weights` vs the measured embedding width, the
+Qdrant collection's width and metric, whether an RTSP run will write a watchable
+video with reconciled ids, the RTSP transport/timeouts, and which `device` key each
+path actually reads (`reid.device` is file-batch only; the live path reads
+`live.run.device`).
+
+The check that matters most is the **collection width**. A collection left at the
+previous backbone's 512-d accepts nothing at 2048-d, the store only *warns*, and
+`IdentityStage` swallows the error — so the run persists nothing and reconcile has
+nothing to reconcile, with no failure anywhere. That is the most likely way a first
+run after the backbone switch goes wrong (§3.5).
+
 ### 8.1 Correctness checks (fast, dev box)
 
 ```bash
