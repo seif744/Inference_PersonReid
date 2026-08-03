@@ -45,7 +45,25 @@ so this pass is conservative, matching service.py's "prefer a split" bias:
     in the same 0.8-0.9 band as the true match -- and a lone threshold then
     over-merges. Requiring mutual nearest-neighbour keeps the one real pair and
     rejects the look-alike crowd. Turn off only with a model whose same/different
-    scores are cleanly separated (see the sweep in demo_identity.py).
+    scores are cleanly separated (see measure_reconcile_thresholds.py).
+  * GEOMETRIC REACHABILITY: two tracklets never merge if doing so would require a
+    person to move faster than anyone on this floor has been observed to move.
+    Covers both "two places at the same instant" and "could not have got there in
+    time" with one formula (distance / elapsed).
+
+---------------------- GEOMETRY IS CONSUMED, NEVER COMPUTED -------------------
+This module reads the floor positions the LIVE RUN recorded into each observation's
+payload. It does NOT load a calibration, apply a homography, or derive a position
+from a bounding box -- the only import it takes from `geometry/` is the arithmetic
+in `geometry.reachability`, and `tests/live/test_geometry_not_recomputed.py`
+asserts that stays true.
+
+WHY THAT MATTERS ENOUGH TO BE A RULE. The live RTSP feed is never recorded, so a
+position that was not written during the run is gone for good. And a reconcile that
+re-derived positions would silently produce DIFFERENT geometry from the run it is
+reconciling the moment anyone re-fits a calibration -- so two reconciles of one run
+could disagree, with nothing in either output to say why. One run, one geometry,
+decided once, at capture.
 
 Deterministic: the surviving id of a merged cluster is its smallest global_id,
 and vectors/point-ids are never touched -- only the global_id payload is
@@ -54,12 +72,18 @@ to merge.
 ============================================================================
 """
 
+import bisect
 from collections import defaultdict
 
 import numpy as np
 
 from identity import decision_log as dlog
 from identity.decision_log import Candidate, DecisionRecord, GateResult
+# The ONLY geometry import allowed here: pure arithmetic over positions the live
+# run already recorded. `geometry.floor` and `geometry.calibration` -- the modules
+# that could turn a box into a position -- must never appear in this file.
+from geometry.reachability import (IMPOSSIBLE, RecordedPosition, SpeedEnvelope,
+                                   observed_speed_ceiling)
 
 
 # Keys `identity.reconcile.per_camera[<cam>]` is allowed to override. Anything else
@@ -162,6 +186,33 @@ def resolve_covisibility(recon_cfg, log=print):
     return enabled, pairs
 
 
+def resolve_geometry_policy(cfg, log=print):
+    """Whole config -> the `geometry` POLICY dict reconcile_tracklets expects.
+
+    POLICY ONLY -- three numbers that say how hard to bite. No calibration, no
+    homography, no positions: those were recorded by the live run and travel in the
+    observation payloads (geometry/__init__.py invariant 1). That separation is why
+    this resolver never touches `geometry.calibration_path`.
+
+    `geometry.reconcile.enabled` gates the veto independently of
+    `geometry.enabled`, which gates RECORDING. The asymmetry is deliberate: recording
+    is additive and safe to leave on, while the veto changes identities and should be
+    switchable without losing a run's geometry.
+    """
+    gcfg = (cfg or {}).get("geometry") or {}
+    rec = gcfg.get("reconcile") or {}
+    enabled = bool(rec.get("enabled", False))
+    return {
+        "enabled": enabled,
+        # Cross-camera timestamp uncertainty. `ts` is decode time, not sensor time,
+        # so two cameras' stamps for one instant differ by their buffering. Added to
+        # every elapsed time, which can only make the veto more permissive.
+        "clock_error_sec": float(rec.get("clock_error_sec", 0.5)),
+        # Multiplies the measured speed ceiling before it becomes a veto line.
+        "safety_factor": float(rec.get("safety_factor", 1.5)),
+    }
+
+
 def resolve_reconcile_kwargs(cfg, log=print):
     """Whole config -> the kwargs `reconcile_tracklets` should be called with.
 
@@ -203,6 +254,7 @@ def resolve_reconcile_kwargs(cfg, log=print):
         "same_camera_reciprocal_best": bool(
             recon.get("same_camera_reciprocal_best", False)),
         "same_camera_rounds": bool(recon.get("same_camera_rounds", False)),
+        "geometry": resolve_geometry_policy(cfg, log=log),
     }
 
 
@@ -226,7 +278,8 @@ def describe_reconcile_kwargs(kw):
         f" reciprocal={'on' if kw['require_reciprocal_best'] else 'OFF'}"
         f" same_reciprocal={'on' if kw['same_camera_reciprocal_best'] else 'OFF'}"
         f" same_rounds={'on' if kw.get('same_camera_rounds') else 'OFF'}"
-        f" covisibility={'on/' + str(len(covis_pairs)) + ' pairs' if covis_on else 'OFF'}")
+        f" covisibility={'on/' + str(len(covis_pairs)) + ' pairs' if covis_on else 'OFF'}"
+        + f" geometry={'on' if (kw.get('geometry') or {}).get('enabled') else 'OFF'}")
 
 
 def temporal_overlap_sec(span_a, span_b):
@@ -369,6 +422,7 @@ def _gather_tracklets(store, run_id):
         span: (min_frame, max_frame),
         span_ts: (min_ts, max_ts) or None,
         gids: {original global ids},
+        floor: [(ts, x, y, error, group)] sorted by ts -- RECORDED positions only,
     }.
     """
     data = defaultdict(lambda: {
@@ -377,6 +431,7 @@ def _gather_tracklets(store, run_id):
         "frames": [],
         "times": [],
         "gids": set(),
+        "floor": [],
     })
 
     # #20: filter run_id SERVER-SIDE. This used to scroll the ENTIRE collection
@@ -439,6 +494,22 @@ def _gather_tracklets(store, run_id):
                     data[key]["times"].append(float(ts))
                 except (TypeError, ValueError):
                     pass
+
+            # The floor position the LIVE RUN recorded for this observation. We
+            # READ it; we never derive it. There is deliberately no bbox ->
+            # position code path anywhere in this module -- see
+            # geometry/__init__.py invariant 1 and
+            # tests/live/test_geometry_not_recomputed.py.
+            #
+            # Observations stored before geometry existed, or by a run with it
+            # disabled, simply have no `floor` key. That leaves `floor` short and
+            # every geometric rule then fails open, which is the same contract
+            # `span_ts` already uses for a missing wall clock.
+            pos = RecordedPosition.from_payload(pl)
+            if pos is not None and pos.ts is not None:
+                data[key]["floor"].append(
+                    (pos.ts, pos.x, pos.y, pos.error, pos.group))
+
             gid = pl.get("reid_id", pl.get("global_id"))
             if gid is not None:
                 data[key]["gids"].add(int(gid))
@@ -468,12 +539,181 @@ def _gather_tracklets(store, run_id):
             "frames": sorted(frames),
             "times": sorted(times),
             "gids": info["gids"],
+            # Sorted by ts so the reachability check can pair observations by
+            # nearest time with a binary search instead of a scan.
+            "floor": sorted(info["floor"]),
         }
     return out
 
 
 def _cluster_prototype(members, protos):
     return _prototype([protos[m] for m in members])
+
+
+# ------------------------------------------------------ geometric reachability
+
+# How many observation pairings a verdict needs. Below this the check reports no
+# opinion. MV3DT uses minCommonFrames4MatchScore = 2 for the same reason: with one
+# shared instant a geometric "verdict" is an accident of sampling.
+MIN_GEOMETRY_PAIRINGS = 3
+
+# How many of the temporally CLOSEST pairings the verdict is taken over. Bounded
+# because the median has to stay anchored to the moment that actually constrains
+# the merge: for time-overlapping tracklets that is the overlap, and for disjoint
+# ones it is the handover boundary. Include every pairing instead and a long
+# tracklet's far-apart-in-time pairs (which imply no speed at all) would drown the
+# boundary and the check would never fire.
+MAX_GEOMETRY_PAIRINGS = 9
+
+
+def build_speed_envelope(tracklets, clock_error_sec, safety_factor, log=print):
+    """Measure this run's own speed ceiling and build one envelope per floor group.
+
+    The ceiling comes from the run being reconciled, not from a config value and not
+    from a calibration file. Two reasons, both learned here the hard way:
+
+      * NO GUESSED CONSTANTS. Consecutive observations of ONE tracklet are provably
+        one person walking, so their speed distribution is this floor's real answer.
+        Every numeric constant this project invented has been reverted for hurting
+        accuracy -- four thresholds and the topology veto -- and a number read off
+        the data cannot repeat that.
+      * NO UNITS PROBLEM. The floor frame's scale is unknown (no metric reference),
+        but the distances and the ceiling come out of the same frame, so the unknown
+        scale cancels exactly. Nothing here claims metres.
+
+    Returns {group: SpeedEnvelope}. A group with too little data is absent, which
+    makes the check unavailable for it -- fail-open, by construction.
+    """
+    per_group = defaultdict(dict)
+    for key, info in tracklets.items():
+        rows = info.get("floor") or []
+        for ts, x, y, _err, group in rows:
+            per_group[group].setdefault(key, []).append((ts, x, y))
+
+    envelopes = {}
+    for group, samples in sorted(per_group.items()):
+        stats = observed_speed_ceiling(samples)
+        if stats is None:
+            log(f"  geometry: group {group} has too few usable observation pairs to "
+                f"measure a speed ceiling -> reachability check UNAVAILABLE here "
+                f"(fails open, nothing is vetoed).")
+            continue
+        env = SpeedEnvelope(stats["ceiling_units_per_sec"],
+                            clock_error_sec=clock_error_sec,
+                            safety_factor=safety_factor, group=group)
+        envelopes[group] = env
+        log(f"  geometry: group {group} -- {env.describe()} "
+            f"[measured over {stats['n_pairs']} pairs from {stats['n_tracks']} "
+            f"tracklet(s); median {stats['median']:.3f}, p99 {stats['p99']:.3f}]")
+    return envelopes
+
+
+def closest_pairings(rows_a, rows_b, limit=MAX_GEOMETRY_PAIRINGS):
+    """The `limit` temporally closest (obs_a, obs_b) pairings between two tracklets.
+
+    `rows_a` / `rows_b` are the `floor` lists -- (ts, x, y, error, group), sorted by
+    ts. For each observation on each side we take its nearest-in-time counterpart on
+    the other, then keep the pairings with the smallest |dt|.
+
+    That single rule handles both questions with no special-casing:
+
+      overlapping in time -> the closest pairings are near-simultaneous, so the
+                             verdict is about standing in two places at once;
+      disjoint in time    -> the closest pairings cluster at the handover boundary,
+                             so the verdict is about whether the walk was possible.
+    """
+    if not rows_a or not rows_b:
+        return []
+    times_b = [r[0] for r in rows_b]
+    times_a = [r[0] for r in rows_a]
+    seen = set()
+    out = []
+
+    def nearest(rows, times, ts):
+        i = bisect.bisect_left(times, ts)
+        best = None
+        for j in (i - 1, i):
+            if 0 <= j < len(rows):
+                d = abs(rows[j][0] - ts)
+                if best is None or d < best[0]:
+                    best = (d, j)
+        return best
+
+    for ia, ra in enumerate(rows_a):
+        got = nearest(rows_b, times_b, ra[0])
+        if got is not None and (ia, got[1]) not in seen:
+            seen.add((ia, got[1]))
+            out.append((got[0], ra, rows_b[got[1]]))
+    for ib, rb in enumerate(rows_b):
+        got = nearest(rows_a, times_a, rb[0])
+        if got is not None and (got[1], ib) not in seen:
+            seen.add((got[1], ib))
+            out.append((got[0], rows_a[got[1]], rb))
+
+    out.sort(key=lambda p: p[0])
+    return out[:limit]
+
+
+def reachability_verdict(rows_a, rows_b, envelopes):
+    """-> (is_impossible, detail dict). The geometric veto for one tracklet pair.
+
+    THE VERDICT IS THE MEDIAN, NOT THE WORST CASE, and that choice is the whole
+    difference between a usable guard and the topology veto that had to be disabled.
+    One bad foot point -- a clipped box, a person behind a desk, a momentary
+    detector wobble -- produces one impossible pairing. Vetoing on the worst case
+    would let that single artefact split a person permanently, and reconcile has no
+    way to undo a refusal. A median demands that the pair be impossible
+    CONSISTENTLY, across independent instants.
+
+    Fails open on every uncertainty: no positions, mixed floor groups, an unmeasured
+    group, or fewer than MIN_GEOMETRY_PAIRINGS pairings all return "not impossible".
+    """
+    if not rows_a or not rows_b or not envelopes:
+        return False, None
+
+    groups = {r[4] for r in rows_a} | {r[4] for r in rows_b}
+    if len(groups) != 1:
+        # Either a camera pair spanning two floor frames (no comparable
+        # coordinates), or a tracklet whose calibration changed mid-run. Neither is
+        # a distance.
+        return False, None
+    group = next(iter(groups))
+    env = envelopes.get(group)
+    if env is None:
+        return False, None
+
+    pairings = closest_pairings(rows_a, rows_b)
+    if len(pairings) < MIN_GEOMETRY_PAIRINGS:
+        return False, None
+
+    speeds, verdicts = [], []
+    for _dt, ra, rb in pairings:
+        a = RecordedPosition(ra[1], ra[2], ra[3], group, ra[0])
+        b = RecordedPosition(rb[1], rb[2], rb[3], group, rb[0])
+        reason = env.check(a, b)
+        if reason.required_speed is None:
+            continue
+        speeds.append(reason.required_speed)
+        verdicts.append(reason)
+
+    if len(speeds) < MIN_GEOMETRY_PAIRINGS:
+        return False, None
+
+    speeds.sort()
+    median = speeds[len(speeds) // 2] if len(speeds) % 2 else (
+        0.5 * (speeds[len(speeds) // 2 - 1] + speeds[len(speeds) // 2]))
+    impossible = median > env.limit
+    detail = {
+        "group": group,
+        "pairings": len(speeds),
+        "median_required_speed": round(float(median), 4),
+        "min_required_speed": round(float(speeds[0]), 4),
+        "max_required_speed": round(float(speeds[-1]), 4),
+        "limit": round(float(env.limit), 4),
+        "n_impossible": sum(1 for r in verdicts if r.verdict == IMPOSSIBLE),
+        "verdict": IMPOSSIBLE if impossible else "plausible",
+    }
+    return impossible, detail
 
 
 def reconcile_tracklets(store, threshold, run_id=None,
@@ -488,6 +728,7 @@ def reconcile_tracklets(store, threshold, run_id=None,
                         covisibility=None,
                         same_camera_reciprocal_best=False,
                         same_camera_rounds=False,
+                        geometry=None,
                         quality_out=None):
     """
     Rebuild global ids from camera-local tracklets.
@@ -530,6 +771,13 @@ def reconcile_tracklets(store, threshold, run_id=None,
         not. See REMEDIATION_PLAN.md Phase 9.
     top2_margin_basis : "eligible" | "all_scored" -- which margin variant would
         gate if a threshold were set. Exactly one can ever gate, by construction.
+
+    geometry : optional dict of POLICY for the reachability veto -- never geometry
+        data. Keys: `enabled` (default False), `clock_error_sec`, `safety_factor`.
+        The positions themselves come from the observation payloads the live run
+        wrote, and the speed ceiling is measured from those same positions, so
+        nothing here needs a calibration file. `enabled: false` reproduces the
+        pre-geometry behaviour exactly.
     """
     dl = decision_log
     tracklets = _gather_tracklets(store, run_id)
@@ -595,6 +843,56 @@ def reconcile_tracklets(store, threshold, run_id=None,
         if unknown:
             log(f"  tracklet reconcile: covisibility names {unknown}, absent from "
                 f"this run")
+
+    # ---- geometric reachability veto --------------------------------------
+    # Consumes the floor positions the LIVE RUN recorded; computes none of them.
+    gcfg = geometry or {}
+    geo_envelopes = {}
+    positioned = sum(1 for k in all_keys if tracklets[k].get("floor"))
+    if gcfg.get("enabled"):
+        if positioned == 0:
+            # Enabled but no recorded positions: almost always a run captured with
+            # geometry off, or one whose calibration did not match the frames. Said
+            # loudly because the alternative -- an enabled guard that silently never
+            # fires -- is indistinguishable from a working one that finds nothing.
+            log("  geometry: reachability veto ENABLED but NOT ONE observation in "
+                "this run carries a recorded floor position -> the veto can never "
+                "fire. Either the run was captured with geometry.enabled: false, or "
+                "the calibration's image_size did not match its frames. Reconcile "
+                "continues on appearance alone.")
+        else:
+            geo_envelopes = build_speed_envelope(
+                tracklets,
+                clock_error_sec=float(gcfg.get("clock_error_sec", 0.5)),
+                safety_factor=float(gcfg.get("safety_factor", 1.5)),
+                log=log)
+            log(f"  geometry: reachability veto ON -- {positioned}/{len(all_keys)} "
+                f"tracklet(s) carry recorded positions, "
+                f"{len(geo_envelopes)} floor group(s) measured. Tracklets without a "
+                f"position, and pairs across floor groups, are never vetoed.")
+    elif positioned:
+        log(f"  geometry: {positioned}/{len(all_keys)} tracklet(s) carry recorded "
+            f"positions, but the reachability veto is OFF "
+            f"(geometry.reconcile.enabled is false) -- nothing is vetoed.")
+
+    geo_details = {}          # (key_a, key_b) -> detail dict, for the log/summary
+    geo_vetoes = 0
+
+    def geometry_blocks(a, b):
+        """True when merging these two tracklets would be physically impossible."""
+        nonlocal geo_vetoes
+        if not geo_envelopes:
+            return False
+        pair = (a, b) if a <= b else (b, a)
+        if pair in geo_details:
+            return geo_details[pair].get("verdict") == IMPOSSIBLE
+        impossible, detail = reachability_verdict(
+            tracklets[a].get("floor"), tracklets[b].get("floor"), geo_envelopes)
+        if detail is not None:
+            geo_details[pair] = detail
+        if impossible:
+            geo_vetoes += 1
+        return impossible
 
     def _obs(k):
         return len(tracklets[k]["vectors"])
@@ -683,7 +981,7 @@ def reconcile_tracklets(store, threshold, run_id=None,
         Returns a REASON rather than a bool so the decision log can attribute the
         exclusion.
 
-        TWO physical impossibilities are checked, and both are HARD -- no appearance
+        THREE physical impossibilities are checked, and all are HARD -- no appearance
         score can override them, because they are statements about where one body
         can be, not about how alike two crops look:
 
@@ -698,13 +996,31 @@ def reconcile_tracklets(store, threshold, run_id=None,
         people" the operator kept reporting, and no threshold addresses it: the
         pair's cosine can be perfectly high and the merge still be impossible.
 
+        GEOMETRIC REACHABILITY: merging two tracklets whose recorded FLOOR POSITIONS
+        would require a person to move faster than anyone on this floor has been
+        observed to move is equally impossible. Unlike the two above, this one is a
+        statement about DISTANCE rather than mere co-presence, so it also catches the
+        cases those miss: two people standing in the same camera pair at slightly
+        different times, and two people in one camera whose tracks do not overlap.
+        Positions come from the live run's payload; nothing is recomputed here.
+
+        Note this is where the disabled `live.topology` min-transit veto's job now
+        lives, done properly. That veto guessed 2-3 second minimums between cameras
+        that are actually adjacent, and pruned the true cross-camera match. Measured
+        positions cannot make that mistake: overlapping cameras yield a distance near
+        zero, so the check stays silent exactly where the guess over-fired.
+
         Fail-open everywhere it is unsure: disabled by config, an unlisted camera
-        pair, a co-visible pair, or a missing wall-clock span all mean "no veto".
-        A wrong veto is worse than a missing one -- it manufactures a second
-        identity for someone who only has one.
+        pair, a co-visible pair, a missing wall-clock span, an observation with no
+        recorded position, a pair spanning two floor groups, or a floor group whose
+        speed ceiling could not be measured all mean "no veto". A wrong veto is worse
+        than a missing one -- it manufactures a second identity for someone who only
+        has one, and nothing downstream can undo that.
         """
         for a in set_a:
             for b in set_b:
+                if geometry_blocks(a, b):
+                    return dlog.GEOMETRIC_UNREACHABLE
                 if a[0] == b[0]:
                     if not _spans_disjoint(tracklets[a]["span"],
                                            tracklets[b]["span"]):
@@ -782,6 +1098,7 @@ def reconcile_tracklets(store, threshold, run_id=None,
                 dlog.RECIPROCAL_BEST: _na_gate(),
                 dlog.TEMPORAL_CONFLICT_SAME_CAMERA: _na_gate(),
                 dlog.TEMPORAL_CONFLICT_CROSS_CAMERA: _na_gate(),
+                dlog.GEOMETRIC_UNREACHABLE: _na_gate(),
             }, accepted_partner=None, context="suppressed")
             dl.records[-1].state = dlog.SUPPRESSED
 
@@ -948,8 +1265,14 @@ def reconcile_tracklets(store, threshold, run_id=None,
             scored = []
             for b in peers:
                 score = pair_score({a}, {b}, protos[a], protos[b])
-                if conflict_reason({a}, {b}) is not None:
-                    reason = dlog.TEMPORAL_CONFLICT_SAME_CAMERA
+                # Use the reason conflict_reason ACTUALLY gave. It used to be
+                # hardcoded to the same-camera overlap gate, which was true while
+                # that was the only rule reachable here; a geometric veto attributed
+                # to time overlap would send the next investigation to the wrong
+                # rule, which is exactly the failure Part M was written about.
+                blocked = conflict_reason({a}, {b})
+                if blocked is not None:
+                    reason = blocked
                 elif score < bar_a:
                     reason = dlog.BELOW_ABSOLUTE_THRESHOLD
                 else:
@@ -992,6 +1315,12 @@ def reconcile_tracklets(store, threshold, run_id=None,
                     threshold=0, passed=True,
                     extra={"note": "count of peers excluded for time overlap"}),
                 dlog.TEMPORAL_CONFLICT_CROSS_CAMERA: _na_gate(),
+                dlog.GEOMETRIC_UNREACHABLE: GateResult(
+                    value=sum(1 for _, _, r in scored
+                              if r == dlog.GEOMETRIC_UNREACHABLE),
+                    threshold=0, passed=True,
+                    extra={"note": "count of peers excluded as physically "
+                                   "unreachable from the recorded floor positions"}),
             }, accepted_partner=partner, context="same_camera")
 
     # Phase 2 runs in ROUNDS, re-scoring from scratch each round, so a chain of
@@ -1252,6 +1581,14 @@ def reconcile_tracklets(store, threshold, run_id=None,
                         extra={"note": "count of peers excluded for cross-camera "
                                        "simultaneity",
                                "applies": bool(covis_enabled)}),
+                    dlog.GEOMETRIC_UNREACHABLE: GateResult(
+                        value=sum(1 for _, _, _, r in scored
+                                  if r == dlog.GEOMETRIC_UNREACHABLE),
+                        threshold=0, passed=True,
+                        extra={"note": "count of peers excluded as physically "
+                                       "unreachable from the recorded floor "
+                                       "positions",
+                               "applies": bool(geo_envelopes)}),
                 }, accepted_partner=partner, context=ctx)
 
         round_index += 1
@@ -1314,6 +1651,22 @@ def reconcile_tracklets(store, threshold, run_id=None,
 
     log(f"  tracklet reconcile: {len(keys)} tracklets -> "
         f"{len(set(remap.values()))} identities.")
+    if geo_envelopes:
+        # A veto count of zero is a RESULT, not a silence: on these overlapping
+        # cameras it means no proposed merge was physically impossible, which is
+        # exactly what the disabled min-transit veto got wrong. Print the pair that
+        # came closest so the envelope's position can be judged rather than assumed.
+        judged = len(geo_details)
+        log(f"  geometry: {geo_vetoes} merge(s) vetoed as physically unreachable, "
+            f"out of {judged} tracklet pair(s) it could judge.")
+        if judged:
+            worst = max(geo_details.items(),
+                        key=lambda kv: kv[1]["median_required_speed"])
+            (ka, kb), d = worst
+            log(f"  geometry: closest call {ka[0]}:{ka[1]} <-> {kb[0]}:{kb[1]} -- "
+                f"median {d['median_required_speed']:.2f} units/s vs limit "
+                f"{d['limit']:.2f} ({d['pairings']} pairings, "
+                f"{d['n_impossible']} individually impossible) -> {d['verdict']}")
     if dl is not None:
         dl.print_summary(log=log)
         written = dl.write()

@@ -64,7 +64,7 @@ class IdentityService:
                     a split (one person given a spare id) is recoverable. So we
                     prefer to mint a new id when unsure. This value is
                     DATA-AND-MODEL-DEPENDENT -- calibrate it per deployment
-                    with the threshold sweep in demo_identity.py, and re-measure
+                    with tests/calibration/measure_score_separation.py, and re-measure
                     whenever the ReID checkpoint changes. config.yaml overrides
                     this default with the value actually calibrated for the
                     checkpoint currently in use (see identity.threshold there,

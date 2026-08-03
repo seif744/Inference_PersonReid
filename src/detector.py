@@ -113,7 +113,7 @@ def crop_person(frame, det, padding=0):
 
     This is the ONE shared "box -> safe crop" primitive. It lives here, next to
     Detection, because it's a pure detection-geometry operation with no ReID or
-    disk-IO concern -- so both crop_saver.py and the ReID path depend on it
+    disk-IO concern -- so every consumer of a person crop depends on it
     rather than each keeping their own copy (which would drift over time).
 
     Clamping matters: YOLO boxes can extend past the frame edge (a person at the
@@ -121,7 +121,7 @@ def crop_person(frame, det, padding=0):
     wrong crop. max(...,0) stops negatives; min(...,w/h) stops overrun.
 
     padding grows the box by N pixels per side (0 = tight box). ReID wants tight
-    boxes to match training crops; crop_saver may want a margin for debugging.
+    boxes to match training crops; a debug view may want a margin.
     """
     h, w = frame.shape[:2]
     x1 = max(det.x1 - padding, 0)
@@ -177,7 +177,7 @@ class PersonDetector:
 
         # ---- Pose ensemble: split boxes that merged two+ people ----
         # The box detector/tracker sometimes wraps ONE box around two overlapping
-        # people (the crops/id_0008 case: two stacked bodies). Embedding that crop
+        # people (two stacked bodies in one box). Embedding that crop
         # blends two identities. To catch it, we run a second, independent model
         # -- a POSE model that finds one skeleton PER PERSON -- and, when a tracker
         # box clearly contains >= 2 distinct pose bodies, we split it into the

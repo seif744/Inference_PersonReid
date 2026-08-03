@@ -62,7 +62,7 @@ class Verifier:
         # cosine tops out around 0.48-0.57, while genuine same-person
         # cross-video matches reach 0.70-0.80, a much cleaner gap than the
         # earlier Market1501 checkpoint (which overlapped ~0.70-0.85 for both).
-        # Re-measure and re-anchor these weights (or demo_identity.py's sweep)
+        # Re-measure and re-anchor these weights (measure_score_separation.py)
         # if the ReID weights or camera domain change. Observation count still
         # carries supporting weight: a candidate identity with many accumulated
         # views is stronger corroborating evidence that a borderline cosine

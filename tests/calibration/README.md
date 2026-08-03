@@ -13,7 +13,6 @@ python tests/calibration/compare_backbones.py          register_file.avi 60 6
 python tests/calibration/measure_reconcile_thresholds.py register_file.avi 90 4
 python tests/calibration/measure_detection.py            register_file.avi 50
 python tests/calibration/compare_detector_models.py      register_file.avi 150
-python tests/calibration/measure_pose_ensemble.py        register_file.avi 40 20
 python tests/calibration/characterize_known_defects.py
 python tests/calibration/audit_product_path.py           test_v2.avi 40 2
 python tests/calibration/analyze_decision_log.py         logs/reconcile_decisions_<run_id>.jsonl
@@ -38,12 +37,25 @@ directory with a distinct camera name and a local Qdrant, so it cannot overwrite
 | `measure_detection.py` | no | H.6, H.7 | before proposing any detector-side change |
 | `compare_detector_models.py` | no | H.11 | before changing `detector.model`; answers recall AND whether extra boxes become sustained tracks |
 | `analyze_decision_log.py` | no | J.6, J.10 | after every live run — it is how a threshold change is judged |
-| `measure_pose_ensemble.py` | no | — | only if the batch path comes back into use |
 | `characterize_known_defects.py` | no, always exits 0 | — | after each phase lands, to see what moved |
 | `audit_product_path.py` | no | H.10 | after any pipeline change; the only whole-path check |
 | `explain_merge_failure.py` | no | Part M | when the operator reports one person carrying two reids — names the rule and the tracklet pair that refused the merge |
 | `sweep_reconcile_thresholds.py` | no | #41, Part M.1 | to explore merge settings on a finished run, with no camera time |
 | `rerender_from_clips.py` | no | — | to see a setting on the actual video before it ships |
+
+Geometry has its own tooling, outside this directory, because it is not a
+measurement of the appearance model:
+
+| Tool | What it does |
+|---|---|
+| `tools/fit_floor_frame.py` | fits the shared floor frame from people's own foot points on a finished run — no clicking, no floor plan, no camera time. Refuses to write a calibration that fails its label-free validation |
+| `tests/live/test_geometry_*.py` | the geometry maths, fully verifiable on the dev box (no GPU, no footage, no Qdrant) |
+
+`--geometry`, `--no-geometry` and `--geometry-safety F` work on the three
+reconcile-replaying tools, so the reachability veto can be judged on a finished run
+with no camera time. They toggle **policy only**: they cannot conjure geometry into a
+run captured without it, because positions are recorded live and only there. On such
+a run reconcile says so loudly and proceeds on appearance alone.
 
 **The three scripts that re-run reconcile** (`explain_merge_failure`,
 `sweep_reconcile_thresholds`, `rerender_from_clips`) all take their settings from

@@ -35,7 +35,8 @@ class IdentityStage(threading.Thread):
                  cross_camera_threshold=0.63, accept_margin=0.03,
                  bank_size=20, active_ttl_sec=300.0, max_active_identities=200,
                  topology=None, max_per_lane=64, sweep_interval_sec=2.0,
-                 metrics=None, store=None, run_id=None, sample_stride=1):
+                 metrics=None, store=None, run_id=None, sample_stride=1,
+                 geometry=None):
         super().__init__(name="identity", daemon=True)
         self.in_q = identity_queue
         self.render_queues = render_queues          # {cam: DropOldestQueue}
@@ -56,6 +57,14 @@ class IdentityStage(threading.Thread):
         self._sample_count = defaultdict(int)
         self.stored = 0
         self._store_failed = False
+
+        # ---- geometry (src/geometry/) ----
+        # THE LIVE RUN IS THE ONLY WRITER OF GEOMETRY. This stage computes each
+        # observation's floor position and stores it INSIDE the payload, so offline
+        # reconcile consumes a recorded fact rather than re-deriving one (see
+        # geometry/__init__.py invariant 1). None = no calibration, and everything
+        # downstream degrades to appearance-only, exactly as before geometry existed.
+        self.geometry = geometry
 
         self.engine = IdentityEngine(
             min_evidence_obs=min_evidence_obs,
@@ -142,8 +151,10 @@ class IdentityStage(threading.Thread):
                 key = (frame.cam, det.track_id)
                 self._sample_count[key] += 1
                 if self._sample_count[key] % self._sample_stride == 0:
+                    payload = self._observation_payload(frame, det)
+                    self._record_geometry(frame, det, payload)
                     store_vecs.append(det.embedding)
-                    store_payloads.append(self._observation_payload(frame, det))
+                    store_payloads.append(payload)
 
         if store_vecs:
             try:
@@ -184,6 +195,46 @@ class IdentityStage(threading.Thread):
             payload["crop_quality"] = float(cq)
         return payload
 
+    def _frame_size(self, frame):
+        """(width, height) of the frame these boxes were measured in, or None.
+
+        Needed because a homography belongs to the pixel space it was fitted in and
+        `source.resize_width` changes that space before detection. Handing the size
+        over lets geometry rescale, or refuse -- never guess. A GPU tensor is
+        (C, H, W) or (H, W, C) depending on the decode backend, so anything not
+        clearly a 3-D image returns None and geometry falls back to trusting the
+        calibrated size.
+        """
+        img = getattr(frame, "image", None)
+        shape = getattr(img, "shape", None)
+        if shape is None or len(shape) != 3:
+            return None
+        # BGR HWC (numpy, and the CPU tensor path) -- channels last and small.
+        if shape[2] <= 4:
+            return (int(shape[1]), int(shape[0]))
+        # CHW (a torch tensor from the GPU decode backend).
+        if shape[0] <= 4:
+            return (int(shape[2]), int(shape[1]))
+        return None
+
+    def _record_geometry(self, frame, det, payload):
+        """Attach this observation's floor position to the payload, if available.
+
+        The live run is the ONLY writer of geometry (geometry/__init__.py invariant
+        1), and this is that write. Never raises: GeometryRecorder swallows its own
+        errors and disables itself, because losing geometry must never cost a run
+        its identities.
+        """
+        if self.geometry is None or not self.geometry.enabled:
+            return
+        bbox = payload.get("bbox")
+        if bbox is None:
+            return
+        self.geometry.annotate(payload, frame.cam, bbox, frame.ts,
+                               frame_index=frame.frame_index,
+                               track_id=det.track_id,
+                               frame_size=self._frame_size(frame))
+
     # ---- metrics surface (used by later stages / shutdown report) ----------
     @property
     def minted(self):
@@ -191,7 +242,9 @@ class IdentityStage(threading.Thread):
 
     def stats(self):
         e = self.engine
+        geo = self.geometry.stats() if self.geometry is not None else {}
         return {
+            **geo,
             "minted": e.minted,
             "reacquired": e.reacquired,                 # same-camera cold reactivations
             "linked": e.linked,                         # cross-camera links

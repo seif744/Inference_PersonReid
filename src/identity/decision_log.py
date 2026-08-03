@@ -65,6 +65,10 @@ TOP2_MARGIN = "TOP2_MARGIN"
 RECIPROCAL_BEST = "RECIPROCAL_BEST"
 TEMPORAL_CONFLICT_SAME_CAMERA = "TEMPORAL_CONFLICT_SAME_CAMERA"
 TEMPORAL_CONFLICT_CROSS_CAMERA = "TEMPORAL_CONFLICT_CROSS_CAMERA"
+# The merge would require a person to move faster than anyone on this floor has
+# been observed to move -- computed from the floor positions the LIVE RUN recorded
+# (src/geometry/), never re-derived here. See geometry/__init__.py invariant 1.
+GEOMETRIC_UNREACHABLE = "GEOMETRIC_UNREACHABLE"
 
 ALL_GATES = (
     MIN_OBSERVATIONS,
@@ -73,6 +77,7 @@ ALL_GATES = (
     RECIPROCAL_BEST,
     TEMPORAL_CONFLICT_SAME_CAMERA,
     TEMPORAL_CONFLICT_CROSS_CAMERA,
+    GEOMETRIC_UNREACHABLE,
 )
 
 # Reasons a candidate is removed from the ELIGIBLE set. All are independent of the
@@ -84,6 +89,7 @@ BELOW_ABSOLUTE_THRESHOLD = "BELOW_ABSOLUTE_THRESHOLD"
 EXCLUSION_REASONS = (
     TEMPORAL_CONFLICT_SAME_CAMERA,
     TEMPORAL_CONFLICT_CROSS_CAMERA,
+    GEOMETRIC_UNREACHABLE,
     NOT_MERGEABLE_CROSS,
     BELOW_ABSOLUTE_THRESHOLD,
 )

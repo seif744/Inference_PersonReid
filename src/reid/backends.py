@@ -9,10 +9,17 @@ the OTHER question -- WHICH network computes it.
 The two are separated because they change for completely different reasons. The
 contract is a property of the pipeline (Qdrant wants unit vectors; four cameras
 share one model; a crowded frame must not OOM). The network is a property of an
-EXPERIMENT: "is ResNet50-IBN better than OSNet-AIN on our footage?" Every such
-experiment used to mean editing the one file that also holds the invariants the
-calibration harness asserts -- so each backbone trial risked silently breaking
-batching or normalisation, which produce no error, just worse matching.
+EXPERIMENT: "is FastReID ResNet101-IBN better than OSNet-AIN on our footage?" --
+which is the experiment this file was written for, and the swap that shipped.
+Every such experiment used to mean editing the one file that also holds the
+invariants the calibration harness asserts -- so each backbone trial risked
+silently breaking batching or normalisation, which produce no error, just worse
+matching.
+
+WHAT IS RUNNING TODAY: `reid.model: fastreid_sbs_R101_ibn` -- FastReID SBS
+ResNet-**101**-IBN, MSMT17, 2048-d at 384x128. R50 is registered and unused.
+Nothing below changes that; see the note on OSNetBackend.__init__'s `arch`
+default, which is the one line people misread as "we are still on OSNet".
 
 ------------------------------ THE SPLIT -----------------------------------
 A backend OWNS everything model-specific:
@@ -183,6 +190,14 @@ class OSNetBackend(ReIDBackend):
     #: quietly fall back instead of doing what the config asked.
     ARCHS = ("osnet_x1_0", "osnet_ibn_x1_0", "osnet_ain_x1_0")
 
+    # NOTE ON THIS `arch` DEFAULT: it selects which OSNet *this class* builds when
+    # constructed without one. It is NOT the pipeline's ReID model, and it cannot
+    # select FastReID -- that is a different class further down. What actually runs
+    # is `reid.model` in config.yaml (today `fastreid_sbs_R101_ibn`) resolved through
+    # the BACKENDS registry, which always passes `arch` explicitly for OSNet entries,
+    # so this default is never consulted on the shipped path. Reading it as "we are
+    # still on OSNet" is a mistake people have made; the run banner prints the model
+    # actually loaded.
     def __init__(self, weights: str, device: torch.device,
                  arch: str = "osnet_ain_x1_0", tap: str = "post_relu"):
         super().__init__(device)

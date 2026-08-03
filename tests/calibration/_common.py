@@ -162,6 +162,7 @@ KNOWN_FLAGS = {
     "--cross", "--same", "--same-global", "--min-obs", "--scoring", "--top-frac",
     "--no-reciprocal", "--same-reciprocal", "--no-same-reciprocal",
     "--same-rounds", "--no-same-rounds", "--no-covisibility", "--covis-tolerance",
+    "--geometry", "--no-geometry", "--geometry-safety",
 }
 
 
@@ -210,6 +211,16 @@ def reconcile_settings(cfg=None, log=print, owns=(), extra_flags=()):
       --no-covisibility      disable the cross-camera simultaneity veto
       --covis-tolerance S    override every numeric veto tolerance with S seconds
                              (pairs declared `covisible` stay covisible)
+      --geometry             turn the geometric reachability veto ON for this run
+      --no-geometry          turn it OFF
+      --geometry-safety F    multiply the MEASURED speed ceiling by F to get the
+                             veto line. Raise it to be more permissive; a wrong
+                             veto cannot be undone, a missed one costs nothing new
+
+    NOTE `--geometry` toggles POLICY only. It cannot conjure geometry into a run
+    that was captured without it -- positions are recorded live and only there
+    (geometry/__init__.py invariant 1). On such a run reconcile says so and
+    proceeds on appearance alone.
     """
     from identity.reconcile import resolve_reconcile_kwargs
 
@@ -254,6 +265,16 @@ def reconcile_settings(cfg=None, log=print, owns=(), extra_flags=()):
         kw["covisibility"] = (enabled,
                               {k: (None if v is None else tol)
                                for k, v in pairs.items()})
+    # Geometry POLICY overrides. The positions themselves were recorded during the
+    # run and are not overridable from here -- by design.
+    geo = dict(kw.get("geometry") or {})
+    if flag("--geometry"):
+        geo["enabled"] = True
+    if flag("--no-geometry"):
+        geo["enabled"] = False
+    if mine("--geometry-safety") is not None:
+        geo["safety_factor"] = float(mine("--geometry-safety"))
+    kw["geometry"] = geo
     return kw
 
 

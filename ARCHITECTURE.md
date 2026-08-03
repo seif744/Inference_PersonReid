@@ -7,9 +7,8 @@ that is stable for the same real person **across cameras** and **across
 re-appearances** within a camera. The pipeline is fully self-contained: it
 builds and owns its own Qdrant gallery — there is no separate registration step
 or external service. Output: annotated videos (boxes + reid-id labels, with
-`global_id` kept for compatibility) and a console run-summary. (On-disk
-per-person crop saving is disabled in the code — see the CropSaver note in
-[section 3, "Components"](#3-components).)
+`global_id` kept for compatibility) and a console run-summary. No crop images
+are written to disk — the embedder makes its own in-memory crop.
 
 There are two entry paths, and **both settle cross-camera identity with the same
 offline reconcile** (`identity/reconcile.py`):
@@ -35,7 +34,7 @@ Three layers, kept strictly independent (see `src/identity/DESIGN.md`):
 
 | Layer | Module | Knows about | Does NOT know about |
 |---|---|---|---|
-| **Appearance** | `reid/extractor.py` | one crop → 512-d vector | cameras, time, identity |
+| **Appearance** | `reid/extractor.py` | one crop → an L2-normalised vector (2048-d under the current backend) | cameras, time, identity |
 | **Storage** | `database/store.py` | vectors + payloads, nearest-neighbour search | how vectors are produced, camera topology |
 | **Identity** | `identity/service.py`, `identity/reconcile.py` | appearance + **where** + **when** | how the model computes a vector |
 
@@ -69,23 +68,22 @@ ADR-002 adds two more stages **inside** the identity layer's decision, between
    │ 1. VideoSource          video file      → frame              │
    │ 2. (optional) resize    frame            → frame (downscaled) │
    │ 3. PersonDetector       frame            → [Detection + track_id]  (YOLO11n + ByteTrack)
-   │ 4. CropSaver (disabled)  frame+dets      → in-memory only (no files written)
-   │ 5. TrackEmbedder        crop             → det.embedding (512-d)  [shared model lock]
+   │ 4. TrackEmbedder        crop             → det.embedding (2048-d) [shared model lock]
    │      └─ quality gate + occlusion gate + throttle/cache          │
-   │ 6. IdentityService      embedding+where+when → det.reid_id     [identity lock]
+   │ 5. IdentityService      embedding+where+when → det.reid_id     [identity lock]
    │      └─ candidate (Qdrant search) → re-rank (Upgrade 1) →       │
    │         verify (Upgrade 2) → decide → COMMIT to the gallery     │
-   │ 7. drawing → live display window; box geometry captured for the │
+   │ 6. drawing → live display window; box geometry captured for the │
    │      final render (the video is NOT written in this pass)       │
    └─────────────────────────────────────────────────────────────┘
                             │  (all camera threads join)
                             ▼
    ┌─────────────────────────────────────────────────────────────┐
-   │ 8. reconcile_tracklets  OFFLINE, whole-gallery view:           │
+   │ 7. reconcile_tracklets  OFFLINE, whole-gallery view:           │
    │      rebuild identities from tracklets, merge across cameras   │
-   │ 9. render_final_videos  re-draw with FINAL reid ids →           │
+   │ 8. render_final_videos  re-draw with FINAL reid ids →           │
    │      output_<cam>.mp4  (same person = same REID in every video) │
-   │ 10. print_run_summary   → console only (no files written)      │
+   │ 9. print_run_summary   → console only (no files written)      │
    └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -102,17 +100,14 @@ Returns `Detection(x1,y1,x2,y2, confidence, class_id, track_id, ...)`. `track_id
 is **per-camera** and stable frame-to-frame; it may be `None` until ByteTrack
 confirms a box. `crop_person()` is the shared "box → safe crop" primitive.
 
-### CropSaver — `src/crop_saver.py` (disk saving DISABLED)
-Only constructed when `crops.save: true` (off by default). It throttles per-track
-crops and returns them **in memory** — it **writes nothing to disk** (the on-disk
-`crops/<camera>/id_<track>/` saving was removed), and `main.py` discards the
-return. Not required by the pipeline: the embedder makes its own in-memory crop
-via `crop_person()`. To actually collect crops on disk again you'd re-add a
-consumer for the returned crops.
-
 ### ReIDExtractor — `src/reid/extractor.py`
-OSNet-AIN-x1_0, loaded once and shared. Pipeline per crop: BGR→RGB → resize
-**256×128** → `/255` → ImageNet mean/std → forward in `eval()` mode (512-d
+The configured backend (`reid.model`, today **FastReID SBS ResNet101-IBN /
+MSMT17**), loaded once and shared. `src/reid/backends.py` owns the architecture,
+checkpoint load, **preprocessing recipe** and feature tap; the extractor keeps the
+backend-invariant contract (batching, `max_batch` chunking, the shared-model forward
+lock, L2-normalisation, empty-crop rejection). Pipeline per crop: BGR→RGB → resize
+to the backend's size (**384×128** for FastReID, 256×128 for OSNet) → `/255` →
+ImageNet mean/std → forward in `eval()` mode (2048-d for FastReID, 512-d
 feature) → **L2-normalize**. Unit vectors ⇒ cosine similarity == dot product.
 Preprocessing is pinned to match training or embeddings silently degrade.
 
@@ -220,8 +215,13 @@ identities from scratch (does **not** trust live `reid_id`s); the **tracklet**
 2. **Suppress** tracklets with `< min_tracklet_observations` (3) via
    `clear_global_id` — 1–2-frame detector blips don't become people.
 3. **Prototype** per tracklet (mean of normalized vectors).
-4. **Union-find** with a hard conflict guard: same-camera, time-**overlapping**
-   tracklets can never merge (provably two people).
+4. **Union-find** with hard conflict guards, all statements about where one body
+   can be rather than about how alike two crops look: same-camera,
+   time-**overlapping** tracklets can never merge (provably two people);
+   cross-camera pairs overlapping in time in cameras that cannot both see one
+   person (`covisibility`); and pairs whose **recorded floor positions** would
+   require impossible speed (`GEOMETRIC_UNREACHABLE`, see
+   [the geometry section](#geometry--srcgeometry)). All fail open.
 5. **Phase 1 — same-camera defrag**: merge same-camera, time-disjoint pairs with
    cosine ≥ `same_camera_threshold` (0.90).
 6. **Phase 2 — cross-camera, iterated to convergence**: on cluster prototypes,
@@ -245,6 +245,53 @@ identities from scratch (does **not** trust live `reid_id`s); the **tracklet**
 7. **Survivor**: each final cluster keeps the smallest existing reid ID
    (deterministic); all its points rewritten via `set_global_id` so both
    `reid_id` and `global_id` stay aligned.
+
+### geometry — `src/geometry/`
+Answers one question: *could one person have been in both of these places?* It is a
+**check** on identity, not a tracker — nothing here does 3D tracking, and nothing
+here can create or merge an identity. It can only refuse a merge.
+
+    src/geometry/calibration.py   the floor-frame record + the metric-scale guard
+    src/geometry/floor.py         bbox -> point on a shared floor (owns the homography)
+    src/geometry/reachability.py  two recorded points -> possible / impossible
+    src/geometry/recorder.py      the LIVE run's writer -- the only place a position
+                                  is ever computed
+    tools/fit_floor_frame.py      fits the floor frame from people's own foot points
+
+One formula: `required_speed = distance / elapsed`, vetoed above a speed ceiling.
+At `elapsed ≈ 0` that is "one body cannot be in two places"; at `elapsed > 0` it is
+"could not have got there in time". `src/live/topology.py`'s hand-set min-transit
+veto is **superseded** by it and stays disabled — it asserted 2–3 s minimums between
+adjacent cameras and pruned the true match; measured positions cannot make that
+mistake, because overlapping cameras give a distance near zero.
+
+**Three invariants.** Each is enforced, not merely documented — see
+`tests/live/test_geometry_*.py` and `ADR-003D`.
+
+1. **The live run records geometry; offline reconcile only consumes it.** Positions
+   are computed once, at capture, and stored in the observation payload under
+   `floor`. `reconcile.py` never loads a calibration, applies a homography, or
+   derives a position from a box: it may import `geometry.reachability` (pure
+   arithmetic) and nothing else under `geometry/`. Why — the live feed is never
+   recorded, so an unwritten position is gone; and if reconcile derived positions,
+   re-fitting a calibration would silently change a finished run's identities.
+2. **Units are floor units, not metres.** The frame is fitted from imagery alone,
+   which fixes the plane only up to scale. `is_metric` is False and the
+   metre-facing API raises until a trusted metric reference is recorded (verified
+   floor plan/CAD, verified architectural dimension, or an independently measured
+   reference distance). Nothing is lost: the speed ceiling is measured from the same
+   footage in the same unit, so the unknown scale cancels. Metres are needed only to
+   relate **separate floor groups**, which is why `cam_206` and `cam_213` — which
+   overlap nothing — have no geometry at all.
+3. **It fails open, always.** Uncalibrated camera, missing box, mismatched image
+   size, cameras in different floor groups, no timestamp, an unmeasured speed
+   ceiling → *unavailable*, treated as no opinion. Every error budget biases toward
+   permitting the merge, because refusing one is unrecoverable while missing one
+   leaves a false merge that already happens today.
+
+Ships disabled (`geometry.enabled`, `geometry.reconcile.enabled` both false).
+File-batch mode records nothing — `IdentityService._commit` stores neither `bbox`
+nor `ts` — so use `--mode live` to run geometry over recorded footage.
 
 ### render_final_videos — `main.py`
 Second render pass, after reconciliation. The live pass only captured per-frame
@@ -336,8 +383,10 @@ The pipeline is correct; the **embedding model is the ceiling** on this domain.
   cross-video matches reached **~0.70–0.80** — but on this project's actual
   CCTV footage the two clusters still ran close enough (~0.72 vs. ~0.55) that
   a domain-generalization backbone was worth trying.
-- **Current default (OSNet-AIN, `osnet_ain_x1_0`)**: same OSNet family and
-  512-d embedding, with Adaptive Instance Normalization added specifically to
+- **Previous default (OSNet-AIN, `osnet_ain_x1_0`)** — superseded on 2026-07-31
+  by FastReID R101-IBN, below. Kept because **every threshold in `config.yaml` was
+  derived in this feature space** and none has been re-anchored since: same OSNet
+  family and 512-d embedding, with Adaptive Instance Normalization added to
   generalize to unseen camera domains — a near-drop-in swap (same torchreid
   API, same 256×128 preprocessing). Measured from the decision log on this
   project's 3-video run: accepted (same-person) matches average cosine
@@ -354,8 +403,8 @@ The pipeline is correct; the **embedding model is the ceiling** on this domain.
   [section 7](#7-key-configuration-configyaml).
 - **This is footage-and-checkpoint-specific, not solved in general.** A
   different deployment (different cameras, lighting, clothing diversity)
-  could easily reintroduce distribution overlap even with OSNet-AIN. Re-run
-  `identity/demo_identity.py`'s sweep (or inspect
+  could easily reintroduce distribution overlap even with a new checkpoint. Re-run
+  `tests/calibration/measure_score_separation.py` (or inspect
   `logs/verification_decisions.jsonl` directly) whenever you point this at
   new footage, and re-anchor the verifier's weights and thresholds if the gap
   changes. If overlap persists, escalate to a foundation backbone (CLIP-ReID /
@@ -417,8 +466,8 @@ The pipeline is correct; the **embedding model is the ceiling** on this domain.
 |---|---|---|
 | `detector.confidence_threshold` | 0.4 | drop weak detections |
 | `tracker.config` | bytetrack.yaml | tracker |
-| `crops.interval` | 10 | crop-helper throttle (frames/crop; disk saving disabled) |
-| `reid.weights` | osnet_ain_x1_0.pth | ReID checkpoint — recalibrate everything below if this changes ([section 6](#6-known-limitations-model-not-plumbing)) |
+| `reid.model` | fastreid_sbs_R101_ibn | which backend in `reid/backends.py` runs. **Note `backends.DEFAULT_BACKEND` is `osnet_ain_x1_0`** — that is only the fallback when `reid.model` is absent, never what ships |
+| `reid.weights` | msmt_sbs_R101-ibn.pth | ReID checkpoint — recalibrate everything below if this changes ([section 6](#6-known-limitations-model-not-plumbing)) |
 | `reid.interval` / `ttl` | 10 / 300 | re-embed cadence / cache eviction |
 | `reid.quality.max_occlusion_ratio` | 0.5 | reject multi-body crops |
 | `store.enabled` | true | the pipeline's own gallery — always on for the default flow |

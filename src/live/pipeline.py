@@ -165,6 +165,54 @@ class LivePipeline:
               f"{len(topo.known())} camera(s) [{cams}]; any other camera is fail-open.")
         return topo
 
+    def _build_geometry(self, cameras):
+        """Build the GeometryRecorder from the top-level `geometry` config block.
+
+        Returns None when geometry is off or no calibration exists -- and that is a
+        normal, supported state: every consumer treats missing geometry as "no
+        opinion" and the run behaves exactly as it did before geometry existed.
+
+        THE LIVE RUN IS THE ONLY WRITER OF GEOMETRY. Offline reconcile reads the
+        positions this records and never re-derives them (geometry/__init__.py
+        invariant 1). So if this returns None, the run's reachability check is gone
+        for good -- it cannot be recovered afterwards, because the raw feed is never
+        recorded. That is why every failure below is LOUD.
+        """
+        gcfg = self.cfg.get("geometry", {}) or {}
+        if not gcfg.get("enabled", False):
+            print("[live] geometry: OFF (geometry.enabled is false) -> no floor "
+                  "positions recorded, so offline reconcile has no reachability "
+                  "check. Appearance-only, exactly as before.")
+            return None
+        try:
+            from geometry.calibration import load_calibration
+            from geometry.recorder import GeometryRecorder
+            record = load_calibration(gcfg.get("calibration_path") or None)
+        except Exception as e:                                     # noqa: BLE001
+            print(f"[live] geometry: could NOT load the calibration ({e}) -> no "
+                  f"floor positions will be recorded for this run.")
+            return None
+        if record is None:
+            print("[live] geometry: enabled, but no calibration record exists -> "
+                  "nothing will be recorded. Fit one from a completed run (no "
+                  "camera time needed): python tools/fit_floor_frame.py <run_id>")
+            return None
+
+        log_path = (gcfg.get("log_path") or "logs/geometry_<run_id>.jsonl")
+        log_path = log_path.replace("<run_id>", str(self.run_id))
+        rec = GeometryRecorder(record, log_path=log_path, run_id=self.run_id)
+        print("[live] geometry ACTIVE:")
+        for line in record.summary().splitlines():
+            print(f"[live]   {line}")
+        missing = rec.cameras_without_geometry(cameras)
+        if missing:
+            # Named at startup, not inferred from a zero counter afterwards: a
+            # camera silently contributing no geometry looks identical to geometry
+            # being off, and that ambiguity is expensive to debug later.
+            print(f"[live]   NOT calibrated (fail-open, appearance-only): "
+                  f"{', '.join(sorted(missing))}")
+        return rec
+
     def _build_store(self, dim: Optional[int] = None):
         """Build the Qdrant gallery for the offline reconcile, from the top-level
         `store` config (same backend the file path uses: env QDRANT_URL/API_KEY >
@@ -411,6 +459,9 @@ class LivePipeline:
             store=self.store if self.reconcile_enabled else None,
             run_id=self.run_id,
             sample_stride=self._sample_stride,
+            # Records each observation's floor position INTO the payload, so the
+            # offline reconcile consumes recorded geometry instead of recomputing it.
+            geometry=self._build_geometry([n for n, _ in self.sources]),
         )
         self.identity_stage = identity
         # shared consumers start before captures
@@ -547,6 +598,22 @@ class LivePipeline:
             print("[live] Their output is missing or incomplete -- the traceback is "
                   "above, earlier in this log.")
             print("=" * 72)
+        # Flush and close the geometry sidecar HERE, inside the guarded phase, for
+        # the same reason the writers finalize here: an append-only log must not
+        # lose its tail to a second Ctrl-C. Identity has already joined, so no
+        # further records can arrive. The observation payloads in Qdrant -- which is
+        # what reconcile actually reads -- were written as the run went, so a lost
+        # sidecar tail costs analysis data, never identities.
+        geo = getattr(self.identity_stage, "geometry", None) if self.identity_stage else None
+        if geo is not None:
+            try:
+                geo.close()
+                for line in geo.summary():
+                    print(f"[live] {line}")
+            except Exception as e:                                 # noqa: BLE001
+                print(f"[live] geometry finalize failed ({type(e).__name__}: {e}); "
+                      f"continuing -- the ids matter.")
+
         # Reporting is DIAGNOSTIC and must never be able to skip what follows it.
         # Guarded because it sits between the joins and the reconcile: any failure
         # here -- a dead stdout, a KeyError in the metrics dicts, a stage object

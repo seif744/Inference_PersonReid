@@ -90,9 +90,31 @@ def _sampled_cooccurrences(a_times, b_times, tol):
     return hits
 
 
-def describe_pair(a, b, tracklets, covis_enabled, covis_pairs, sample_tol):
-    """One row of the conflict grid: (gate, detail) for this member pair."""
+def describe_pair(a, b, tracklets, covis_enabled, covis_pairs, sample_tol,
+                  geo_envelopes=None):
+    """One row of the conflict grid: (gate, detail) for this member pair.
+
+    THIS FUNCTION MUST STAY IN STEP WITH reconcile.conflict_reason. It deliberately
+    reimplements the grid -- reconcile drops a vetoed pair before scoring, leaving no
+    trace -- so a gate added there and forgotten here makes this tool report "no rule
+    refused" about a pair that WAS refused. That is worse than not having the tool,
+    because it sends the next investigation to the wrong rule. The geometric check
+    below was added for exactly that reason; check reconcile.conflict_reason's gate
+    list against this one whenever either changes.
+    """
     ta, tb = tracklets[a], tracklets[b]
+
+    # Checked FIRST, matching conflict_reason's order, so the reported gate is the
+    # one reconcile would actually have returned.
+    if geo_envelopes:
+        impossible, detail = R.reachability_verdict(ta.get("floor"),
+                                                    tb.get("floor"), geo_envelopes)
+        if impossible:
+            return (R.dlog.GEOMETRIC_UNREACHABLE,
+                    f"physically unreachable: median "
+                    f"{detail['median_required_speed']:.2f} units/s over "
+                    f"{detail['pairings']} pairing(s) vs limit {detail['limit']:.2f} "
+                    f"({detail['n_impossible']} individually impossible)")
     if a[0] == b[0]:
         frame_overlap = (min(ta["span"][1], tb["span"][1])
                          - max(ta["span"][0], tb["span"][0]))
@@ -411,6 +433,18 @@ def main():
 
     # ---- the conflict grid -------------------------------------------------
     covis_enabled, covis_pairs = kw["covisibility"]
+    # Rebuild the geometric envelopes the same way reconcile does -- from THIS run's
+    # recorded positions, never from a calibration file (geometry/__init__.py
+    # invariant 1). Empty when the veto is off or the run carries no positions, which
+    # makes the grid's geometry column silent rather than misleading.
+    geo_cfg = kw.get("geometry") or {}
+    geo_envelopes = {}
+    if geo_cfg.get("enabled"):
+        geo_envelopes = R.build_speed_envelope(
+            tracklets,
+            clock_error_sec=float(geo_cfg.get("clock_error_sec", 0.5)),
+            safety_factor=float(geo_cfg.get("safety_factor", 1.5)),
+            log=lambda m: print(f"  {m}"))
     # Tolerance for "the same sampled instant". Observations are taken every
     # reid.interval_sec, so two boxes that really were on screen together land
     # within about one cadence of each other; 1.5x leaves room for the jitter in
@@ -427,7 +461,7 @@ def main():
     for x in sorted(set_a):
         for y in sorted(set_b):
             gate, detail = describe_pair(x, y, tracklets, covis_enabled,
-                                         covis_pairs, sample_tol)
+                                         covis_pairs, sample_tol, geo_envelopes)
             tag = "BLOCK" if gate else "  ok "
             if gate:
                 blockers.append((x, y, gate, detail))

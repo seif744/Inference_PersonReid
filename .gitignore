@@ -78,4 +78,11 @@ ADR-003-geometric-signal.md
 ADR-003A-geometry-subsystem.md
 ADR-003B-label-mining.md
 ADR-003C-identity-integration.md
+ADR-003D-reachability-veto.md
+
+# CLAUDE.md IS tracked, deliberately, and is the counterweight to the line above.
+# The ADR set being local means the A6000 and every fresh clone have no copy of the
+# rules -- so anything load-bearing is duplicated into CLAUDE.md, ARCHITECTURE.md or
+# config.yaml comments, all of which travel. ADR-003D section 1 says which rules
+# those are. If you change one there, change it in the tracked copy too.
 

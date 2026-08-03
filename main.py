@@ -16,12 +16,11 @@ for EACH video, runs the same per-frame pipeline:
 
     STAGE 1-2   VideoSource      video file  ->  frame
     STAGE 3-4   PersonDetector   frame       ->  [Detection...] (+ track IDs)
-    STAGE 6prep CropSaver        crops each tracked person to crops/<name>/
     STAGE 5     drawing          detections  ->  annotated frame
 
 MULTIPLE VIDEOS AT ONCE (and how we show them):
-Each video gets its OWN detector (so their track IDs never mix) and its OWN
-crops folder. The heavy work (decode + detect + track + draw) runs on one
+Each video gets its OWN detector (so their track IDs never mix). The heavy work
+(decode + detect + track + draw) runs on one
 worker THREAD per video, all at the same time. But OpenCV's windows are NOT
 thread-safe, so the worker threads never call imshow directly -- instead each
 worker drops its latest annotated frame into a shared buffer, and the MAIN
@@ -32,7 +31,6 @@ you watch all cameras live, with the tracking boxes, safely.
 import argparse
 from datetime import datetime
 import os
-import shutil
 import sys
 import threading
 import time
@@ -47,7 +45,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src
 from video_source import VideoSource, is_stream_path
 from detector import PersonDetector, resolve_detector_cfg
 from drawing import draw_detections, draw_hud
-from crop_saver import CropSaver
 from interrupt_guard import InterruptGuard, print_stop_hint
 
 
@@ -204,8 +201,8 @@ def _camera_name_from_source(path):
 def normalize_sources(videos):
     """
     Turn a list of video entries into a clean list of (name, path) with UNIQUE
-    names (names become crops/<name>/ and output_<name>.mp4, so collisions would
-    overwrite each other).
+    names (names become output_<name>.mp4, so collisions would overwrite each
+    other).
 
     Each entry may be either:
       - a plain string path/URL  -> name is derived from the file/host, OR
@@ -297,21 +294,6 @@ def resolve_sources(args, cfg):
         raise SystemExit("[main] These video files were not found:\n  "
                          + "\n  ".join(missing))
     return sources, origin
-
-
-def clear_directory(path):
-    """Remove all contents of a directory, creating it if needed."""
-    if not path:
-        return
-    if os.path.exists(path):
-        for entry in os.listdir(path):
-            full_path = os.path.join(path, entry)
-            if os.path.isdir(full_path) and not os.path.islink(full_path):
-                shutil.rmtree(full_path)
-            else:
-                os.remove(full_path)
-    else:
-        os.makedirs(path, exist_ok=True)
 
 
 def build_gid_map(store, run_id):
@@ -482,17 +464,17 @@ def render_final_videos(jobs, cfg, shared, store, run_id,
 # =============================================================================
 # The WORKER: runs the whole pipeline for ONE video, on its own thread.
 # It does NOT touch any window. It only:
-#   - reads frames, detects+tracks, saves crops, draws boxes, and
+#   - reads frames, detects+tracks, draws boxes, and
 #   - publishes its latest annotated frame into `shared` for the main thread.
 # =============================================================================
-def process_video(name, path, detector, crop_saver, embedder, store, identity,
+def process_video(name, path, detector, embedder, store, identity,
                   locks, cfg, shared, stop_event, run_id):
     trk_cfg = cfg["tracker"]
     # 0 = process the whole video; a positive number stops early (handy for a
     # quick CPU test without waiting for hundreds of frames).
     max_frames = cfg["source"].get("max_frames", 0)
     # 0 = keep native resolution. A positive width downscales every frame (keeping
-    # aspect) BEFORE detect/track/crop/embed -- QHD footage on CPU is dominated by
+    # aspect) BEFORE detect/track/embed -- QHD footage on CPU is dominated by
     # pixel count, so e.g. 1280 is dramatically faster for dev with little ReID
     # cost. Everything downstream uses the same resized frame, so coords stay
     # consistent (crops are smaller too).
@@ -531,10 +513,6 @@ def process_video(name, path, detector, crop_saver, embedder, store, identity,
                     detections = detector.track(frame)   # Stage 4: with IDs
                 else:
                     detections = detector.detect(frame)  # Stage 3: no IDs
-
-                # ---- STAGE 6 prep: crop from the CLEAN frame (before drawing)-
-                if crop_saver is not None:
-                    crop_saver.save(frame, detections, frame_index)
 
                 # ---- STAGE 5/6: embed tracked people + check Qdrant ---------
                 # Uses the CLEAN frame (before boxes are drawn). We embed each
@@ -745,7 +723,6 @@ def main():
     rtsp_options_from_config(cfg)
     det_cfg = cfg["detector"]
     trk_cfg = cfg["tracker"]
-    crop_cfg = cfg["crops"]
     disp_cfg = cfg["display"]
 
     sources, src_origin = resolve_sources(args, cfg)
@@ -795,15 +772,9 @@ def main():
             "[main] batch mode cannot process stream URLs. Use --mode live "
             "(or run.mode: auto) for RTSP/HTTP streams.")
 
-    # ---- FILE-BATCH path (local files only from here on) --------------------
-    if crop_cfg.get("save"):
-        clear_directory(crop_cfg.get("dir", "crops"))
-        print(f"[main] Cleared crops directory: {crop_cfg.get('dir', 'crops')}")
-
-    # ---- Build one detector + crop saver PER video --------------------------
+    # ---- Build one detector PER video ---------------------------------------
     # Each detector has its OWN tracker memory (IDs never bleed between videos).
-    # Each crop saver writes to crops/<name>/ so crops stay separate.
-    jobs = []  # each: (name, path, detector, crop_saver)
+    jobs = []  # each: (name, path, detector)
     for name, path in sources:
         # Per-camera overrides (angle/lighting differ per view) merged over the
         # global detector block -- see detector.resolve_detector_cfg.
@@ -816,16 +787,7 @@ def main():
             pose_ensemble=cam_det_cfg.get("pose_ensemble"),
             iou=cam_det_cfg.get("iou", 0.7),
         )
-        crop_saver = None
-        if crop_cfg["save"]:
-            per_video_dir = os.path.join(crop_cfg["dir"], name)
-            crop_saver = CropSaver(
-                output_dir=per_video_dir,
-                interval=crop_cfg["interval"],
-                padding=crop_cfg["padding"],
-            )
-            print(f"[main] {name}: crops -> {per_video_dir}/")
-        jobs.append((name, path, detector, crop_saver))
+        jobs.append((name, path, detector))
 
     # ---- Build the SHARED ReID model + Qdrant access ------------------------
     # ONE extractor for the whole run: the model is the expensive resource, so we
@@ -948,10 +910,10 @@ def main():
 
     # ---- Start one worker thread per video ----------------------------------
     threads = []
-    for name, path, detector, crop_saver in jobs:
+    for name, path, detector in jobs:
         t = threading.Thread(
             target=process_video,
-            args=(name, path, detector, crop_saver, embedders.get(name), store,
+            args=(name, path, detector, embedders.get(name), store,
                   identity, locks, cfg, shared, stop_event, run_id),
             name=name,
         )

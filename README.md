@@ -75,13 +75,13 @@ flowchart TD
         subgraph CAM_A["Camera A"]
             direction TB
             A1(["Video frame"]) --> A2["Detect + Track\n(YOLO11n + ByteTrack)"]
-            A2 --> A3["Embed crop\n(OSNet, 512-d)"]
+            A2 --> A3["Embed crop\n(FastReID R101-IBN, 2048-d)"]
             A3 --> A4["Re-rank + verify\ncandidates -> assign\na reid id"]
         end
         subgraph CAM_B["Camera B"]
             direction TB
             B1(["Video frame"]) --> B2["Detect + Track\n(YOLO11n + ByteTrack)"]
-            B2 --> B3["Embed crop\n(OSNet, 512-d)"]
+            B2 --> B3["Embed crop\n(FastReID R101-IBN, 2048-d)"]
             B3 --> B4["Re-rank + verify\ncandidates -> assign\na reid id"]
         end
     end
@@ -250,28 +250,50 @@ weights download themselves):
 
 | File | How to get it | In a fresh clone? |
 |---|---|---|
-| `yolo11n.pt` (detector) | **Auto-downloaded** by ultralytics on first run | No (gitignored; fetched automatically) |
+| `yolo11m.pt` (detector) | **Auto-downloaded** by ultralytics on first run | No (gitignored; fetched automatically) |
 | `yolo11n-pose.pt` (pose ensemble) | **Auto-downloaded** by ultralytics — but only on a **file-batch** run (the live path disables the pose ensemble, so live runs never fetch it) | No (gitignored; fetched automatically) |
-| `src/reid/weights/osnet_ain_x1_0.pth` (ReID, default) | Committed to the repo | Yes — already present |
+| `src/reid/weights/msmt_sbs_R101-ibn.pth` (ReID, **the default**) | **Fetch per machine** — 537 MB, see below | **No** |
+| `src/reid/weights/osnet_ain_x1_0.pth` (ReID, previous default) | Committed to the repo | Yes — already present |
 
-The default ReID checkpoint is **OSNet-AIN x1_0** (set by `reid.weights` in
-`config.yaml`), the same torchreid OSNet family with Adaptive Instance
-Normalization added for better generalization to unseen camera domains. It
-replaced a plain `osnet_x1_0` (MSMT17) checkpoint whose embeddings weren't
-discriminative enough on this project's out-of-domain CCTV footage
-(same-person cross-camera cosine ~0.72 vs. different-person ~0.55 — too
-close). On this project's footage, the AIN swap measurably widens that gap
-(see [ARCHITECTURE.md → section 6, "Known
-limitations"](ARCHITECTURE.md#6-known-limitations-model-not-plumbing)).
-If you ever need to re-fetch it: it's the multi-source
-domain-generalization checkpoint (trained on
-DukeMTMC-reID + Market1501 + CUHK03, evaluated on MSMT17) from the official
-`deep-person-reid` MODEL_ZOO (`osnet_ain_x1_0`) — download via `gdown` from the
-Google Drive link on that page and place it at `src/reid/weights/`.
+The default ReID checkpoint is **FastReID SBS ResNet101-IBN, trained on MSMT17**
+(`reid.model: fastreid_sbs_R101_ibn`, `reid.weights:
+src/reid/weights/msmt_sbs_R101-ibn.pth`). It is **not in git** and must be fetched
+on every machine:
 
-To compare against an earlier checkpoint (e.g. `osnet_x1_0_msmt17` or
-`osnet_x1_0` Market1501), fetch it the same way and point `reid.weights` at it —
-but OSNet-AIN is the recommended default given the measured separation above.
+```bash
+curl -L -o src/reid/weights/msmt_sbs_R101-ibn.pth \
+  https://github.com/JDAI-CV/fast-reid/releases/download/v0.1.1/msmt_sbs_R101-ibn.pth
+```
+
+At **537 MB** it is over GitHub's 100 MB per-file hard limit, so a push carrying it
+is *rejected*, not merely slow. Move it with `deploy.sh` or `scp` if a box has no
+outbound network.
+
+> **Two things that catch people out**, both read off upstream source:
+> 1. **Input is 384×128, not 256×128** — `Base-SBS.yml` overrides `INPUT.SIZE_TEST`.
+>    Feeding 256×128 runs fine and quietly costs accuracy.
+> 2. **There is no feature tap to choose.** FastReID's `EmbeddingHead` returns the
+>    post-bnneck feature unconditionally at eval, so `reid.tap: n/a` is required and
+>    the backend raises on anything else.
+>
+> Also note `backends.DEFAULT_BACKEND` is `osnet_ain_x1_0`. That is only the
+> fallback used when `reid.model` is absent from the config — it is **not** what
+> ships. `config.yaml` selects FastReID.
+
+The embedding is **2048-d**, so a Qdrant collection holding the previous 512-d
+vectors **must be rebuilt**; the store's dimension guard reports the mismatch at
+startup. Every threshold in `config.yaml` was derived in the old 512-d space and
+none has been re-anchored — see [ARCHITECTURE.md → section 6, "Known
+limitations"](ARCHITECTURE.md#6-known-limitations-model-not-plumbing).
+
+To compare backbones, point `reid.model` at any registered backend
+(`fastreid_sbs_R101_ibn` | `fastreid_sbs_R50_ibn` | `osnet_ain_x1_0` |
+`osnet_ibn_x1_0` | `osnet_x1_0`) with a matching `reid.weights`, and rank them with
+threshold-free metrics — a cosine bar means nothing across feature spaces:
+
+```bash
+python tests/calibration/compare_backbones.py register_file.avi 60 6
+```
 
 ---
 
@@ -373,7 +395,9 @@ tracker:
 
 reid:
   enabled: true
-  weights: src/reid/weights/osnet_ain_x1_0.pth
+  model: fastreid_sbs_R101_ibn   # which backend in src/reid/backends.py
+  weights: src/reid/weights/msmt_sbs_R101-ibn.pth
+  tap: n/a                       # FastReID has no selectable tap; see section 3
   device: cpu                    # ReID model only, file-batch path. YOLO
                                  # detection auto-picks the GPU regardless --
                                  # see the note under this snippet.
@@ -383,7 +407,8 @@ identity:
   enabled: true
   threshold: 0.63                # plain-path cosine acceptance (used only
                                   # when verification.enabled is false) --
-                                  # calibrated for the osnet_ain_x1_0 checkpoint
+                                  # STILL calibrated for the OLD osnet_ain_x1_0
+                                  # feature space; not yet re-anchored
   min_score_gap: 0.03
   rerank:                        # ADR-002 Upgrade 1: camera-aware re-ranking
     enabled: true
@@ -539,10 +564,8 @@ A run produces:
 | Gallery | Qdrant (`store.url` / `store.path`) | every observation + assigned reid id (plus compatibility `global_id`) — this pipeline's own data |
 | Verification decision log | `logs/verification_decisions.jsonl` | one line per accept/reject decision, with its full feature vector — for calibrating or eventually training the verifier |
 
-That's it — no crop images are written. On-disk crop saving is disabled in the
-code (`crop_saver.py` writes nothing); the embedder makes its own in-memory
-crops, so the ReID path never needs files on disk. `crops.save: true` only builds
-an in-memory (discarded) crop helper — it does not produce files.
+That's it — **no crop images are written.** The embedder makes its own in-memory
+crop, so the ReID path never needs files on disk.
 
 The console prints a **RUN SUMMARY** at the end, e.g.:
 ```
@@ -566,7 +589,8 @@ Cross-camera people: 1
 | `ModuleNotFoundError: No module named 'gdown'` (or `'tensorboard'`) on `import torchreid` | You installed from an older `requirements.txt`. torchreid declares no runtime dependencies, so these must be pinned explicitly — re-run `pip install -r requirements.txt` (see [section 2](#2-install-the-python-environment)). |
 | Run stalls trying to `pip install lap>=0.5.12` when tracking starts (or fails there with no network) | `lap` missing — ultralytics only ships it in an optional extra. Re-run `pip install -r requirements.txt`; the pin is now explicit. |
 | Run stopped with Ctrl-C but `output_<cam>.mp4` has per-camera (unreconciled) ids | Ctrl-C was pressed **repeatedly**, force-quitting the finalize step (3 presses). Press it **once** and wait — see [section 6, "Stopping a run"](#stopping-a-run--and-why-not-to-spam-ctrl-c). |
-| `Unexpected checkpoint keys dropped` | Wrong/corrupt ReID weights. Re-fetch `osnet_ain_x1_0.pth` to `src/reid/weights/`. |
+| `Unexpected checkpoint keys dropped` | Wrong/corrupt ReID weights, or `reid.model` and `reid.weights` disagree. Re-fetch `msmt_sbs_R101-ibn.pth` ([section 3](#3-model-weights)). |
+| `ValueError` about vector dimension at startup, or observations silently missing | The Qdrant collection still holds 512-d vectors from the previous backbone. Rebuild it ([section 3](#3-model-weights)). |
 | Hangs on first run for a while | `yolo11n.pt` is downloading; subsequent runs are fast. |
 | Very slow on CPU | Set `source.resize_width: 1280` and/or `source.max_frames` for tests. |
 | "database is locked" | Embedded mode (`store.path`) is single-process. Use the shared Docker server (`store.url`), or stop other runs using the same folder. |
@@ -587,12 +611,13 @@ ARCHITECTURE.md             deep-dive: data flow, components, design
 src/
   video_source.py           frame decoding (files + streams)
   detector.py                YOLO11 + ByteTrack, Detection, crop_person
-  crop_saver.py               per-track crop helper (in-memory; disk saving disabled)
   drawing.py                  boxes / HUD overlay
   reid/
-    extractor.py              crop -> 512-d L2-normalized embedding (OSNet)
+    extractor.py              crop -> L2-normalized embedding (backend-invariant contract)
+    backends.py                the ReIDBackend interface: architecture + preprocessing + tap
+    vendor/fastreid/            5 torch-only files from upstream FastReID (see PROVENANCE.md)
     service.py                 TrackEmbedder: throttle, cache, quality + occlusion gates
-    weights/                    ReID model checkpoint (osnet_ain_x1_0.pth)
+    weights/                    ReID model checkpoints
   database/
     store.py                   Qdrant wrapper (PersonVectorStore) -- this pipeline's own gallery
   identity/
@@ -600,15 +625,24 @@ src/
     reranking.py                 ADR-002 Upgrade 1: camera-aware k-reciprocal + Jaccard re-ranking
     verifier.py                  ADR-002 Upgrade 2: scored verification layer + decision logging
     reconcile.py                 offline cross-camera reconciliation (used by BOTH paths)
+    decision_log.py              every merge decision, accepted and rejected, with all gates
     DESIGN.md                    why the layers are separated
+  geometry/                   IS a merge physically possible? (a CHECK, not a tracker)
+    calibration.py             the floor-frame record + the metric-scale guard
+    floor.py                    bbox -> point on a shared floor (owns the homography)
+    reachability.py             two recorded points -> possible / impossible
+    recorder.py                 the LIVE run's writer -- the ONLY place a position is computed
   live/                       REAL-TIME streaming pipeline (--mode live)
     pipeline.py                orchestrator: wire stages, run, shutdown + offline reconcile
     capture.py / decode_backend.py / capabilities.py   per-camera capture + device probe
     scheduler.py / inference.py                         freshness batching + detect/track/embed
     identity_stage.py / identity_engine.py / priority.py   online ids + fair queue + store persistence
-    topology.py                 fail-open cross-camera physical-impossibility veto
+    topology.py                 hand-set min-transit veto -- DISABLED, superseded by geometry/
     render.py / writer.py / queues.py / frame.py        draw/encode + load-shedding primitives
 tests/live/                  deterministic logic tests (synthetic; no GPU/models needed)
+tests/calibration/           measurements on REAL footage (see its README)
+tools/
+  fit_floor_frame.py         fit the floor frame from people's own foot points
 ```
 
 Also at the root: `deploy.sh` — rsyncs the code (no venv/videos/store) to a GPU
@@ -626,6 +660,15 @@ see **[ARCHITECTURE.md → section 6, "Known
 limitations"](ARCHITECTURE.md#6-known-limitations-model-not-plumbing)** for the
 measured same-vs-different score overlap and why no threshold (or hand-tuned
 heuristic on top of it) can perfectly resolve it.
+
+The answer being pursued is **not** a better threshold — four threshold changes have
+been reverted for hurting accuracy. It is a **physical** guard: `src/geometry/`
+refuses any merge that would require a person to move faster than anyone on that
+floor has been observed to move, which is a question cosine similarity cannot
+answer. It ships disabled; see `ARCHITECTURE.md` → *geometry* and `CLAUDE.md` §1–2
+for the rules it must obey (chiefly: the live run records positions, offline
+reconcile only consumes them, and nothing claims metres without a trusted metric
+reference).
 
 ADR-002's P0 items (camera-aware re-ranking, a scored verification layer) are
 implemented. The following are deferred — documented but not built:
@@ -654,7 +697,8 @@ model is trained or fine-tuned here. Each component and its role:
 | **YOLO11n** (`yolo11n.pt`) | Person **detection** every frame (COCO class 0), the entry point for both paths. | [Ultralytics](https://github.com/ultralytics/ultralytics) (COCO-pretrained) | Ultralytics YOLO11 |
 | **ByteTrack** (`bytetrack.yaml`) | Multi-object **tracking** — stable per-camera `track_id`s frame-to-frame; the tracklet is the unit of identity evidence. | Ships with Ultralytics | Zhang et al., *ByteTrack: Multi-Object Tracking by Associating Every Detection Box*, ECCV 2022 |
 | **YOLO11n-pose** (`yolo11n-pose.pt`) | Optional **pose ensemble** that splits a tracker box merging two overlapping people into one. File-batch only; off in live (`inference.pose_ensemble: false`) for throughput. | [Ultralytics](https://github.com/ultralytics/ultralytics) | Ultralytics YOLO11-pose |
-| **OSNet-AIN x1_0** (`osnet_ain_x1_0.pth`) | **Appearance embedding** — one crop → 512-d L2-normalized vector; the cosine similarity that drives re-ranking, verification, and reconciliation. AIN (Adaptive Instance Normalization) adds cross-domain generalization. Multi-source checkpoint (DukeMTMC-reID + Market1501 + CUHK03, eval MSMT17). | [torchreid / deep-person-reid](https://github.com/KaiyangZhou/deep-person-reid) | Zhou et al., *Omni-Scale Feature Learning for Person Re-ID*, ICCV 2019; *Learning Generalisable Omni-Scale Representations…*, IEEE TPAMI 2021 |
+| **FastReID SBS ResNet101-IBN** (`msmt_sbs_R101-ibn.pth`) — **the default** | **Appearance embedding** — one crop → 2048-d L2-normalized vector at 384×128; the cosine similarity that drives re-ranking, verification, and reconciliation. IBN mixes instance and batch norm for cross-domain generalization; trained on MSMT17. Definition vendored into `src/reid/vendor/fastreid/` (5 torch-only files) because FastReID ships no `setup.py` — see its `PROVENANCE.md`. | [JDAI-CV / fast-reid](https://github.com/JDAI-CV/fast-reid) | He et al., *FastReID: A Pytorch Toolbox for General Instance Re-identification*, 2020; Pan et al., *Two at Once: Enhancing Learning and Generalization Capacities via IBN-Net*, ECCV 2018 |
+| **OSNet-AIN x1_0** (`osnet_ain_x1_0.pth`) — previous default | Same role, 512-d at 256×128. Retained because every threshold in `config.yaml` was calibrated in this feature space. Multi-source checkpoint (DukeMTMC-reID + Market1501 + CUHK03, eval MSMT17). | [torchreid / deep-person-reid](https://github.com/KaiyangZhou/deep-person-reid) | Zhou et al., *Omni-Scale Feature Learning for Person Re-ID*, ICCV 2019; *Learning Generalisable Omni-Scale Representations…*, IEEE TPAMI 2021 |
 | **Qdrant** | **Vector store** (not a model) — this pipeline's own gallery: stores every observation embedding + payload and serves nearest-neighbour search. | [Qdrant](https://github.com/qdrant/qdrant) | — |
 
 **Libraries:** [torchreid](https://github.com/KaiyangZhou/deep-person-reid)

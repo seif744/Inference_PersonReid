@@ -3,8 +3,8 @@
 # =============================================================================
 
 source:
-  # Default videos (one entry per camera; each gets its own detector/tracker and
-  # crops folder). These are just the DEFAULTS -- override them at runtime with
+  # Default videos (one entry per camera; each gets its own detector/tracker).
+  # These are just the DEFAULTS -- override them at runtime with
   #   python main.py --videos a.mp4 b.mp4        (or)   --videos-dir /path
   # so you never have to edit this file to process different footage.
   # #67: these used to point at placeholder_video/, which does not exist -- so a
@@ -31,7 +31,7 @@ source:
   # 0 = process the whole video. Set e.g. 60 for a quick CPU smoke test.
   max_frames: 0
   # 0 = native resolution. Positive width downscales every frame (keeps aspect)
-  # before detect/track/crop/embed. QHD (2560px) on CPU is very slow; 1280 is a
+  # before detect/track/embed. QHD (2560px) on CPU is very slow; 1280 is a
   # big speedup for dev with little ReID cost. Use 0 for a final full-res run.
   resize_width: 0
 
@@ -118,7 +118,7 @@ detector:
   #       confidence_threshold: 0.35   # wide/high view: small, partly-occluded people
   per_camera: {}
   # Pose ensemble: when the box tracker merges two overlapping people into ONE
-  # box (e.g. crops/id_0008), a second pose model finds one skeleton per person
+  # box (two stacked bodies), a second pose model finds one skeleton per person
   # and we split the box into individual people. Runs a 2nd model per frame.
   pose_ensemble:
     enabled: true
@@ -130,17 +130,6 @@ detector:
 tracker:
   enabled: true
   config: bytetrack.yaml     # ships with ultralytics; "botsort.yaml" also works
-
-crops:
-  # On-disk crop saving is DISABLED in the code (crop_saver.py writes nothing).
-  # The ReID path never needs on-disk crops -- the embedder makes its own
-  # in-memory crop. Leave save: false. Setting it true only constructs the
-  # (in-memory, discarded) crop helper; it does NOT write files. Re-add a real
-  # consumer for the returned crops before relying on this to collect data.
-  save: false
-  dir: crops
-  interval: 10               # crop-helper throttle (frames between crops per track)
-  padding: 0
 
 reid:
   enabled: true
@@ -320,7 +309,8 @@ identity:
                              # on this project's footage with osnet_x1_0_msmt17:
                              # different people's prototype cosine tops out ~0.57,
                              # genuine cross-video same-person matches reach 0.70-0.80.
-                             # Re-measure (see src/identity/demo_identity.py's sweep)
+                             # Re-measure with
+                             # tests/calibration/measure_score_separation.py
                              # if the ReID weights or camera domain change. Left at
                              # 0.63 after the osnet_ain_x1_0 swap: raising it to 0.68
                              # alongside the verifier changes below measurably hurt
@@ -658,6 +648,89 @@ identity:
       #                  the two, whether or not the runner-up is available)
       # Both are ALWAYS logged regardless; this only picks the one that could gate.
       basis: eligible
+
+# =============================================================================
+# GEOMETRY (src/geometry/) -- where people are standing, used ONLY to rule out
+# the physically impossible. Not a tracker: nothing here does 3D tracking, and
+# nothing here can create or merge an identity. It can only refuse a merge.
+#
+# THE ONE RULE EVERYTHING ELSE FOLLOWS FROM:
+#   The LIVE RUN records geometry. OFFLINE RECONCILE only CONSUMES it.
+# Each observation's floor position is computed once, at capture, and stored in
+# its Qdrant payload. Reconcile reads that; it never loads a calibration, applies
+# a homography, or re-derives a position. So one run has ONE geometry, decided
+# once, and re-reconciling it next year gives the same answer. Asserted by
+# tests/live/test_geometry_not_recomputed.py. Full rationale: ADR-003D.
+#
+# UNITS ARE **FLOOR UNITS**, NOT METRES. The floor frame is fitted from camera
+# imagery alone, which fixes the plane only up to an arbitrary scale. Nothing here
+# claims metres and no metre-based threshold appears below -- the speed ceiling is
+# measured from this deployment's own footage in the same unit as the distances,
+# so the unknown scale cancels exactly. Metres become available only when a trusted
+# metric reference is recorded in the calibration (verified floor plan / CAD,
+# verified architectural dimension, or an independently measured reference
+# distance), and they are needed only to relate SEPARATE floor groups.
+#
+# WHICH CAMERAS THIS CAN COVER. A floor frame needs cameras whose views overlap,
+# because the frame is fitted from people's own foot points seen from both. Here
+# that is cam_219 + cam_224 (same room). cam_206 and cam_213 overlap nothing, so
+# NO geometry is derivable for them from imagery -- they stay appearance-only until
+# real-world distances between the camera regions are supplied. That is a fact
+# about the camera placement, not a gap in the code.
+#
+# FILE-BATCH MODE HAS NO GEOMETRY. The batch path's IdentityService._commit stores
+# neither bbox nor ts, so there is nothing to position. To run geometry over
+# RECORDED footage, use `--mode live` on the files: the live pipeline records bbox,
+# ts and floor position exactly as it does for RTSP.
+geometry:
+  # Master switch for RECORDING. false = today's behaviour exactly: no positions
+  # written, and every consumer treats their absence as "no opinion".
+  #
+  # Ships OFF because there is no calibration record yet. Fit one first (needs no
+  # camera time and no measuring -- it uses a finished run's stored observations):
+  #   python tools/fit_floor_frame.py <run_id>
+  # then set this true for the next capture.
+  #
+  # RECORDING IS NOT RECOVERABLE AFTER THE FACT. The live RTSP feed is never
+  # recorded, so a position not written during the run is gone. Leave recording on
+  # once a calibration exists, even while the veto below is off.
+  enabled: false
+
+  calibration_path: calibration/floor_frame.json
+  # <run_id> is substituted with the run timestamp. This sidecar is ANALYSIS input,
+  # never a reconcile input -- it carries the image-space foot point, so a better
+  # calibration can be applied offline without re-running detection.
+  log_path: logs/geometry_<run_id>.jsonl
+
+  # The reachability veto, consumed by OFFLINE RECONCILE.
+  reconcile:
+    # Gated separately from recording on purpose: recording is additive and safe,
+    # while this changes identities. Turn it on ALONE, on a captured run, and watch
+    # the video -- a cluster count cannot tell you whether a cluster is one person
+    # or three (see REMEDIATION_PLAN.md Part A):
+    #   python tests/calibration/sweep_reconcile_thresholds.py <run_id> --geometry
+    #   python tests/calibration/rerender_from_clips.py <run_id> --geometry
+    enabled: false
+
+    # Cross-camera timestamp uncertainty, seconds. `ts` is when a frame was DECODED
+    # locally, not when photons hit the sensor, so two cameras' stamps for one
+    # instant differ by their encoder + network + decoder buffering. ADDED to every
+    # elapsed time, so over-stating it only ever makes the veto MORE permissive.
+    # 0.5 is ADR-003A's ceiling rather than its 150 ms target, deliberately.
+    clock_error_sec: 0.5
+
+    # Multiplies the MEASURED speed ceiling to get the veto line. The ceiling comes
+    # from p99.9 of observed same-track speeds in the run being reconciled -- one
+    # ByteTrack track is provably one person, so that distribution is this floor's
+    # real answer and needs no metric scale. 1.5 leaves room for someone moving
+    # faster than anything in that run (a run, a stumble).
+    #
+    # THIS IS THE ONLY TUNABLE HERE, AND IT SHOULD BE RAISED, NEVER LOWERED, WHEN IN
+    # DOUBT. A wrong veto is unrecoverable: reconcile cannot un-split a person whose
+    # merge it refused, which is precisely how the old live.topology min-transit
+    # veto destroyed a run (links 5 -> 1, topology_pruned=508). A MISSED veto costs
+    # nothing new -- it leaves a false merge that already happens today.
+    safety_factor: 1.5
 
 display:
   show_window: false         # true = OpenCV windows; false = headless. Only the
