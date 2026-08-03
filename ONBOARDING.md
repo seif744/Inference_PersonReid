@@ -484,8 +484,38 @@ position. The live pipeline records both for files exactly as it does for RTSP.
 
 ## 7. The corpus — what already exists
 
-Runs already on the server's Qdrant. **A new session does not need to capture a run
-to start work on reconcile, or to fit a floor frame.**
+> ## ⚠️ THE QDRANT COLLECTION WAS FOUND EMPTY ON 2026-08-03
+>
+> **Every run in the table below is gone from the store.** The store only *warns* on
+> a dimension mismatch and never wipes, so the cause is something that emptied it
+> deliberately — most likely `python main.py --reset`, which clears the store **and
+> then runs the pipeline**, so it looks like an ordinary run.
+>
+> Consequences, in order of how much they cost:
+>
+> - **The 11 operator link labels in `calibration/link_labels.jsonl` are orphaned.**
+>   They name `(run_id, camera:track_id)` pairs, so `review_links.py --score` has
+>   nothing to grade against. That was the project's only ground truth.
+> - **A floor frame cannot be fitted** until a run with cam_219 + cam_224 exists
+>   again (§6.2).
+> - `sweep_reconcile_thresholds.py` / `rerender_from_clips.py` / `explain_merge_failure.py`
+>   all read stored observations, so none of them can run either.
+>
+> **Partially recoverable, if the clips survived on disk.** `keep_frames: true` kept
+> `._live_src_<cam>.mp4` + `.annotations.json` per camera, and the sidecar preserves
+> every box **and its `track_id`** — so re-embedding the clips would rebuild the same
+> tracklets and make the labels usable again. Check with
+> `ls -la ._live_src_*` on the server.
+>
+> **But NOT for geometry.** Sidecars written before 2026-08-03 carry no per-frame
+> wall clock — only a single `measured_fps` — and that gives each camera its own
+> timeline with an *unknown offset* relative to the others. Co-temporal pairing is
+> the foundation of both the floor-frame fit and the veto, so geometry cannot be
+> replayed from an old clip. `render.py` now persists `frame_ts` per frame precisely
+> so this cannot happen again.
+
+Runs that **were** on the server's Qdrant, kept here because the clips may still
+exist and because they document what the corpus contained:
 
 | run_id | Observations | Cameras | Notes |
 |---|---|---|---|
@@ -497,10 +527,10 @@ to start work on reconcile, or to fit a floor frame.**
 **These hold OSNet 512-d vectors.** They cannot be swept for FastReID appearance
 thresholds — the sweep reads embeddings out of Qdrant.
 
-**They CAN be used to fit the floor frame.** `tools/fit_floor_frame.py` needs
-`bbox`, `ts` and *relative* appearance similarity to pick correspondences; it never
-compares a cosine to an absolute bar that the backbone switch invalidated. Start
-with `20260730_111232` — it has cam_219 and cam_224 and the most observations.
+**They held OSNet 512-d vectors, and they are gone regardless** — see the notice
+above. Had they survived, `tools/fit_floor_frame.py` would have worked on them
+despite the backbone switch, because it uses *relative* appearance similarity to
+pick correspondences and never compares a cosine to an absolute bar.
 
 ### 7.1 Why the frozen clips are valuable
 
