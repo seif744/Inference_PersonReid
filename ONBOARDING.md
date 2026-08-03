@@ -407,7 +407,21 @@ and veto every cross-room merge in the deployment.
 ```bash
 python tools/fit_floor_frame.py <run_id>              # writes calibration/floor_frame.json
 python tools/fit_floor_frame.py <run_id> --dry-run    # report only
+python tools/backfill_geometry.py <run_id>            # give THAT run positions too
 ```
+
+**ONE capture, not two.** A floor frame is fitted *from* a run, so the first run on
+any deployment is necessarily captured before a calibration exists — which would
+seem to need a second capture to record positions with. It does not:
+`backfill_geometry.py` applies the fresh calibration to the `bbox` + `ts` already in
+that run's payloads, so the run it was fitted from ends up carrying positions too.
+No frames, no detection, no camera time.
+
+Backfilling the same run the fit came from is mildly self-serving — the fit saw some
+of those feet — so it is for checking the plumbing and **watching whether the veto's
+decisions are right**, not for claiming generalisation. The first honest
+generalisation test is the next capture, which costs nothing extra because
+`geometry.enabled: true` records positions live by then.
 
 `bbox` and `ts` have been in every observation payload since the live reconcile
 landed, so **any finished multi-camera run can be calibrated retroactively.** No
@@ -437,8 +451,9 @@ every true co-visible match from the same-instant rule.
 ### 6.4 Then, in order
 
 ```bash
-# 1. RECORD (additive, safe). Set geometry.enabled: true, then capture.
-#    Positions cannot be added after the fact -- the live feed is never recorded.
+# 1. RECORD (additive, safe). Set geometry.enabled: true, then capture. For a run
+#    captured BEFORE the calibration existed, use tools/backfill_geometry.py (6.2)
+#    -- but note positions can never be recovered for a run that stored no bbox/ts.
 python main.py --mode live
 
 # 2. Check the run summary named a high positioned fraction PER CAMERA.
