@@ -68,8 +68,9 @@ memoryless** by design, and that is exactly why it must not decide identity:
    **overlapped outright**, so no fixed threshold on the embedding separated
    people cleanly. That has not been solved by a better backbone: after the switch
    to FastReID SBS R101-IBN the thresholds were never re-anchored to the new
-   feature space, and run `20260803_121136` turned **two people into 21
-   identities** with 76 of 96 decisions failing on the absolute threshold. A
+   feature space. Run `20260803_121136` produced 21 identities with 76 of 96
+   decisions failing on the absolute threshold — though its true headcount was
+   never established, so that is a suspicion rather than a measurement. A
    borderline pair still confuses a lone threshold (see [`ARCHITECTURE.md`
    section 6, "Known
    limitations"](../../ARCHITECTURE.md#6-known-limitations-model-not-plumbing)

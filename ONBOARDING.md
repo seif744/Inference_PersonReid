@@ -36,7 +36,8 @@ ids) → offline reconcile (final ids, geometric reachability veto) → render`
 
 > **State in one line (2026-08-03):** the FastReID wiring is correct and verifiable
 > (`tools/preflight.py --load-model`); the **thresholds are not** — two people
-> currently produce 21 identities (§3.4), and that is the bottleneck, not the model
+> are void because the feature space changed (§3.4) — though the run that seemed to
+> prove it had an unknown headcount, so treat the size of the problem as unmeasured
 > and not geometry. The deployment is an **office where people sit at desks**, which
 > constrains geometry in ways §6.6 spells out.
 
@@ -244,22 +245,54 @@ verified on site; one or more independently measured reference distances.
 `config.yaml` was derived in OSNet-AIN's 512-d post-ReLU space and none has been
 re-anchored to FastReID's 2048-d post-bnneck space.
 
-Measured on run `20260803_121136` (two people, 70 s, cam_219 + cam_224):
+> ⚠️ **CORRECTION, 2026-08-03.** An earlier version of this section claimed run
+> `20260803_121136` "turned two people into 21 identities" and called that ~10×
+> over-fragmentation. **That was wrong.** Two people were visible in *both* cameras;
+> there were **more people around**, and the true headcount was never established.
+> Every count-based conclusion below is therefore **unproven**, and the corrected
+> reading is in §3.4a. The threshold suspicion is still reasonable — it is no longer
+> *measured*.
 
-| observed | meaning |
+Run `20260803_121136` (70 s, cam_219 + cam_224, unknown headcount) produced:
+
+| observed | what it does NOT prove |
 |---|---|
-| 29 tracklets → **21 identities** | ~10× over-fragmentation. Two people should be 2–4 ids |
-| `ABSOLUTE_THRESHOLD` failed **76 of 96** decisions | the bar, not the model, is rejecting nearly everything |
-| `BELOW_ABSOLUTE_THRESHOLD` excluded **834** candidates | same story at candidate level |
-| best **rejected** same-person score **0.671** vs a **0.90** bar | the bar is roughly 0.2 too high for this space |
-| cross-camera merges landed at 0.937, 0.706, 0.670 | against a 0.63 cross bar — barely clearing |
+| 29 tracklets → **21 identities** | nothing, without the headcount. 21 ids is bad for 3 people and roughly right for 12 |
+| `ABSOLUTE_THRESHOLD` failed **76 of 96** decisions | a refusal is **correct** when the pair is two different people. With several people present, most pairs *should* fail |
+| `BELOW_ABSOLUTE_THRESHOLD` excluded **834** candidates | same — with N people, most of the N² candidate pairs are genuinely different people |
+| best **rejected** same-camera score **0.671** vs a **0.90** bar | only evidence if that pair was truly one person. Unknown |
+| cross-camera merges at 0.937, 0.706, 0.670 | that three merges happened, not that they were right |
 
-Earlier evidence pointing the same way: at `same_camera_threshold: 0.90` only
-**50%** of same-person fragments merge; 100% merge at 0.75.
+**The lesson is §5.2's, and it caught us again:** a cluster count cannot tell you
+whether a cluster is one person or three. It also cannot tell you whether 21 is too
+many, unless you know how many people walked past.
 
-**Fixing this needs no camera time** — sweep on a finished run (§8.3). It is the
-highest-value work available, and geometry cannot substitute for it: a veto can only
-*refuse* merges, so at best it would turn 21 identities into 22.
+Independent evidence that thresholds *are* mis-set — headcount-free, so it survives:
+
+- at `same_camera_threshold: 0.90` only **50%** of same-person fragments merge; 100%
+  merge at 0.75 (measured on labelled fragments, not inferred from a count);
+- `compare_backbones.py` measured FastReID's **different-person p95 at 0.40** versus
+  OSNet's **0.59**. The shipped bars were positioned for OSNet's stranger ceiling, so
+  there is headroom in the new space. *(Margins are not comparable across feature
+  spaces for judging which model is better; this number is being used only to place a
+  bar inside FastReID's own space.)*
+
+### 3.4a What is actually needed before any threshold is changed
+
+**Ground truth for one run.** Nothing in §8.4's sweep means anything without it — the
+sweep ranks settings by identity count, and a count is only judgeable against a known
+answer. Two ways, cheapest first:
+
+1. **Watch `output_cam_219.mp4` / `output_cam_224.mp4`** from a run and answer the two
+   §5.3 questions: does any one person carry more than one id? does any one id cover
+   more than one person? Record verdicts with `review_links.py <run_id> --label` so
+   they accumulate — there are still only **11** labels in the project.
+2. **Capture a run with a known cast.** Agree the headcount before recording, keep
+   others out of frame, and write it down. That single number turns every future
+   sweep on that run into a real measurement.
+
+Until then the honest statement is: **the thresholds are void because the feature
+space changed, not because a count proved them wrong.**
 
 Second, unrelated: **the Qdrant collection must be rebuilt** on any machine still
 holding 512-d vectors. `python tools/preflight.py` reports it and `--fix-store`
@@ -704,7 +737,7 @@ exist and because they document what the corpus contained:
 
 | run_id | Observations | Cameras | Notes |
 |---|---|---|---|
-| `20260803_121136` | 1480 (cam_219 604, cam_224 876) | 219 + 224 | 70 s, **two people, only one moving**. Clips + sidecars kept. 29 tracklets → 21 identities → the threshold evidence in §3.4. **Too degenerate to fit a floor frame** (§6.3), but perfectly good for the appearance sweep, and you know its ground truth: two people |
+| `20260803_121136` | 1480 (cam_219 604, cam_224 876) | 219 + 224 | 70 s. Two people co-visible in both cameras, **plus others around — true headcount UNKNOWN**. Clips + sidecars kept. 29 tracklets → 21 identities, which cannot be judged without that headcount (§3.4). **Too degenerate to fit a floor frame** (§6.3). Usable for the sweep only once someone watches the video and labels it (§3.4a) |
 
 **These hold OSNet 512-d vectors.** They cannot be swept for FastReID appearance
 thresholds — the sweep reads embeddings out of Qdrant.
@@ -833,8 +866,9 @@ python -c "import sys; sys.path.insert(0,'src'); from database.store import Pers
 ## 9. If you are picking this up cold — do this
 
 **The single highest-value thing available is re-anchoring the thresholds (§3.4),
-and it needs no camera time.** Two people currently produce 21 identities. Do that
-before anything geometric.
+and it needs no camera time — but it needs GROUND TRUTH first (§3.4a).** A sweep
+ranks settings by identity count, and a count is unjudgeable without knowing how many
+people were present. Watch a run's output and label it before tuning anything.
 
 1. Read `CLAUDE.md`, then `REMEDIATION_PLAN.md` §0 → Part A → Part J, then §3.4 and
    §6.6 here.

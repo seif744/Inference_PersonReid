@@ -324,11 +324,15 @@ def check_thresholds(cfg, rep):
             f"cross-camera {live_id.get('cross_camera_threshold')}   "
             f"same-camera {live_id.get('same_camera_threshold')}")
     rep.add(WARN, "these were derived in the PREVIOUS backbone's feature space",
-            "Nothing can verify a threshold automatically. Evidence they are now\n"
-            "too high: on run 20260803_121136 two people produced 21 identities,\n"
-            "76 of 96 decisions failed ABSOLUTE_THRESHOLD, and the best REJECTED\n"
-            "same-person score was 0.671 against a 0.90 bar.\n"
-            "Re-anchor them offline, with no camera time:\n"
+            "Nothing can verify a threshold automatically, and a run's identity\n"
+            "COUNT cannot either unless you know how many people were present --\n"
+            "a lesson this project has now learned twice.\n"
+            "Headcount-free evidence that they are too high: at\n"
+            "same_camera_threshold 0.90 only 50% of labelled same-person fragments\n"
+            "merge (100% at 0.75), and FastReID's different-person p95 is 0.40\n"
+            "against OSNet's 0.59, so the bars sit higher than this space needs.\n"
+            "Get GROUND TRUTH first -- watch a run's output_<cam>.mp4 and record\n"
+            "verdicts with review_links.py <run_id> --label -- then sweep:\n"
             "  python tests/calibration/sweep_reconcile_thresholds.py <run_id> \\\n"
             "    --cross 0.45,0.55,0.63 --same \"cam_219=0.65,cam_224=0.65\"")
 
