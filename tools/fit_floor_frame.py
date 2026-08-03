@@ -278,6 +278,49 @@ def co_temporal_feet(rows_a, rows_b, max_dt):
 
 # ------------------------------------------------------------------ the fit
 
+# Correspondences are DEDUPLICATED by floor location, on a grid this many pixels
+# across in the target camera. Roughly a person's width, so two points in one cell
+# are the same place as far as the fit is concerned.
+DEDUP_CELL_PX = 60
+# At most this many correspondences per cell. A homography needs distinct LOCATIONS;
+# repeats of one location add no information and, worse, out-vote everything else.
+MAX_PER_CELL = 3
+# Distinct occupied cells needed. THIS is the number that decides whether a fit is
+# possible -- not the raw correspondence count.
+MIN_DISTINCT_LOCATIONS = 8
+
+
+def deduplicate_by_location(corr, cell_px=DEDUP_CELL_PX, cap=MAX_PER_CELL):
+    """Thin correspondences so no single floor location can dominate the fit.
+
+    WHY THIS IS NOT AN OPTIMISATION. Run 20260803_121136 produced 122
+    correspondences, of which 106 came from ONE person who never moved: a
+    38.6-second tracklet contributing the same floor location over and over. Those
+    106 are mutually consistent with each other (they are the same point), so RANSAC
+    scored them as a model and rejected everything else -- 8% inliers, and a
+    flattering 9.7 px median held-out error that described nothing but the blob.
+
+    A homography is determined by distinct locations. Duplicates of one location
+    carry no extra information about the plane and actively bias the fit toward
+    whatever is wrong about that one spot -- which is exactly the failure mode of a
+    SEATED person, whose every observation is off-plane in the same direction.
+
+    Keeps `cap` per grid cell, preferring the earliest, and returns
+    (kept, n_cells).
+    """
+    seen = {}
+    kept = []
+    for pair in corr:
+        (xa, ya) = pair[0]
+        cell = (int(xa // cell_px), int(ya // cell_px))
+        n = seen.get(cell, 0)
+        if n >= cap:
+            continue
+        seen[cell] = n + 1
+        kept.append(pair)
+    return kept, len(seen)
+
+
 def gather_correspondences(obs, protos, cam_a, cam_b, min_cosine, max_dt):
     """Foot-point correspondences from confident cross-camera matches.
 
@@ -603,7 +646,38 @@ def main():
     for a, b, score, overlap, n in sorted(used, key=lambda t: -t[2]):
         print(f"     {a[0]}:{a[1]:<4} <-> {b[0]}:{b[1]:<4}  cosine {score:.3f}  "
               f"overlap {overlap:5.1f}s  -> {n} foot pair(s)")
-    print(f"  {len(corr)} foot-point correspondence(s) total")
+    print(f"  {len(corr)} raw foot-point correspondence(s)")
+
+    # Thin by location BEFORE counting anything, so a stationary person cannot
+    # dominate. Distinct locations, not raw count, is what determines a plane.
+    corr, n_locations = deduplicate_by_location(corr)
+    print(f"  -> {len(corr)} after de-duplicating by floor location "
+          f"({DEDUP_CELL_PX} px cells, max {MAX_PER_CELL} each)")
+    print(f"  -> {n_locations} DISTINCT location(s) covered   "
+          f"[need >= {MIN_DISTINCT_LOCATIONS}]")
+    if n_locations < MIN_DISTINCT_LOCATIONS:
+        raise SystemExit(
+            f"[calib] only {n_locations} distinct floor location(s) "
+            f"(need {MIN_DISTINCT_LOCATIONS}).\n"
+            f"\n"
+            f"        This is the number that matters, and it is NOT the raw\n"
+            f"        correspondence count -- a person standing still for a minute\n"
+            f"        produces hundreds of correspondences at ONE location, which\n"
+            f"        determines nothing about the plane.\n"
+            f"\n"
+            f"        THE FIX IS FOOTAGE. One person is enough, and is actually\n"
+            f"        ideal (no matching ambiguity). What is needed is COVERAGE:\n"
+            f"          * walk to a spot, STAND STILL 3-4 seconds, feet visible\n"
+            f"          * move to a clearly DIFFERENT spot; repeat 8-12 times\n"
+            f"          * cover the room's extent -- each corner of the overlap,\n"
+            f"            the middle, near one camera, near the other\n"
+            f"          * NOBODY SEATED: the foot point is the bottom of the box,\n"
+            f"            so a chair or desk edge encodes a plane that does not\n"
+            f"            exist, and those points are self-consistent enough for\n"
+            f"            RANSAC to prefer them\n"
+            f"\n"
+            f"        Add 30 seconds with two people standing in DIFFERENT places\n"
+            f"        for the triangle validation.")
     if len(corr) < MIN_CORRESPONDENCES:
         raise SystemExit(
             f"[calib] {len(corr)} correspondences is too few (need "
@@ -759,6 +833,8 @@ def main():
                     "matches": [[f"{a[0]}:{a[1]}", f"{b[0]}:{b[1]}", round(s, 4)]
                                 for a, b, s, _o, _n in used],
                     "n_correspondences": len(corr),
+                    "n_distinct_locations": n_locations,
+                    "collinearity": round(spread["collinearity"], 4),
                     "ransac_inliers": inliers,
                     "ransac_px": args.ransac_px,
                     "heldout_px_median": (round(float(np.median(residuals)), 3)
