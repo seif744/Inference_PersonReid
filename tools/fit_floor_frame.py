@@ -170,6 +170,73 @@ def load_observations(store, run_id):
     return out, skipped
 
 
+def inventory_failure(store, run_id):
+    """Explain WHY a run has no observations, by inventorying the store.
+
+    Three causes look identical from the outside and need different fixes:
+      * wrong run id                       -> the list below has what you want
+      * collection emptied (`--reset`)     -> the corpus is gone; capture again
+      * collection rebuilt at a new width  -> ditto, and the width says when
+    Naming which one it is costs one scroll and saves an afternoon.
+    """
+    lines = [f"[calib] no usable observations for run {run_id!r}.", ""]
+    try:
+        info = store.client.get_collection(store.collection)
+        dim = getattr(info.config.params.vectors, "size", "?")
+        total = store.count()
+        lines.append(f"        collection {store.collection!r}: {total} point(s), "
+                     f"dim={dim} (this build embeds at {store.dim})")
+    except Exception as e:                                      # noqa: BLE001
+        return "\n".join(lines + [f"        could not inspect the collection: {e}"])
+
+    runs, with_bbox, with_ts = {}, {}, {}
+    offset = None
+    try:
+        while True:
+            pts, offset = store.client.scroll(store.collection, limit=1000,
+                                              offset=offset, with_payload=True,
+                                              with_vectors=False)
+            for p in pts:
+                pl = p.payload or {}
+                r = pl.get("run_id")
+                runs[r] = runs.get(r, 0) + 1
+                if pl.get("bbox") is not None:
+                    with_bbox[r] = with_bbox.get(r, 0) + 1
+                if pl.get("ts") is not None:
+                    with_ts[r] = with_ts.get(r, 0) + 1
+            if offset is None:
+                break
+    except Exception as e:                                      # noqa: BLE001
+        return "\n".join(lines + [f"        could not scroll the collection: {e}"])
+
+    if not runs:
+        lines += [
+            "",
+            "        The collection is EMPTY. Every stored run is gone -- the usual",
+            "        cause is `python main.py --reset`, which wipes the store AND",
+            "        THEN runs the pipeline, so it looks like a normal run.",
+            "",
+            "        A floor frame can only be fitted from a run that is still in",
+            "        the store, so this needs a fresh capture with two cameras that",
+            "        see the same room (cam_219 + cam_224).",
+        ]
+        return "\n".join(lines)
+
+    lines += ["", "        runs present (usable = has BOTH bbox and ts, which a "
+                  "foot point needs):"]
+    for r, n in sorted(runs.items(), key=lambda kv: str(kv[0])):
+        usable = min(with_bbox.get(r, 0), with_ts.get(r, 0))
+        flag = "" if usable else "   <- NOT usable: no bbox/ts stored"
+        lines.append(f"          {str(r):24} {n:7} point(s), {usable} usable{flag}")
+    lines += [
+        "",
+        "        If the run you wanted is not listed, it is no longer in the store.",
+        "        Pick one above, or capture a new one. Note a run needs TWO cameras",
+        "        that see the SAME room -- a single-camera run cannot be fitted.",
+    ]
+    return "\n".join(lines)
+
+
 def prototypes(obs):
     protos = {}
     for key, rows in obs.items():
@@ -444,9 +511,11 @@ def main():
     header(f"OBSERVATIONS -- run {args.run_id}")
     obs, skipped = load_observations(store, args.run_id)
     if not obs:
-        raise SystemExit(
-            f"[calib] no observations for run {args.run_id}. Check the run id "
-            f"against the store, and that the run persisted observations at all.")
+        # Never just say "not found". A wrong run id, an emptied collection and a
+        # collection rebuilt at a new width are three completely different
+        # problems with three different fixes, and they are indistinguishable from
+        # the outside. Inventory the store and name which one it is.
+        raise SystemExit(inventory_failure(store, args.run_id))
     cams = sorted({k[0] for k in obs})
     print(f"  {sum(len(v) for v in obs.values())} observation(s), "
           f"{len(obs)} tracklet(s), cameras: {', '.join(cams)}")
