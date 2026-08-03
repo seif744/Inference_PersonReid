@@ -21,6 +21,8 @@ know decode internals.
 import abc
 import time
 
+import cv2
+
 from video_source import VideoSource   # reuse tested stream-open + reconnect
 
 # Flipped to True by Stage 4 once a real NVDEC backend is implemented AND a
@@ -45,6 +47,15 @@ class DecodeBackend(abc.ABC):
 
     @abc.abstractmethod
     def read(self): ...
+
+    @property
+    def source_fps(self):
+        """The recorded source's own frame rate, or None if unknown / a stream.
+
+        Default None: a backend that cannot report it makes MEDIA time unavailable,
+        which the capture stage reports loudly rather than guessing a rate.
+        """
+        return None
 
     @abc.abstractmethod
     def reconnect(self): ...
@@ -90,6 +101,32 @@ class CPUDecodeBackend(DecodeBackend):
     def open(self):
         self._src.open()
         return self
+
+    @property
+    def source_fps(self):
+        """The FILE's own frame rate, or None when unknown / not a file.
+
+        Only meaningful for a recording, where it is the sole way to reconstruct
+        MEDIA time (`frame_index / fps`). A live stream returns None: its `ts` is
+        already the event time, and a stream's reported fps is nominal anyway --
+        dropped frames make the real rate lower, so using it would drift.
+
+        Rejects nonsense rather than passing it on: OpenCV returns 0 (and
+        occasionally absurd values) for containers with no usable rate, and a bad
+        fps here silently stretches or compresses the whole timeline.
+        """
+        if self.is_stream:
+            return None
+        cap = self._src.capture
+        if cap is None:
+            return None
+        try:
+            fps = float(cap.get(cv2.CAP_PROP_FPS))
+        except Exception:                                       # noqa: BLE001
+            return None
+        if not (1.0 <= fps <= 240.0):
+            return None
+        return fps
 
     def read(self):
         cap = self._src.capture

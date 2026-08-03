@@ -474,11 +474,41 @@ identity count must not drop — that is the exact number the topology veto dest
 If G2/G3 fail: raise `safety_factor`, or set `geometry.reconcile.enabled: false` and
 **keep recording**. Recording cannot hurt; only the veto changes identities.
 
-### 6.5 Running on recorded footage
+### 6.5 Running on recorded footage — and the timestamp trap
 
 `--mode live` on files. The file-batch path records **no** geometry —
 `IdentityService._commit` stores neither `bbox` nor `ts`, so there is nothing to
 position. The live pipeline records both for files exactly as it does for RTSP.
+
+**But `frame.ts` alone is not usable for recorded footage.** It is stamped at frame
+*read*, and files decode as fast as the disk allows (125+ fps measured here), so it
+tracks decode progress, not events. Two files read in parallel get timestamps whose
+difference reflects **thread scheduling** — and every cross-camera temporal rule
+(the co-presence veto, all of geometry's co-temporal pairing) would be built on
+invented simultaneity that looks entirely plausible.
+
+So since 2026-08-03 a file source also carries **media time**,
+`source_ts = offset + frame_index / fps`, and `Frame.event_ts()` is what every
+"when did this happen" consumer reads — including the stored payload's `ts`. The
+pipeline's own machinery (scheduler freshness, writer pacing, the live engine's
+TTLs) deliberately stays on the wall clock; `tests/live/test_media_time.py` pins
+both halves. Capture prints which clock is in force per camera:
+
+```
+[capture:cam_219] recorded source: MEDIA time active (22.913 fps, offset +0.000s).
+```
+
+If it instead reports the rate as **UNKNOWN**, that camera has no media time and
+nothing cross-camera from the run can be trusted — re-encode the file with a valid
+fps.
+
+**Files must overlap in real time.** Media time makes two recordings *comparable*;
+it cannot create overlap that was never filmed. Concurrent recordings started
+together need no configuration (0 offset = "all files begin at t=0"). If one started
+late, set `live.capture.file_time_offsets: {cam_224: 1.35}`. Verify rather than
+assume: a wrong offset shows up as a held-out reprojection error in
+`fit_floor_frame.py` that no calibration can reduce, because you are pairing one
+person's feet with where they were a second earlier.
 
 ---
 
@@ -569,7 +599,7 @@ exercise the veto on real footage. A prior 3-camera run reconciled 35 tracklets 
 ### 8.1 Correctness checks (fast, dev box)
 
 ```bash
-python tests/run_all.py                                   # 18 test files
+python tests/run_all.py                                   # 19 test files
 python tests/calibration/verify_embedding_contract.py     # the one real regression test
 ```
 

@@ -391,6 +391,12 @@ class LivePipeline:
                 reconnect_max_delay=float(self._g("capture", "reconnect_max_delay", 30)),
                 reconnect_attempts=int(self._g("capture", "reconnect_attempts", 5)),
                 device=device,
+                # Shifts this camera's MEDIA timeline so several concurrently
+                # recorded files line up (frame.py, "two clocks"). Ignored for a
+                # live stream, whose `ts` is already the event time. 0 is correct
+                # when every recording was started together.
+                time_offset_sec=float(
+                    (self._g("capture", "file_time_offsets", {}) or {}).get(name, 0.0)),
             )
             self.captures.append(capt)
 

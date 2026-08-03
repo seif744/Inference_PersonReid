@@ -26,7 +26,7 @@ from live.frame import Frame
 class CaptureThread(threading.Thread):
     def __init__(self, cam, backend, slot, stop_event,
                  reconnect_base_delay=1.0, reconnect_max_delay=30.0,
-                 reconnect_attempts=5, device="cpu"):
+                 reconnect_attempts=5, device="cpu", time_offset_sec=0.0):
         super().__init__(name=f"capture-{cam}", daemon=True)
         self.cam = cam
         self.backend = backend
@@ -43,6 +43,13 @@ class CaptureThread(threading.Thread):
         self.retry_forever = True
         self.dead_retry_sec = 30.0
         self.finished = False      # file ended, or dead, or stopped
+        # ---- MEDIA time, for recorded sources only (see frame.py) ----
+        # `time_offset_sec` shifts this camera's media timeline so several files
+        # recorded concurrently line up. 0 means "this file starts at t=0", which is
+        # correct when every camera's recording was started together.
+        self.time_offset_sec = float(time_offset_sec or 0.0)
+        self.source_fps = None       # resolved at open(); None -> no media time
+        self.media_time = False      # whether frames carry source_ts
 
     def _sleep_interruptible(self, seconds):
         """Wait, but wake immediately on stop (never a bare sleep -> §10)."""
@@ -60,6 +67,26 @@ class CaptureThread(threading.Thread):
             self.finished = True
             return
 
+        # Media time is resolved ONCE, after open, because the rate belongs to the
+        # container and cannot change mid-file. Reported either way: which clock is
+        # in play decides whether every cross-camera temporal rule means anything,
+        # and silently having no media time on a file run is exactly the failure
+        # this exists to prevent.
+        if not self.backend.is_stream:
+            self.source_fps = getattr(self.backend, "source_fps", None)
+            if self.source_fps:
+                self.media_time = True
+                print(f"{tag} recorded source: MEDIA time active "
+                      f"({self.source_fps:.3f} fps, offset "
+                      f"{self.time_offset_sec:+.3f}s). Cross-camera timing uses "
+                      f"frame_index/fps, NOT decode wall-clock.")
+            else:
+                print(f"{tag} recorded source but its frame rate is UNKNOWN -> no "
+                      f"media time. Cross-camera temporal rules (co-presence veto, "
+                      f"geometry) will be comparing DECODE times, which on a file "
+                      f"run are meaningless. Re-encode the file with a valid fps, or "
+                      f"do not trust any cross-camera timing from this run.")
+
         consecutive_failures = 0
         while not self.stop_event.is_set():
             try:
@@ -73,6 +100,9 @@ class CaptureThread(threading.Thread):
                 self.slot.put(Frame(
                     cam=self.cam, ts=ts, frame_index=self.frame_index,
                     image=image, device="cpu",   # decode is CPU here (see backend)
+                    source_ts=(self.time_offset_sec
+                               + self.frame_index / self.source_fps
+                               if self.media_time else None),
                 ))
                 self.frame_index += 1
                 continue

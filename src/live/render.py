@@ -122,11 +122,15 @@ class RenderStage(threading.Thread):
             return
         dets = frame.detections or []
         if self.capture_mode:
-            ts = getattr(frame, "ts", None)
+            # EVENT time (media time for a recording), so the sidecar agrees with the
+            # `ts` written into the store for the same frame. measured_fps below
+            # deliberately keeps using the WALL clock -- it answers "how fast did
+            # this run actually produce frames", which is a playback-rate question.
+            ts = frame.event_ts() if hasattr(frame, "event_ts") else getattr(frame, "ts", None)
             if ts is not None:
                 if self._first_ts is None:
-                    self._first_ts = float(ts)
-                self._last_ts = float(ts)
+                    self._first_ts = float(getattr(frame, "ts", ts))
+                self._last_ts = float(getattr(frame, "ts", ts))
             self._capture(img, dets, ts)
             return
         img = draw_detections(img, dets)

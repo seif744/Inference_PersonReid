@@ -138,6 +138,17 @@ class IdentityStage(threading.Thread):
                 det.reid_score = None
                 continue
             has_fresh_emb = (det.track_id in fresh) and (det.embedding is not None)
+            # DELIBERATELY frame.ts (wall clock), not frame.event_ts(). The engine's
+            # TTL bookkeeping is paired with `sweep(time.time())` below, so both ends
+            # must read the same clock -- feeding media time to one and wall-clock to
+            # the other would make every identity look infinitely stale and get
+            # evicted on the first sweep.
+            #
+            # Harmless because these ids are PROVISIONAL: reconcile rebuilds identity
+            # from scratch and never trusts them. On a recorded run the engine will
+            # reason oddly (a whole file decodes in seconds, so everything looks
+            # co-active) and the delivered ids are unaffected. What must be right is
+            # the STORED payload's `ts`, which is event time -- see below.
             reid = self.engine.assign(frame.cam, det.track_id, det.embedding,
                                       det.crop_quality, frame.ts, has_fresh_emb)
             det.reid_id = reid
@@ -177,7 +188,13 @@ class IdentityStage(threading.Thread):
             "track_id": int(det.track_id),
             "frame": int(frame.frame_index),
             "run_id": self._run_id,
-            "ts": float(frame.ts),
+            # EVENT time, not decode time (frame.py, "two clocks"). Identical to
+            # frame.ts for a live camera; MEDIA time for a recorded file, where
+            # decode order says nothing about when anything happened. Everything
+            # downstream that compares one camera to another reads this field --
+            # reconcile's co-presence veto and the geometric reachability check --
+            # so getting it wrong makes both of them confidently meaningless.
+            "ts": float(frame.event_ts()),
         }
         # Extra metadata, only when the detection actually carries it.
         bbox = [getattr(det, a, None) for a in ("x1", "y1", "x2", "y2")]
@@ -230,7 +247,7 @@ class IdentityStage(threading.Thread):
         bbox = payload.get("bbox")
         if bbox is None:
             return
-        self.geometry.annotate(payload, frame.cam, bbox, frame.ts,
+        self.geometry.annotate(payload, frame.cam, bbox, frame.event_ts(),
                                frame_index=frame.frame_index,
                                track_id=det.track_id,
                                frame_size=self._frame_size(frame))

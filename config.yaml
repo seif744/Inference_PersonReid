@@ -772,6 +772,37 @@ live:
     # backwards. 2.5 periods keeps today's behaviour for the 25 fps cameras and
     # gives cam_224 the same relative allowance. 0 = absolute bound only.
     max_frame_staleness_periods: 2.5
+
+    # ---- MEDIA TIME for RECORDED sources (src/live/frame.py, "two clocks") ----
+    # A live camera's `ts` is stamped at frame read, which is milliseconds after the
+    # event -- so it doubles as "when did this happen", and all four cameras share
+    # one machine clock, which is what makes cross-camera timing comparable.
+    #
+    # A RECORDED FILE breaks that. Frames decode as fast as the disk allows (125+ fps
+    # measured), so read time tracks decode progress, not events. Feed two files to
+    # `--mode live` and the difference between their timestamps reflects THREAD
+    # SCHEDULING. Every cross-camera temporal rule -- the co-presence veto, and all
+    # of geometry's co-temporal pairing -- would then be built on invented
+    # simultaneity that looks completely plausible.
+    #
+    # So for a file source the capture stage also stamps MEDIA time,
+    # `offset + frame_index / fps`, and everything that asks "when did this happen"
+    # uses that instead (Frame.event_ts(), the stored payload's `ts`, geometry). The
+    # pipeline's own machinery -- scheduler freshness, writer pacing, the live
+    # engine's TTLs -- deliberately stays on the wall clock.
+    #
+    # `file_time_offsets` shifts one camera's media timeline, in seconds, to line up
+    # files that were not started at the same instant. Leave EMPTY when every
+    # recording was started together: 0 then means "all files begin at t=0", which is
+    # the truth. A positive value means this camera's recording started LATER than
+    # the others by that much.
+    #
+    # Verify rather than assume: after a run, the fit's held-out reprojection error
+    # is the check. A wrong offset shows up as a large residual that no calibration
+    # can reduce, because you are pairing one person's feet with where they were a
+    # second earlier.
+    file_time_offsets: {}
+    #   cam_224: 1.35     # this file started 1.35 s after the others
   inference:
     max_batch_size: 8       # forced to 1 on CPU (device-aware)
     t_batch_ms: 40          # dispatch a batch at max_batch_size OR this timeout.

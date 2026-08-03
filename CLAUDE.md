@@ -146,6 +146,13 @@ in doubt, raise `geometry.reconcile.safety_factor`; never lower it.
   mtime against the `run_id`.
 - **Placeholders get pasted literally.** `<run_id>` has been run verbatim; `<` is a
   shell redirect. Write commands that derive their values.
+- **Recorded files need MEDIA time, not `frame.ts`.** `ts` is stamped at frame read,
+  so on a file it tracks decode speed (125+ fps), not events — two files read in
+  parallel get timestamps that differ by thread scheduling. `Frame.event_ts()`
+  returns media time (`offset + frame_index / fps`) for files and wall-clock for
+  streams; the stored payload's `ts` and all of geometry use it, while scheduler
+  freshness, writer pacing and the live engine's TTLs deliberately stay on `ts`.
+  Never conflate them — `tests/live/test_media_time.py` pins both halves.
 - **File-batch mode records no geometry** — `IdentityService._commit` stores neither
   `bbox` nor `ts`. To run geometry over recorded footage use `--mode live` on the
   files.
@@ -156,7 +163,7 @@ in doubt, raise `geometry.reconcile.safety_factor`; never lower it.
 ## 8. Before you commit
 
 ```bash
-python tests/run_all.py                                   # 18 files, CPU, seconds
+python tests/run_all.py                                   # 19 files, CPU, seconds
 python tests/calibration/verify_embedding_contract.py     # after ANY src/reid/ change
 ```
 
