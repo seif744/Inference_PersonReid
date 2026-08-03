@@ -314,6 +314,69 @@ def gather_correspondences(obs, protos, cam_a, cam_b, min_cosine, max_dt):
     return corr, used
 
 
+def describe_spread(corr, image_size=None):
+    """How the correspondence points are ARRANGED, not how many there are.
+
+    Count is the number everyone looks at and it is the least informative. A
+    homography maps a PLANE to a plane, so it needs points spread in two
+    dimensions. Sixteen points along one person's six-second walk are nearly
+    COLLINEAR, and a homography fitted from collinear points is degenerate --
+    `findHomography` still returns a matrix, it is simply meaningless away from that
+    line. The symptoms are a low inlier fraction and a huge held-out error, which
+    look like "bad matches" and get misdiagnosed as such.
+
+    Returns:
+      collinearity : sqrt(smaller / larger principal spread), 0 = a perfect line,
+                     1 = an isotropic blob. Below ~0.15 the fit cannot be trusted
+                     however many points there are.
+      coverage     : fraction of the frame's width/height the points span, which
+                     says whether the map is being asked to extrapolate.
+    """
+    pts = np.asarray([c[0] for c in corr], dtype=np.float64)   # cam_a (dst) side
+    out = {"n": len(pts)}
+    if len(pts) < 3:
+        out["collinearity"] = 0.0
+        out["coverage"] = None
+        return out
+    centred = pts - pts.mean(axis=0)
+    # Eigenvalues of the 2x2 covariance = variance along each principal axis.
+    eig = np.linalg.eigvalsh(np.cov(centred, rowvar=False))
+    lo, hi = float(max(eig.min(), 0.0)), float(max(eig.max(), 1e-12))
+    out["collinearity"] = float(np.sqrt(lo / hi))
+    span = pts.max(axis=0) - pts.min(axis=0)
+    out["span_px"] = [float(span[0]), float(span[1])]
+    if image_size:
+        out["coverage"] = [float(span[0] / image_size[0]),
+                           float(span[1] / image_size[1])]
+    else:
+        out["coverage"] = None
+    return out
+
+
+def report_spread(spread, n_pairs):
+    """Print the arrangement, and say plainly when it cannot support a fit."""
+    print(f"  arrangement of the {spread['n']} point(s) in the target frame:")
+    if spread.get("span_px"):
+        cov = spread.get("coverage")
+        extra = (f"  ({cov[0] * 100:.0f}% x {cov[1] * 100:.0f}% of the frame)"
+                 if cov else "")
+        print(f"     span {spread['span_px'][0]:.0f} x "
+              f"{spread['span_px'][1]:.0f} px{extra}")
+    print(f"     collinearity {spread['collinearity']:.3f}   "
+          f"(0 = all on one line, 1 = spread evenly in both directions)")
+    if spread["collinearity"] < 0.15:
+        print(f"  !! NEARLY COLLINEAR. A homography maps a PLANE to a plane, so")
+        print(f"     points along a single path cannot determine one -- the fit is")
+        print(f"     degenerate no matter how many points there are, and any inlier")
+        print(f"     count or residual below is meaningless.")
+        if n_pairs <= 2:
+            print(f"     With only {n_pairs} matched tracklet pair(s), every point")
+            print(f"     traces the same short walk. This needs FOOTAGE where people")
+            print(f"     stand in many different places, not a longer walk.")
+        return False
+    return True
+
+
 def fit_homography(corr, ransac_px):
     """RANSAC cam_b pixels -> cam_a pixels. -> (H, inlier_mask) or (None, None)."""
     if len(corr) < 4:
@@ -570,13 +633,51 @@ def main():
               f"max {residuals.max():7.1f}")
     else:
         print("  held-out error: NOT COMPUTABLE (too few correspondences)")
-    if frac < MIN_INLIER_FRACTION:
-        raise SystemExit(
-            f"[calib] only {frac:.0%} of correspondences fit one homography "
-            f"(need {MIN_INLIER_FRACTION:.0%}).\n"
-            f"        Correspondences from two different people, or foot points off "
-            f"the floor plane, do not admit a single consistent map. Raise "
-            f"--min-cosine and try again.")
+    if frac < MIN_INLIER_FRACTION or not usable_spread:
+        why = (f"only {frac:.0%} of correspondences fit one homography "
+               f"(need {MIN_INLIER_FRACTION:.0%})" if frac < MIN_INLIER_FRACTION
+               else "the correspondences are nearly collinear")
+        lines = [f"[calib] {why}, so this footage cannot produce a usable floor "
+                 f"frame yet.", ""]
+        # Order the advice by what the DATA says, not by a fixed list. Suggesting
+        # "raise --min-cosine" when only one pair matched would delete the only
+        # evidence there is -- which is exactly what the first version of this
+        # message did.
+        if spread["collinearity"] < 0.15:
+            lines += [
+                "        DIAGNOSIS: degenerate arrangement, not bad matching.",
+                f"        collinearity {spread['collinearity']:.3f} means the points",
+                "        lie along a line. A homography maps a plane to a plane and",
+                "        cannot be recovered from one line, so the residuals above",
+                "        describe nothing at all.",
+                "",
+                "        THE FIX IS FOOTAGE, not a flag. What is needed is people",
+                "        STANDING IN MANY DIFFERENT PLACES while both cameras see",
+                "        them -- 8-12 distinct spots, corners and middle, near and",
+                "        far -- rather than a longer walk along one path.",
+            ]
+        if len(used) <= 2:
+            lines += [
+                "",
+                f"        Only {len(used)} tracklet pair(s) cleared "
+                f"--min-cosine {args.min_cosine:.2f}, so every point comes from one",
+                "        person's path. Do NOT raise the gate -- that removes the",
+                "        only evidence. Lowering it admits more pairs and more of",
+                "        the floor, at the risk of matching the wrong person:",
+                f"          python tools/fit_floor_frame.py {args.run_id} "
+                f"--min-cosine 0.65",
+                "        The triangle validation is what catches a wrong match, so",
+                "        read it carefully if you do.",
+            ]
+        else:
+            lines += [
+                "",
+                "        With several matched pairs, a low inlier fraction points at",
+                "        correspondences from two different people, or foot points",
+                "        off the floor plane (someone seated, or behind a desk).",
+                "        RAISE --min-cosine to keep only the confident matches.",
+            ]
+        raise SystemExit("\n".join(lines))
 
     header("VALIDATION -- provably-different people (no labels used)")
     tested, passed, examples = validate_triangles(obs, protos, H, args.cam_a,
