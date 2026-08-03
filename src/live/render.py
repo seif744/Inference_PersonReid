@@ -64,6 +64,9 @@ class RenderStage(threading.Thread):
         # Per-frame box geometry, index-aligned with the temp clip. Consumed by
         # render_final_videos() as shared["annotations"][cam] after reconcile.
         self.annotations = []
+        # Wall-clock ts per captured frame, index-aligned with `annotations`. See
+        # the note in _capture() for why this is not derivable from fps.
+        self.frame_ts = []
         self._clip = None
         self._clip_disabled = False
         # Wall-clock of the first/last captured frame -> this camera's MEASURED
@@ -124,7 +127,7 @@ class RenderStage(threading.Thread):
                 if self._first_ts is None:
                     self._first_ts = float(ts)
                 self._last_ts = float(ts)
-            self._capture(img, dets)
+            self._capture(img, dets, ts)
             return
         img = draw_detections(img, dets)
         img = draw_hud(img, person_count=len(dets))
@@ -163,6 +166,11 @@ class RenderStage(threading.Thread):
                     # the frames were actually produced at.
                     "measured_fps": self.measured_fps(),
                     "frames": len(self.annotations),
+                    # Index-aligned with `annotations`. The ONE field that makes a
+                    # clip replayable for cross-camera, time-sensitive work (all of
+                    # geometry) once the store no longer has the run. Not derivable
+                    # from measured_fps -- see _capture().
+                    "frame_ts": self.frame_ts,
                     "annotations": self.annotations,
                 }, f)
             print(f"[render:{self.cam}] box geometry -> {path}")
@@ -186,10 +194,24 @@ class RenderStage(threading.Thread):
             return None
         return (self.rendered - 1) / elapsed
 
-    def _capture(self, img, dets):
+    def _capture(self, img, dets, ts=None):
         """Record the CLEAN frame + its box geometry (both from this one Frame,
         so they stay aligned). No drawing here -- the final ids aren't known until
         the offline reconcile runs at shutdown."""
+        # `ts` is the WALL CLOCK stamped once at frame read (frame.py: "never
+        # regenerated"), shared by every camera in the process. Persisting it per
+        # frame is what makes a clip re-usable for anything CROSS-CAMERA and
+        # time-sensitive after the store is gone.
+        #
+        # It was missing until 2026-08-03, and the cost was concrete: when the
+        # Qdrant collection was emptied, the surviving clips could still be
+        # re-embedded to rebuild appearance data, but the geometry work could not be
+        # replayed at all -- every co-temporal comparison needs to know when each
+        # frame happened, and `measured_fps` only gives each camera its own timeline
+        # with an UNKNOWN offset relative to the others. Deriving ts from
+        # frame_index/fps therefore cannot pair cameras, which is the one thing the
+        # reachability check is built on. One float per frame avoids that.
+        self.frame_ts.append(None if ts is None else float(ts))
         self.annotations.append([
             {
                 "x1": d.x1, "y1": d.y1, "x2": d.x2, "y2": d.y2,
