@@ -5,6 +5,12 @@ learned the expensive way, and each one contradicts what a reasonable engineer
 would otherwise do. Full detail lives in `ARCHITECTURE.md`, `REMEDIATION_PLAN.md`
 Part A, and `ADR-003D`.
 
+**For the offline-reconcile work in flight, read `AGENT_BRIEF.md` first** — it holds
+the diagnosis of the operator's reported split (§3b below is the short version), the
+table of approaches already ruled out, and the task order. `RECONCILE_PATCHES.md`
+and `CAPTURE_PROTOCOL.md` are its companions. All three are tracked; they were
+hand-pasted into four sessions before anyone noticed they were downloads.
+
 This file is **tracked in git**, so it reaches the A6000 and every fresh session.
 The ADR set is not (see §7).
 
@@ -103,6 +109,38 @@ been recalibrated.** `measure_score_separation.py` crashed on FastReID until
 2026-08-04 — it reached into torchreid OSNet's `fc` block. If a measurement seems
 never to have been taken, check that its script still runs on the current model.
 
+## 3b. The reported split is a SAME-camera bar, not a cross-camera one (2026-08-04).
+
+The operator's standing symptom — one person carrying one reid in `cam_219` and a
+different one in `cam_224` + `cam_213` — is **diagnosed**, with numbers. Do not
+re-derive it. `explain_merge_failure.py 20260804_064551 1 2`:
+
+```
+camera    fragment pair     prototype   max_exemplar   consensus   bar
+cam_213   0031 vs 0035      0.630 fail   0.663 fail    0.567 fail  0.80
+cam_219   0020 vs 0008      0.574 fail   0.600 fail    0.468 fail  0.90
+cam_224   0001 vs 0030      0.907 PASS   0.907 PASS    0.582 fail  0.80
+```
+
+cam_219 cannot merge its own front/back fragments at 0.90, so each is absorbed
+cross-camera into a *different* cluster. Both clusters then contain cam_219
+members, so the pair is judged by `strictest_same_camera_bar` = **0.90** — the
+cross-camera `threshold` is **never consulted**. Consequences:
+
+- **`identity.reconcile.threshold` cannot fix it.** Neither can geometry: a veto
+  only ever *refuses* a merge, so it cannot create a missing link.
+- **Lowering cam_219 to 0.80 is contraindicated**, not merely insufficient —
+  measured, it captured `cam_219(8)` into `cam_219(38)` instead of the right person.
+- `scoring: consensus` was tried and **reverted the same day**: it moved cam_224's
+  pair from 0.907 PASS to 0.582 FAIL, which is the "cam_224 went reid 1, then 2,
+  then back to 1" report. Sixth reverted tuning change.
+- The published same-camera window ("any bar in (0.434, 0.810) is PERFECT") was
+  measured by **splitting one continuous track in half** — the easy case. Real
+  re-appearance measures **0.574**, so the same-person lower edge is ~0.57 and the
+  usable window is far narrower than that comment claims.
+
+Full detail, the retired-approaches table and the task order: `AGENT_BRIEF.md`.
+
 ## 4. A cluster count cannot tell you whether a cluster is one person or three.
 
 Every number quoted for the 2026-07-30 threshold change was **equally consistent
@@ -163,8 +201,14 @@ in doubt, raise `geometry.reconcile.safety_factor`; never lower it.
 - **The ADR set and `NVIDIA_DeepStream_Adoption_Plan.md` are gitignored**, so they
   are **not on the A6000** and not in a fresh clone. Anything that must survive
   belongs here, in `ARCHITECTURE.md`, or in `config.yaml` comments.
-- **`python main.py --reset` is not a wipe** — it clears the store *and then runs
-  the whole pipeline*.
+- **`python main.py --reset` is not a wipe — it is a DESTRUCTIVE RUN. Never use
+  it.** It clears the store *and then runs the whole pipeline*, so it looks like an
+  ordinary run and nothing warns you. It has already cost this project its entire
+  corpus once (`ONBOARDING.md` §7 attributes the 2026-08-03 wipe to exactly this
+  command), and the store currently holds the **only run with usable ground truth**
+  — `20260804_064551`, 2238 observations, clips and sidecars intact. Every
+  measurement tool reads stored observations, so a wipe blocks all of them and no
+  re-capture recovers the run that was watched.
 - **`output_cam_*.mp4` existing does not mean the last run succeeded.** They are
   only overwritten by a completed render, so stale files look like success. Check
   mtime against the `run_id`.
