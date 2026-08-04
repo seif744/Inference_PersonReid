@@ -1,20 +1,15 @@
-# AGENT BRIEF — 2026-08-04. Read this before proposing anything.
+# AGENT BRIEF — revision 3, 2026-08-04
 
-Self-contained on purpose. The ADR set is gitignored, so it is **not** in your
-clone and not on the A6000 (`CLAUDE.md` §7). Everything you need is restated here.
+**Supersedes every earlier revision. Overwrite the tracked copy, do not append.**
+Self-contained: the ADR set is gitignored and is not in your clone (`CLAUDE.md` §7).
 
-**This file is TRACKED IN GIT as of 2026-08-04, and that is the point.** It was
-hand-pasted into four consecutive sessions because it was a download, not a commit
-— the same failure mode `CLAUDE.md` §7 records about the gitignored ADRs:
-*"Anything that must survive belongs here, in `ARCHITECTURE.md`, or in
-`config.yaml` comments."* It is the only place the 0.574 diagnosis, the
-retired-approaches table and the corrected `--reset` rationale are written down.
-The load-bearing lines are mirrored into `CLAUDE.md` §3b and §7 so a fresh session
-gets them without reading this file at all.
-
-Companion documents, all now tracked: `RECONCILE_PATCHES.md` (the patches),
-`CAPTURE_PROTOCOL.md` (the capture), `tools/inspect_tracklet_pairs.py`,
+Tracked companions, already in the repo: `RECONCILE_PATCHES.md`,
+`CAPTURE_PROTOCOL.md`, `tools/inspect_tracklet_pairs.py`,
 `tests/live/test_same_camera_chain.py`.
+
+Earlier revisions contained two errors of fact, both corrected below: they claimed
+the Qdrant collection was empty (it is not), and they said "change nothing in config"
+while `HEAD` shipped a setting already measured to be worse.
 
 ---
 
@@ -22,366 +17,345 @@ Companion documents, all now tracked: `RECONCILE_PATCHES.md` (the patches),
 
 | Fact | Consequence |
 |---|---|
-| **CORRECTED 2026-08-04.** An earlier revision of this brief said the Qdrant collection was empty and every measurement was blocked. **That described the DEV BOX.** On the A6000: `collection 'persons': 6017 point(s), dim=2048, metric=Cosine`, with `run_id=20260804_064551` holding **2238 observations**. | **Nothing is blocked.** The measurement tools run today, on the A6000, against that run. That is where the 0.574 table came from. This was a reasoning failure, not a measurement failure: the table's existence was itself proof the run survived, and it went unchecked. |
-| Clips + sidecars survive for that run (`._live_src_cam_{213,219,224}.annotations.json`) | `rerender_from_clips.py` works on it. Earlier runs lacked sidecars. Clip + sidecar + stored embeddings is a **complete record** — any setting, any backbone, replayable with zero camera time. |
-| **`HEAD` shipped `scoring: consensus` and `threshold: 0.45`** (commit `8bede5e7b2`). Reverted to `prototype`/`0.63` in `279049a34d`. | Landing the revert was a **prerequisite**, not a config change to be avoided. See §4 rule 2, which an earlier revision of this brief got backwards. |
-| The dev box `persons` collection genuinely has 0 points | Run nothing measurement-shaped there. `CLAUDE.md` §7: any conclusion about throughput, identity quality or thresholds drawn on the dev box is wrong. |
-| `geometry.enabled: false`, `geometry.reconcile.enabled: false` | No positions recorded, veto inert. Geometry is **not** in scope. |
-| `identity.reconcile.covisibility.enabled: **true**` | A hard cross-camera veto **is** live. Different switch from geometry. Do not conflate them. |
-| `same_camera_reciprocal_best: **true**`, `same_camera_rounds: false` | The cam_224 greedy-fuse path is closed; the cam_206 stranding path is open. |
-| `scoring: prototype`, reverted from `consensus` on 2026-08-04 | Sixth reverted tuning change. See §4. |
-| cam_206 missing from every run since `20260730_093723` | Must be back in the next capture. It is also the camera with the unmeasured detection-recall complaint under `yolo11m`. |
+| **The corpus is INTACT.** `persons`, **2048-d**, Cosine, GREEN, **7071 points** — printed by the pipeline itself: `Vector store ready at http://localhost:6333 (existing points: 7071)`. | Nothing was lost. Two "the store is empty" readings were artifacts, below. |
+| `20260804_064551` holds **2238 observations**, with clips + sidecars for cam_213/219/224. | The only run carrying an operator-known split. **Protect it.** |
+| `RUN SUMMARY`'s `Store: 0 observations` is **run-scoped**, not global. | `print_run_summary` scrolls for *this* `run_id`. A run whose writes all failed prints 0 while 7071 points sit untouched. Caused one false alarm. |
+| A **port collision on 6333** between two checkouts. | `Inference-monday`'s container can win the port with its own empty volume, so `localhost:6333/dashboard` showed an empty 2048-d `persons` while the real data sat elsewhere. Caused the second false alarm. |
+| `Inference-monday` embeds at **512-d**; the collection is **2048-d**. | Every write correctly 400s. Nothing is corrupted — a rejected write changes nothing. That checkout needs its own port and volume (Task 0). |
+| `geometry.*` all false, no calibration record. | Geometry is **out of scope**: it can only refuse merges, so it cannot fix a split. |
+| `covisibility.enabled: true`, 6 pairs, 1.0 s. | A hard cross-camera veto **is** live. Different switch from geometry — do not conflate. |
+| `scoring: prototype`, `threshold: 0.63`. | Reverted from `consensus`/`0.45`, which measured worse. Correct as-is. |
+| `same_camera_reciprocal_best: true`, `same_camera_rounds: false`, `same_camera_member_quorum: 1.0`. | Current same-camera policy. |
 
 ---
 
-## 2. The diagnosis — established, with numbers
+## 2. The finding that reframes everything
 
-The reported symptom is a **false split**: one person carries one reid in cam_219
-and a different reid in cam_224 + cam_213.
+Same statistic, same model, same script: one tracklet split in half — provably one
+person, one camera, one lighting condition. The **easiest case that exists**.
 
-From `explain_merge_failure.py 20260804_064551 1 2`, recorded in `config.yaml`:
+| corpus | same-person split-half | stranger | gap |
+|---|---|---|---|
+| `register_file.avi` | min **0.810** | max **0.434** (n=6) | **+0.38 clean** |
+| the real cameras | min **0.594** (mean 0.806, n=18) | **0.843** co-present, cam_219 | **−0.25 INVERTED** |
 
-```
-camera    fragment pair     prototype   max_exemplar   consensus   bar
-cam_213   0031 vs 0035      0.630 fail   0.663 fail    0.567 fail  0.80
-cam_219   0020 vs 0008      0.574 fail   0.600 fail    0.468 fail  0.90
-cam_224   0001 vs 0030      0.907 PASS   0.907 PASS    0.582 fail  0.80
-```
+cam_219's `11+57 = 0.843` is **provably two people** — one body cannot be two
+simultaneous detections. The operator's own known re-appearance pair
+`0020 vs 0008` scores **0.574**. A proven stranger outscores a known same-person
+pair by 0.27, inside one camera.
 
-The chain:
+**To merge one person you need a bar ≤ 0.594. To reject that stranger you need
+> 0.843. No bar satisfies both.** `config.yaml`'s window — "any bar in
+(0.434, 0.810) is perfect" — is not narrow on this footage. It is **empty**.
 
-1. In **cam_219**, the person's front and back fragments score **0.574** against
-   cam_219's **0.90** same-camera bar. Phase 1 does not merge them.
-2. Each fragment is then absorbed cross-camera into a **different** cluster. This
-   is the mechanism the `per_camera` comment already documents: a camera that
-   cannot merge its own fragments feeds them into separate identities.
-3. Both resulting clusters now contain cam_219 members, so `pair_threshold` sees a
-   **shared camera** and returns `strictest_same_camera_bar` =
-   `max(0.80, 0.90, 0.80)` = **0.90**.
-4. The merge that would repair the split must clear **0.90**. It scores nowhere
-   near it.
+Two consequences:
 
-**The gate is a same-camera appearance bar, not a cross-camera one.**
+1. **Every threshold in `config.yaml` was derived from `register_file.avi`**, a clip
+   roughly 0.6 cosine easier than the deployment, and one `compare_backbones.py`
+   already refuses to score because it saturates (FastReID and OSNet both hit
+   prototype AUC 1.0000, R@1 48/48 there). The bars were fitted to the wrong
+   distribution.
+2. **Threshold tuning was never going to work**, in either direction. That explains
+   six reverted tunings, and it is not a tuning mistake.
+
+Note also the spread *within* cam_219: `cam_219:14 = 0.594`, `cam_219:7 = 0.950`.
+Something varies by 0.35 inside a single track — 8× the measured scale effect, 3× the
+measured blur effect.
 
 ---
 
-## 3. What this retires — do not spend time here
+## 3. Evidence ledger
 
-Ruled out **for this symptom**. Each may still be valid for something else; none is
-the fix.
+### Eliminated by measurement. Do not revisit without new evidence.
 
-| Ruled out | Why |
+| Hypothesis | Killed by |
 |---|---|
-| Tuning `identity.reconcile.threshold` (the cross bar) | **Never consulted** for this pair. Clusters share cam_219, so the same-camera bar applies. The 0.45→0.63 revert was orthogonal to this bug. |
-| Per-camera-mean feature centering (`RECONCILE_PATCHES.md` C2) | Removes a *between-camera* offset. `0020 vs 0008` is a **within-camera** pair — both fragments get the same vector subtracted, so the comparison is unchanged. Cannot be the fix. |
-| `same_camera_rounds: true` | Under **complete linkage** round 2's member-pair tests are a subset of round 1's, so rounds can never admit an edge round 1 rejected on score, and 0.574 fails on score. **Qualified 2026-08-04 — see §5 Task 4:** that argument holds only at `member_quorum = 1.0`. Below it, rounds becomes load-bearing. |
-| `scoring: consensus` | Measured worse on all three pairs; cam_224 crossed PASS→FAIL. Reverted. |
-| `scoring: max_exemplar` | Weakly best of the three, but moves the blocking pair only 0.574 → 0.600. Not sufficient. |
-| Anything geometric | A veto can **only refuse** a merge. It is structurally incapable of creating the link that is missing, and can only make a split worse. |
-| Lowering cam_219 to 0.80 | **CONTRAINDICATED, not merely insufficient.** Corrected 2026-08-04 from measurement: the sweep on `20260804_064551` showed `cam_219(8)` captured by `cam_219(38)` instead of the operator's person. (`multi` also fell 2 → 1, but that is a cluster count and cannot carry the claim on its own — `CLAUDE.md` §4. The specific mis-capture is the evidence.) It also would not have merged 0.574 anyway. |
+| Geometry / floor homography | Can only *refuse* merges; structurally cannot fix a split. Both fit attempts failed on **coverage** (16 collinear points → 38% inliers, 203 px error; then 106 of 122 from a stationary tracklet → 8%), not on maths. |
+| Cross-camera `threshold` | **Never consulted** for the reported split: once both clusters contain cam_219, `strictest_same_camera_bar` applies (0.90). Measured on `064551`. |
+| Lowering cam_219 to 0.80 | **Contraindicated**, not merely insufficient — the sweep captured `cam_219(8)` into `cam_219(38)` instead of the operator's person. |
+| `same_camera_rounds` as the fix | Fixture: every `rounds=True` row identical to `rounds=False` **at quorum 1.0**, because round 2's member-pair tests are a subset of round 1's. *(It does become load-bearing below quorum 1.0 — see the C1 grid.)* |
+| `scoring: consensus` | One run; lowered all three fragment pairs and crossed cam_224 from 0.907 PASS to 0.582 FAIL. |
+| **Crop scale / upscale factor** | Synthetic degradation: 2× → **0.008**, 4× → **0.022**, 6× → **0.045**. Against a 0.27 gap, an order of magnitude short. The −0.490 h_ratio correlation was confounded. **Do not build a size gate.** |
+| **Blur / focus** | sigma 5 → **0.119**, and sigma 5 is heavy. Real, insufficient. Laplacian variance is **not scale-invariant**, so the cross-camera comparison (cam_219 84–653 vs cam_213 602–5439) is confounded by cam_219's crops being larger. Any focus claim needs height-matched bins. Also: the operator reports cam_219 and cam_224 are the **same build**, so an optics difference between them is ruled out by hardware. |
+| Preprocessing | Checked: `cv2.resize` straight to 384×128 with no aspect preservation, and `crop_person` padding 0, are **exactly what FastReID trains on**. Faithful, not broken. No free win. |
 
-**What remains, honestly:** reaching 0.574 needs a bar near 0.55, which is close to
-the measured stranger ceiling (p95 0.427, MAX 0.434, **n=6**). That is the
-distribution overlap `ARCHITECTURE.md` §6 describes, now measured in FastReID
-space. No single number resolves it.
+### Live hypotheses, ranked. None of #1–#4 has been measured.
 
-### The measurement that is misleading everyone
+| # | Hypothesis | Status |
+|---|---|---|
+| 1 | **Prototype mean-pooling destroys view information.** A mean over front and back matches neither. | Very high on mechanism, **zero on measurement**. Task 1 settles it. |
+| 2 | **cam_219 cannot discriminate people internally.** The 0.843-vs-0.574 inversion is *within* one camera. | High. **Distinct from #3** — do not merge them. |
+| 3 | **Between-camera feature offset.** cam_219 translated relative to cam_224/213. | Plausible, but **cannot explain #2**: centering subtracts the same vector from both halves of a within-camera pair. |
+| 4 | **Reconcile never re-ranks.** `reranking.py` is used by `service.py` and `verifier.py`; `reconcile.py` has zero references. The live path (discarded ids) gets it; the offline path (final ids) compares raw cosine between two means. | Real gap. **Feasibility answered — see Task 2.** |
+| 5 | The embedding is the ceiling on this domain. | The fallback if Task 1 comes back negative. |
+| 6 | Thresholds | Low as a primary cause. §2 explains why. |
 
-`config.yaml`'s same-camera window — *"same-person fragments min=0.810, p5=0.821 …
-any bar in (0.434, 0.810) is PERFECT"* — was measured by splitting **one
-continuous track into two disjoint halves** on `register_file.avi`. Two halves of
-one track share pose, lighting and viewpoint. That is the **easy** case.
-
-The real same-camera merge case is **re-appearance**: someone leaves and returns
-facing the other way. The cam_219 pair at **0.574** *is* that case, on real
-footage. So the same-person lower edge is ~0.57, not 0.810, and the usable window
-is far narrower than the comment claims. Getting that distribution measured
-properly is the point of the capture.
+`reranking.py` is not "cosine again": mean vectors → neighbour graph → Jaccard →
+blended similarity. The graph step reads relational structure no pairwise cosine
+sees. It cannot recover what averaging destroyed *within* a tracklet, but it can
+recover structure *between* tracklets. Different claims; keep them apart.
 
 ---
 
-## 4. Rules that outrank your instincts on this work
+## 4. Rules that outrank your instincts
 
-Additional to `CLAUDE.md`, which still applies in full.
+Additional to `CLAUDE.md`, which applies in full.
 
-1. **Propose no threshold change.** Six have been reverted for hurting accuracy.
-   `CLAUDE.md` §3.
-2. **The `prototype`/`0.63` revert is landed (`279049a34d`); now freeze the
-   config.** An earlier revision said "change nothing before the capture." That was
-   **backwards**: `HEAD` shipped `consensus`/`0.45`, the pair measured to make the
-   defect worse (cam_224's fragment pair crossing 0.907 PASS → 0.582 FAIL).
-   `config.yaml`'s own `scoring:` comment records that the operator's front/back
-   symptom is what *motivated* the consensus change — so the symptom was observed
-   under **prototype**, making `prototype`/`0.63` the configuration worth measuring
-   against. This specifically does **not** license lowering cam_219 to 0.80 (§3).
-3. **`config.yaml`'s comment blocks are the corpus.** They hold measurements that
-   exist nowhere else, including several whose runs are gone. Do not condense,
-   reformat or delete them, even where they contradict each other — the
-   contradictions are documented history (see the `threshold:` block, which argues
-   with itself on purpose and says so).
-4. **A cluster count proves nothing.** `CLAUDE.md` §4.
-   `sweep_reconcile_thresholds.py` reports cluster *shape*; that is exactly what
-   made `consensus` look good before it was measured on fragment pairs. Judge a
-   scoring mode on `explain_merge_failure.py`'s fragment-pair table, never on
-   identity counts.
-5. **Do not build a third decision logger.** `identity/decision_log.py`,
-   `logs/verification_decisions.jsonl`, `explain_merge_failure.py` and
-   `analyze_decision_log.py` already exist.
-6. **"Geometry is off" ≠ "the physical vetoes are off."** `covisibility` is on.
+1. **Propose no threshold change.** Six reverted. §2 explains why none can work.
+2. **`main.py --reset` is a DESTRUCTIVE RUN** — clears the store *then* runs, so it
+   looks ordinary. **Never use it.** Same for `preflight.py --fix-store`,
+   `docker compose down -v`, `docker system prune`. Those 7071 points include the
+   only run with operator-known ground truth.
+3. **One change at a time**, judged on §2's same-track-vs-stranger separation, then on
+   a watched re-render. Never on a cluster count (`CLAUDE.md` §4).
+4. **Pre-register the falsification criterion** in the script, before running it. This
+   worked — the scale/blur hypothesis was killed by its own stated threshold. Keep
+   doing it.
+5. **Anything that changes a score voids every bar.** Scoring mode, re-ranking,
+   centering, backbone. Sweep after, never before.
+6. **Do not build a third decision logger.** `decision_log.py`,
+   `verification_decisions.jsonl`, `explain_merge_failure.py` and
+   `analyze_decision_log.py` all exist.
 7. **Never paste a placeholder.** `<run_id>` has been run verbatim; `<` is a shell
-   redirect. Write commands that derive their values.
-8. **`main.py --reset` is not a wipe** — it clears the store *and then runs the
-   whole pipeline*, so it looks like an ordinary run. **Never use it.** Corrected
-   2026-08-04: an earlier revision justified this with "the store is already
-   empty," which was the dev box. On the A6000 `--reset` would destroy the **only
-   run in the project with usable ground truth** (`20260804_064551`, 2238
-   observations, clips and sidecars intact). The project has already lost its whole
-   corpus once this way — `ONBOARDING.md` §7 attributes the 2026-08-03 wipe to
-   exactly this command.
+   redirect. Derive values.
+8. **The dev box is CPU-only WSL2.** Any conclusion about throughput, identity quality
+   or thresholds drawn there is wrong. All model runs on the A6000.
 
 ---
 
-## 5. Tasks, in order, with acceptance criteria
+## 5. Tasks
 
-### Task 0 — Prerequisites
-
-**0a. Land the `prototype`/`0.63` revert. DONE — `279049a34d`.**
-
-Resolved: **nothing was unpushed.** `origin/research..HEAD` was empty;
-`git status --short` showed only `M config.yaml`. The geometry subsystem,
-`preflight.py`, `backfill_geometry.py`, media time and the
-`measure_score_separation` FastReID fix (`56ca40f61e`) were all already in
-`origin/research`. `HEAD`'s `consensus`/`0.45` came from `8bede5e7b2`. The revert
-was made on the **dev box** (`/home/seif/Projects/Inference`), so the route is
-`git push` here → `git pull` there. Not `deploy.sh`.
-
-**Still open — check the A6000's tree BEFORE pulling:**
+### Task 0 — Protect the corpus, isolate the old checkout (first, 10 min)
 
 ```bash
-git -C ~/seifer_work/Inference_PersonReid status --short
-git -C ~/seifer_work/Inference_PersonReid log --oneline -3
-git -C ~/seifer_work/Inference_PersonReid diff --stat origin/research
+# 1. Does the ground-truth run survive?
+curl -s -X POST http://localhost:6333/collections/persons/points/count \
+  -H 'Content-Type: application/json' \
+  -d '{"exact":true,"filter":{"must":[{"key":"run_id","match":{"value":"20260804_064551"}}]}}' \
+  | python3 -m json.tool
+
+# 2. SNAPSHOT IT. Nothing else until this returns.
+curl -X POST http://localhost:6333/collections/persons/snapshots | python3 -m json.tool
+curl -s  http://localhost:6333/collections/persons/snapshots | python3 -m json.tool
+
+# 3. Which container owns 6333, and where is its storage bound?
+docker inspect $(docker ps -q --filter publish=6333) \
+  --format '{{.Name}} {{json .Mounts}}' | python3 -m json.tool
+du -sh ~/seifer_work/*/qdrant_storage* 2>/dev/null
 ```
 
-Why: `deploy.sh` rsyncs code, so the server can hold a `config.yaml` that arrived
-by rsync while its git state sits elsewhere. If the tree is dirty or behind, a pull
-either conflicts or clobbers local edits. Report the state; do not pull blind.
+Then give `Inference-monday` its own instance, so 512-d can never meet 2048-d:
 
-*One inference not to rely on:* it was argued that because `56ca40f61e` is an
-ancestor of `8bede5e7b2`, a clean pull carrying `consensus/0.45` must also carry
-the `measure_score_separation` fix — yet the script was seen crashing on pre-fix
-code, implying a dirty server tree. `56ca40f61e` is dated **2026-08-04 10:36:24
-+0530** and run `20260804_064551` is timestamped 06:45, so the crash may simply
-predate the fix. **Suggestive, not established.** The state check above settles it.
-
-The operator decides whether to push.
-
-**0b. Place the four companion files. DONE — `d3e695641e`.** All four arrived as
-browser downloads in the repo root, so two were misplaced and each carried a
-`:Zone.Identifier` sidecar (WSL surfacing the NTFS alternate data stream).
-
-`test_same_camera_chain.py` **broke `tests/run_all.py` as delivered**: it resolved
-`src/` with a cwd-relative `sys.path.insert(0, "src")`, which passes standalone
-from the repo root and raises `ModuleNotFoundError` under `run_all.py`, since that
-deliberately runs each test with `cwd = the test's own directory`. `discover()`
-globs `tests/**/test_*.py`, so the file joined the suite and took it from PASS to
-FAIL. Fixed to resolve from `__file__`. This is the §7 breakage class exactly, and
-it would have hit every fresh clone.
-
-### Task 1 — ANSWERED, no action
-
-`config.yaml`'s `decision_log` and `top2_margin.{threshold,basis}` are **not**
-returned by `resolve_reconcile_kwargs` — 12 keys, none of those three — but they
-are **not silently dropped**. `pipeline.py::_decision_log_kwargs()` reads all
-three and splats them in at the `reconcile_tracklets` call. The split is
-deliberate: the resolver returns merge *policy*, while a `DecisionLog` is a live
-object needing a `run_id` and a close, which cannot be a plain config value.
-
-**Residual finding, worth recording:** `main.py` passes **no** decision log at all,
-so **file-batch reconcile runs unlogged** while the live path is logged. That is
-the file/live asymmetry `REMEDIATION_PLAN.md` Part M exists to track. Report it
-there; do not fix it as a side quest.
-
-### Task 2 — ANSWERED, no action
-
-A6000: `collection 'persons': 6017 point(s), dim=2048, metric=Cosine`, with
-`run_id=20260804_064551` holding 2238 observations, plus surviving clips and
-sidecars for cam_213 / cam_219 / cam_224. Dev box: 0 points. Correct width, no
-stale 512-d collection. **Nothing is blocked.**
-
-### Task 3 — DONE — `d7bcbddd3a`
-
-All 13 `OLD` anchors matched exactly once. `tests/run_all.py` 19/19, matching the
-pre-patch baseline. **A9 broke nothing** — no test relied on the `1` default, so
-nothing was pinning that drift. A7 and A8 verified by observable output rather than
-by the suite (malformed covisibility entries now skipped visibly instead of
-producing a two-character camera pair or an uncaught `KeyError`; `cap=` and
-`safety=`/`clock=` now appear in the settings line).
-
-**A2 and A3 were applied** under an earlier revision of `RECONCILE_PATCHES.md` that
-said "apply anyway"; the current revision says skip them for the smaller diff.
-Leave them. They are correct code, merely inert while geometry is off. Reverting is
-churn.
-
-### Task 4 — DONE — `f3c50842ee`. **PREDICTION REFUTED.**
-
-First run, before C1 (`member_quorum` unavailable, complete linkage fixed at 1.0):
-the prediction held — no setting closed the chain while keeping the stranger out.
-Ran clean, with no import or signature mismatch.
-
-**After applying C1, two settings achieve both:**
-
+```yaml
+    container_name: qdra_monday
+    ports:
+      - "6335:6333"
+      - "6336:6334"
+    volumes:
+      - ./qdrant_storage_monday:/qdrant/storage
 ```
-scoring       recip rounds quorum  ids chain stranger
-prototype     True  True   1.00     3  NO    SEPARATE
-prototype     True  True   0.60     2  NO    FUSED
-max_exemplar  True  True   0.60     2  YES   SEPARATE   <== both
-consensus     True  True   0.60     2  YES   SEPARATE   <== both
-```
-
-Two corrections follow, and both matter more than the win itself:
-
-1. **`same_camera_rounds` IS load-bearing — but only below quorum 1.0.** The
-   first grid showed every `rounds=True` row identical to `rounds=False`, and the
-   subset argument explains why: under complete linkage, round 2 re-tests exactly
-   round 1's pairs. That argument **stops holding at quorum < 1.0**, because a
-   2-of-3 quorum can admit a cluster edge no 1-of-1 pairwise test would.
-   `quorum=0.6` with `rounds=False` still gives 3 ids / chain NO — it takes
-   **both** flags. So "rounds cannot fix the cam_206 stranding" is true only at
-   complete linkage.
-2. **The scoring column is not wholly an artifact of `SPREAD_DEG=0`.** The
-   docstring's caveat is right for *singleton* comparisons — zero intra-tracklet
-   variance makes all three modes agree there — but it does not extend to
-   **multi-member clusters**, whose members are distinct vectors however tight each
-   tracklet is. The winning rows are exactly the multi-member ones, and `prototype`
-   diverges from `max_exemplar`/`consensus` there (FUSED vs SEPARATE). Real, not
-   fixture noise. Still 4 synthetic tracklets, and says nothing yet about cam_206.
-
-### C1 — RESOLVED: apply the code, do not flip the switch
-
-The fixture's closing line said "apply C1 and re-run"; §4 and Task 3 said "do not
-apply Part C." **The second was over-broad.** It was written against C2 (camera
-centering) and C3 (consensus variant), both of which change scores.
-
-`same_camera_member_quorum` defaults to **1.0**, which is complete linkage —
-bit-identical to today. Applying that code changes **no decision**.
-
-- **Sanctioned, and DONE:** apply C1, re-run the fixture, record the answer.
-- **Not sanctioned, and NOT done:** setting the quorum below 1.0 in `config.yaml`.
-  That voids the bars, needs a sweep and a re-render, and targets the **cam_206**
-  stranding, not the operator's reported split. The key is deliberately absent from
-  `config.yaml`; the resolver's default supplies 1.0.
-
-### Task 5 — Measure on `20260804_064551`, on the A6000
-
-Runs today against the surviving run and its clips. No room time.
 
 ```bash
-RUN=20260804_064551
-
-# 1. Re-render under prototype and WATCH IT. The only way to learn which reids the
-#    operator carries -- everything below needs those two numbers. Every one of
-#    these tools prints the settings in force on its first line. If that line says
-#    consensus, STOP: the pull has not landed and you are watching the wrong
-#    configuration.
-python tests/calibration/rerender_from_clips.py "$RUN"
-
-# 2. The operator's own split, under the reverted scoring. Substitute the two reids
-#    read off the video above.
-python tests/calibration/explain_merge_failure.py "$RUN" <reid_a> <reid_b>
-
-# 3. Camera bias. Section 2 is the measurement this project has never taken:
-#    camera-mean cosines, the across-camera variance profile, and the LABEL-FREE
-#    same-camera neighbour rate.
-python tools/inspect_tracklet_pairs.py --run "$RUN"
-
-# 4. The 1961-exclusion question (section 6).
-python tests/calibration/analyze_decision_log.py "logs/reconcile_decisions_$RUN.jsonl"
+echo 'QDRANT_URL=http://localhost:6335' >> .env      # Inference-monday ONLY
 ```
 
-**Accept when:** you can state (a) which reids the operator carries and whether the
-split reproduces under prototype, (b) the same-camera neighbour rate per camera
-against each camera's share of tracklets, and (c) how many candidates
-`TEMPORAL_CONFLICT_CROSS_CAMERA` excluded and between which camera pairs.
-
-Note section 3 of `inspect_tracklet_pairs.py` scores **singleton** cross-camera
-pairs, so it cannot show the gate that blocked the split — once both clusters share
-cam_219, `strictest_same_camera_bar` applies instead. Only
-`explain_merge_failure.py` shows that. The script prints this caveat itself.
-
-### Task 6 — Mine re-appearance pairs from the surviving clips
-
-The clips carry every box **and its `track_id`**, so time-disjoint same-camera
-fragments of one person can be identified by watching and recorded with provenance:
-
-```bash
-python tests/calibration/review_links.py "$RUN" --label
-```
-
-This is the 0.574 distribution — the same-camera *re-appearance* case, as opposed
-to the split-one-track-in-half case the published 0.810 window came from. Every
-label is permanent project capital; there are currently **11** in the whole
-project's history and their runs are gone.
-
-Labels belong in `calibration/link_labels.jsonl`, never in a conversation.
-
-### Task 7 — The capture (not the critical path)
-
-See `CAPTURE_PROTOCOL.md`. It supplies four things the existing run genuinely
-cannot: **cam_206**, a **written headcount**, a **known route**, and deliberate
-re-appearance repeats. New information, not unblocking. Do it after Tasks 5 and 6,
-so the capture is designed around what those show.
-
-Agent's part is pre-flight only: `.env`, `source.env_urls`, `preflight.py`, and
-confirming cam_206 produces detections at all. No threshold edits.
+**Accept when:** the count is reported, a snapshot exists and is listed, and the two
+checkouts cannot share a collection. Add the snapshot command to `CLAUDE.md` §8 beside
+the preflight line — a run with ground truth is the most expensive artifact this
+project produces and nothing currently protects it.
 
 ---
 
-## 6. Covisibility — a background question, NOT a suspect
+### Task 1 — THE DECIDING MEASUREMENT
 
-**Corrected 2026-08-04.** An earlier revision titled this "the open suspect nobody
-has measured." That overstated it. `explain_merge_failure.py` on `20260804_064551`
-named the **appearance bar** as the gate that blocked the operator's split.
-Covisibility did not cause the reported symptom. Do not open a workstream here.
+Everything forks on this. Crops come from the clips: no camera time, no labels, no
+headcount.
 
-A distinction that keeps getting collapsed: **covisibility is not geometry.**
-`identity.reconcile.covisibility` is a temporal simultaneity veto using only `ts`
-and a configured camera-pair table — no positions, no homography, no floor frame,
-no calibration. `src/geometry/` is a *distance* veto and is entirely disabled. Two
-switches, two config blocks, two code paths. "Geometry is off" says nothing about
-covisibility, which is **on**.
+**Built: `tests/calibration/decide_view_vs_ceiling.py`** (parts 1 and 2) and
+`tests/calibration/contact_sheet_halves.py` (part 3).
 
-What remains genuinely unexamined, worth exactly one line of output:
+For the same 18 tracklets used in the split-half control:
 
-- `reconcile.py`'s comment records **1961** `TEMPORAL_CONFLICT_CROSS_CAMERA`
-  candidate exclusions on run `20260731_060425` — a different, older, 4-camera run.
-  Nobody has looked at what they were.
-- The `live.topology` veto was disabled because *"the view-to-view handoff is
-  FASTER than the walking distance suggests (adjacent/overlapping fields of
-  view)."* If handoff is effectively instant, a person genuinely **can** appear in
-  two cameras inside one second — and `ts` is receive time, carrying network
-  jitter, decode-cost differences and frame-rate quantisation (ADR-003A §3.1 puts
-  the differential as high as 500 ms). So the evidence that killed the transit veto
-  argues the 1.0s tolerances are tight, on a veto that is hard and
-  **unrecoverable**: reconcile cannot un-split a person whose merge it refused.
+1. **Temporal split-half** — first half vs second half. Compute **all three** modes:
+   `prototype`, `max_exemplar`, `consensus`.
+2. **Random split-half** — same tracklets, random partition, `prototype` only.
+3. **Contact sheets** for `cam_219:14` (0.594) and `cam_219:7` (0.950): first-half
+   crops on one row, second-half on another, one PNG each.
 
-`analyze_decision_log.py` in Task 5 already prints this count. Read it, record it,
-move on. Change the tolerance only if the count is large *and* concentrated on a
-camera pair where fast handoff is plausible — and then alone, with a re-render.
+**Pre-registered decision rules, printed by the script before its results.**
+
+| Observation | Conclusion | Next |
+|---|---|---|
+| `max_exemplar` on the low controls rises to **≥ 0.85** | Mean-pooling is destroying recoverable information | Task 4. No new model needed. |
+| `max_exemplar` stays **< 0.70** | **No view of that person matches any other view.** The embedding is the ceiling. | Task 5. Re-ranking over these prototypes inherits the failure. |
+| random ≈ 0.95 while temporal ≈ 0.59 | Appearance genuinely changes across the track — orientation | View-aware representation |
+| random ≈ temporal ≈ 0.6 | Frame-to-frame instability, not view change | Different problem; investigate before proceeding |
+
+**The contact sheet has THREE readings, not two:**
+
+- the person turned around → orientation, #1 confirmed;
+- **two different people → ByteTrack ID switch mid-track.** A tracker bug, and it
+  means the *control is contaminated* rather than the model failing. **Check this
+  first** — it also invalidates any tracklet built on that track;
+- halves look identical and still score 0.594 → domain failure, #5.
+
+**Accept when:** the three-mode table, the random-split column and both contact sheets
+exist, and you state which pre-registered branch fired. **Then stop.** Do not
+implement the consequence in the same pass.
 
 ---
 
-## 7. What is still genuinely open
+### Task 2 — Reranker feasibility — **ANSWERED 2026-08-04, no code written**
 
-- Whether the same-camera bar can be lowered enough to catch re-appearance
-  (~0.55) without fusing strangers. Needs the capture's labelled pairs. The
-  current stranger sample is **n=6**.
-- What the 1961 covisibility exclusions were (§6).
-- Whether `max_exemplar` helps anything, judged on fragment pairs and on video.
-  Task 4 gives it a synthetic point in its favour at `quorum < 1.0`; that is not
-  evidence about footage.
-- Whether cam_219 is optically different from cam_224/cam_213 — never checked, and
-  it is a five-minute side-by-side frame comparison.
-- Whether the split appears in reconciled ids only, or also in live provisional
-  ids. Different bugs, similar-looking outputs. **Check `output_cam_*.mp4` mtime
-  against the `run_id`** — stale files look like success.
+**1. What does `CameraAwareReranker` take?** Plain vectors and camera labels — **not**
+an `IdentityService`-shaped object. [reranking.py:89](src/identity/reranking.py#L89):
+
+```python
+def rerank(self, query_embedding, query_camera, candidate_gids, prototypes, cameras):
+    """prototypes : {gid: L2-normalized prototype vector}, ALL known identities
+       cameras    : {gid: primary camera string}
+       candidate_gids : the subset we actually need re-ranked scores for."""
+```
+
+Constructor is three numbers ([:33](src/identity/reranking.py#L33)):
+`CameraAwareReranker(k1=8, cross_camera_k1_boost=4, lambda_=0.7)`. No bank, no
+gallery signature, no identity service.
+
+Reconcile already holds both inputs: `protos` is `{(camera, track_id): vector}` and
+the camera is `key[0]`. So this is the **"close to droppable" case**, not an adapter
+rewrite. One caveat on shape: `rerank` is **query-vs-gallery**, while Phase 2 needs an
+all-pairs matrix — so it is a loop of N calls, not one call. `_rebuild_if_needed`
+([:40](src/identity/reranking.py#L40)) caches the neighbour graph across calls with
+the same `prototypes`, so the loop is cheap at N≈20.
+
+**2. Where is the small-gallery guard evaluated?** **Inside `rerank()`, per call** —
+[reranking.py:114-119](src/identity/reranking.py#L114-L119):
+
+```python
+min_gallery_for_jaccard = self.k1 + 1        # 9 at k1=8
+if len(prototypes) < min_gallery_for_jaccard:
+    return {gid: float(prototypes[gid] @ q) for gid in candidate_gids if gid in prototypes}
+```
+
+So the brief's worst case — *"fabricates perfect Jaccard on a shrinking population,
+which manufactures merges"* — **cannot happen.** The guard is re-evaluated on every
+call and fails safe to plain cosine.
+
+The other half of the concern stands but is small on current data. Phase 2's
+population on run `20260804_094039`: 38 tracklets − 11 suppressed = 27, minus 4
+Phase-1 merges = **23 clusters entering Phase 2**, converging to **18**. Both above
+the floor of 9, so the guard would **not** fire on either surviving run. It becomes
+live on a run with fewer than ~9 surviving clusters, where re-ranking silently
+degrades to raw cosine — you would have built nothing, but broken nothing.
+
+**Still untuned, and this is the real cost:** `lambda_: 0.7` leaves 70% of the blended
+score as raw cosine in the broken space, and all three parameters were fitted for the
+**live** path, over live identity prototypes, at a different population size, under
+**OSNet**. Treat them as unknown for reconcile and sweep after wiring, never before.
+
+**Honest estimate:** a few hours — a loop, a `lambda_`/`k1` sweep, and a re-render.
+But it is **downstream of Task 1**: if Task 1's second branch fires, re-ranking is
+built on prototypes that already lost the information, and the neighbour graph
+inherits the failure. Do Task 1 first.
+
+---
+
+### Task 3 — The re-embedding script (the unlock behind Tasks 1, 4 and 5)
+
+Clip + sidecar + `track_id` is a complete record, so any backbone can be replayed on
+frozen footage with zero camera time. It regenerates crops for Task 1, enables a
+threshold-free backbone A/B, and produces the crop set a fine-tune needs. It has been
+the deferred prerequisite for four rounds.
+
+Half a day on the A6000 — FastReID R101 at 384×128 batches in the hundreds of
+crops/sec there; the 0.76 s/crop figure is CPU-only.
+
+**Partially delivered:** `degrade_crops_causal.py`, `contact_sheet_halves.py` and
+`decide_view_vs_ceiling.py` all read crops from clips + sidecars already. What is
+still missing is the **write** half: re-embedding into a separate collection under a
+configurable `reid.model`/`reid.weights`.
+
+**Accept when:** it re-embeds a named run's clips under a configurable
+`reid.model`/`reid.weights` into a **separate** collection, and
+`verify_embedding_contract.py` passes.
+
+---
+
+### Task 4 — Conditional on Task 1: better aggregation
+
+Only if Task 1's first branch fired. Cheapest first:
+
+- **Quality-weighted aggregation.** The scalars are already computed and discarded.
+- **Diversity-aware subsampling.** `reid.interval` is a *time* filter, not a diversity
+  filter — consecutive frames are correlated, so averaging them encodes whatever bias
+  is present rather than reducing variance.
+- **Multi-prototype tracklets.** Cluster each tracklet's observations into 2–4
+  medoids, score by best-matching medoid pair. **Guard it:** max-over-pairs inflates
+  stranger scores too (the `other MAX` trap — 0.819 → 0.936 at 48 vs 90 frames on one
+  clip), so use a high quantile rather than the max, keep `require_reciprocal_best`,
+  and re-derive both bars.
+- **Flip TTA** — embed the crop and its mirror, average. Free, standard, orthogonal
+  to all of the above.
+
+---
+
+### Task 5 — Conditional on Task 1: stronger representation
+
+Only if the second branch fired. Then `ARCHITECTURE.md` §6 was right from the start,
+and ADR-003B was shelved on a premise now falsified — geometry and reconcile cannot
+carry the accuracy if the appearance signal is inverted at source.
+
+Cheapest first, each A/B'd threshold-free on your own clips via Task 3 plus
+`compare_backbones.py --clips`:
+
+- **Domain-generalizing backbone** — CLIP-ReID, SOLIDER, TransReID-SSL. One
+  `reid.model` line plus a checkpoint. No training.
+- **BPBreID / KPR** (`github.com/VlSomers/bpbreid`,
+  `github.com/VlSomers/keypoint_promptable_reidentification`) — part-based with
+  **visibility scores**, so a seated person's upper body compares against a standing
+  person's upper body. The right answer to an office with desks. **But it breaks the
+  storage contract**: multiple part vectors plus visibility per crop, not one
+  L2-normalised vector. A schema *shape* change, not just a width change.
+- **Unsupervised in-domain fine-tune** — Cluster Contrast on Task 3's crops, no labels.
+  Two modifications matter enormously for a small cast: cluster on **camera-debiased**
+  features, and **discard single-camera clusters** (published: Cluster Contrast
+  29.8 → 49.1 mAP on MSMT17). Without them, single-camera clusters dominate.
+
+---
+
+### Task 6 — Small, independent, cheap
+
+- **`reid.quality.max_aspect: 1.2`** admits near-square crops that get stretched ~3×
+  vertically into a shape the model never saw. In an office that is the **seated**
+  case, and it hits cam_219. Measure first: what fraction of cam_219's stored crops
+  had aspect > 0.8, and do those observations sit in the low-scoring halves?
+- **`main.py` passes no decision log**, so file-batch reconcile runs unlogged while the
+  live path is logged. Record in `REMEDIATION_PLAN.md` Part M.
+- **`_gather_tracklets`' scroll fallback is bare and unlogged** (`except Exception:
+  scroll_filter = None`, twice). A silent fallback scans the whole collection
+  client-side — the exact cost the filter was added to remove. Log both.
+- **cam_213's clip showed 0 detections across 138 frames** on the old checkout.
+  Separate thread; may not reflect the current detector config.
+- The `same_camera_rounds` finding from §3 belongs beside that key in `config.yaml`,
+  flagged as synthetic, because its comment currently promises it fixes the cam_206
+  stranding.
+
+---
+
+## 6. Still genuinely open
+
+- **Task 1's branch.** Everything forks on it.
+- `206/12 · 206/26` — decides whether `same_camera_rounds` can fix the cam_206
+  stranding at all. cam_206 is absent from every surviving run, so this needs the
+  capture.
+- What the 1961 `TEMPORAL_CONFLICT_CROSS_CAMERA` exclusions on run `20260731_060425`
+  actually were. One line from `analyze_decision_log.py`. Background, not a lead —
+  `explain_merge_failure.py` named the *appearance* bar for the reported split.
+- Whether cam_219 is optically soft. Two seconds: open `._live_src_cam_219.mp4`.
+  Note the clips are deliberately CLEAN frames (no boxes — those live in the sidecar,
+  and the annotated video is `output_cam_*.mp4`), which is what you want for judging
+  sharpness. Ruled out between cam_219 and cam_224 by hardware; still open vs cam_213.
+- Whether the split is in reconciled ids or only live provisional ids. Check
+  `output_cam_*.mp4` mtime against the `run_id` — stale files look like success.
+- The capture (`CAPTURE_PROTOCOL.md`): cam_206, a written headcount, a known route,
+  deliberate re-appearance repeats. Not blocking; new information.
