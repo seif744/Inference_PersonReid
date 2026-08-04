@@ -356,14 +356,29 @@ identity:
   # which the sticky live decision cannot catch.
   reconcile:
     enabled: true
-    threshold: 0.45          # cross-camera merge bar, in CONSENSUS space -- see
-                             # `scoring` below, which moved to consensus in the same
-                             # change. Blank = use identity.threshold. Set explicitly
-                             # here because this runs independently of the verifier
-                             # (see verifier.py) -- it must be recalibrated whenever
-                             # identity.threshold is.
+    threshold: 0.63          # prototype cosine to merge cross-camera; blank = use
+                             # identity.threshold. Set explicitly here because this
+                             # runs independently of the verifier (see verifier.py) --
+                             # it must be recalibrated whenever identity.threshold is.
                              #
-                             # 0.45 MEASURED 2026-08-04 on run 20260803_131521 with
+                             # REVERTED from 0.45 to 0.63 on 2026-08-04, together with
+                             # `scoring` (consensus -> prototype). The pair of numbers
+                             # was live for exactly one run, 20260804_064551, and
+                             # explain_merge_failure.py on that run showed the mode
+                             # change had made the defect WORSE -- see `scoring` below
+                             # for the measurement. Reverting them together because
+                             # each mode has its own scale and they were set together.
+                             #
+                             # ALSO WORTH KNOWING, and the reason this key was never
+                             # the lever for the reported symptom: when two clusters
+                             # SHARE a camera, this threshold is not consulted at all.
+                             # strictest_same_camera_bar() applies instead. On run
+                             # 20260804_064551 the operator's split person was judged
+                             # at 0.90 (cam_219's bar), never at this value.
+                             #
+                             # The superseded 0.45 measurement, kept because it was
+                             # real: on run 20260803_131521 with --scoring consensus at
+                             # consensus_top_frac 0.25,
                              # sweep_reconcile_thresholds.py --scoring consensus, at
                              # this file's consensus_top_frac 0.25, i.e. the estimator
                              # that actually ships:
@@ -590,8 +605,35 @@ identity:
     # Part H agrees independently: consensus had the lowest different-person
     # ceiling of the three modes at both sample sizes.
     #
-    # CHANGED TO `consensus` 2026-08-04, together with `threshold` above (0.63 ->
-    # 0.45) because each mode has its own scale and the two must move as one.
+    # TRIED `consensus` ON 2026-08-04 AND REVERTED THE SAME DAY. It ran for exactly
+    # one run, 20260804_064551, and made the reported defect WORSE. This is the sixth
+    # tuning change to be reverted for hurting accuracy (CLAUDE.md section 3).
+    #
+    # THE MEASUREMENT THAT REVERTED IT --
+    # explain_merge_failure.py 20260804_064551 1 2, per shared camera, one person's
+    # own two fragments scored against that camera's bar:
+    #
+    #   camera    fragment pair            prototype   max_exemplar   consensus   bar
+    #   cam_213   0031 vs 0035             0.630 fail   0.663 fail    0.567 fail  0.80
+    #   cam_219   0020 vs 0008             0.574 fail   0.600 fail    0.468 fail  0.90
+    #   cam_224   0001 vs 0030             0.907 PASS   0.907 PASS    0.582 fail  0.80
+    #
+    # Consensus LOWERED all three, and cam_224's pair crossed from PASS to FAIL --
+    # which is exactly the operator's "cam_224 went reid 1, then reid 2, then back to
+    # reid 1". Under prototype those two fragments merge in Phase 1 and that
+    # flip-flop does not happen. max_exemplar is weakly the best of the three on
+    # every row, and is what the live engine already uses -- the obvious next
+    # candidate, but it must be watched on video before it ships, not reasoned about.
+    #
+    # WHY THE SWEEP DID NOT CATCH THIS: sweep_reconcile_thresholds.py reports
+    # cluster SHAPE (ids, max, multi). Consensus looked better there -- max cluster 3
+    # instead of 7 -- and that reading was wrong, because no headcount existed to say
+    # whether 7 was a weld or a correctly-followed person. It was a person. Judge a
+    # mode on the FRAGMENT-PAIR table above, which explain_merge_failure.py prints,
+    # not on cluster counts.
+    #
+    # ORIGINAL REASONING FOR THE CHANGE, kept because the front/back argument still
+    # stands and only the remedy was wrong:
     #
     # THE SYMPTOM IT FIXES, reported by the operator: one person carried a DIFFERENT
     # reid in cam_219 than in cam_224, front angle vs back angle, and offline
@@ -625,7 +667,7 @@ identity:
     # clusters above are correct, and consensus's own different-person ceiling, which
     # has never been measured in FastReID space. Re-derive the same-camera bars too --
     # consensus also re-pairs cam_213 (88+93 under prototype, 88+119 here).
-    scoring: consensus
+    scoring: prototype
     consensus_top_frac: 0.25   # what FRACTION of observation pairs must agree.
                                # Part H's "top half" was measured on whole tracks,
                                # where most view pairs match; between a mostly-front
