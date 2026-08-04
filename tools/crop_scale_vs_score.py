@@ -30,7 +30,8 @@ for i, a in enumerate(sys.argv):
 
 store = PersonVectorStore(url=URL, ensure_collection=False, read_only=True)
 
-per = defaultdict(lambda: {"vecs": [], "h": [], "w": [], "blur": [], "ts": []})
+per = defaultdict(lambda: {"vecs": [], "h": [], "w": [], "blur": [], "ts": [],
+                           "hb": []})
 offset = None
 while True:
     pts, offset = store.client.scroll(store.collection, limit=1000, offset=offset,
@@ -53,6 +54,11 @@ while True:
         cq = pl.get("crop_quality")
         if isinstance(cq, dict) and cq.get("blur") is not None:
             rec["blur"].append(float(cq["blur"]))
+            # PAIRED (height, blur) per observation. Kept separately from the two
+            # independent lists above because section 4 must not assume they are
+            # index-aligned -- an observation can carry a bbox and no crop_quality.
+            if bb and len(bb) == 4:
+                rec["hb"].append((float(bb[3]) - float(bb[1]), float(cq["blur"])))
         if pl.get("ts") is not None:
             rec["ts"].append(float(pl["ts"]))
     if offset is None:
@@ -132,36 +138,105 @@ print(f"  time-DISJOINT same-camera pairs (could be one person): {len(disjoint)}
 print(f"  CO-PRESENT   same-camera pairs (provably two people):  {len(copresent)}")
 
 
-def _corr(rs):
-    if len(rs) < 4:
+def _corr_ci(rs):
+    """Pearson r with a Fisher-z 95% CI. Returns (r, lo, hi, n) or None.
+
+    The CI is not decoration. On this run the disjoint set gave r=-0.49 at n=259
+    and the co-present set r=-0.31 at n=28; the second CI includes ZERO and the two
+    overlap heavily, so the pair of numbers cannot support "scale hurts same-person
+    pairs more than stranger pairs". That claim was made once and is withdrawn.
+    """
+    if len(rs) < 5:
         return None
     s = np.array([r[0] for r in rs])
     q = np.array([r[5] for r in rs])
     if s.std() == 0 or q.std() == 0:
         return None
-    return float(np.corrcoef(s, q)[0, 1])
+    r = float(np.corrcoef(s, q)[0, 1])
+    z = np.arctanh(np.clip(r, -0.999999, 0.999999))
+    se = 1.0 / np.sqrt(len(rs) - 3)
+    return r, float(np.tanh(z - 1.96 * se)), float(np.tanh(z + 1.96 * se)), len(rs)
+
+
+def _mean_ci(x):
+    x = np.asarray([v for v in x if v == v], dtype=float)
+    if len(x) < 2:
+        return float("nan"), float("nan")
+    return float(x.mean()), float(1.96 * x.std(ddof=1) / np.sqrt(len(x)))
 
 
 for name, rs in (("disjoint", disjoint), ("co-present", copresent)):
-    c = _corr(rs)
-    if c is None:
+    got = _corr_ci(rs)
+    if got is None:
         print(f"  {name}: too few pairs to correlate")
         continue
-    s = np.array([r[0] for r in rs])
-    q = np.array([r[5] for r in rs])
-    print(f"  {name}: n={len(rs)}  cosine mean={s.mean():.3f}  "
-          f"h-ratio mean={q.mean():.2f}  corr(cosine, h_ratio)={c:+.3f}")
-    hi = s[q > np.median(q)]
-    lo = s[q <= np.median(q)]
-    if len(hi) and len(lo):
-        print(f"      pairs with MATCHED crop scale  (h ratio <= median): "
-              f"mean cosine {lo.mean():.3f}")
-        print(f"      pairs with MISMATCHED crop scale (h ratio >  median): "
-              f"mean cosine {hi.mean():.3f}")
+    r, lo, hi, n = got
+    s = np.array([r_[0] for r_ in rs])
+    q = np.array([r_[5] for r_ in rs])
+    print(f"  {name}: n={n}  cosine mean={s.mean():.3f}")
+    print(f"      corr(cosine, h_ratio) = {r:+.3f}   95% CI [{lo:+.3f}, {hi:+.3f}]"
+          + ("   <-- INCLUDES ZERO" if lo <= 0 <= hi else ""))
+    # RANGE RESTRICTION, reported because it attenuates a correlation on its own.
+    # Two people co-present in one frame are often at comparable depths, so this
+    # subset's h_ratio span is narrower and its r is biased toward zero for that
+    # reason alone -- nothing to do with the mechanism.
+    print(f"      h_ratio: min={q.min():.2f} median={np.median(q):.2f} "
+          f"max={q.max():.2f}  (span {q.max() - q.min():.2f})")
+    m_lo, c_lo = _mean_ci(s[q <= np.median(q)])
+    m_hi, c_hi = _mean_ci(s[q > np.median(q)])
+    print(f"      MATCHED    scale (h ratio <= median): mean cosine "
+          f"{m_lo:.3f} +/- {c_lo:.3f}  (n={int((q <= np.median(q)).sum())})")
+    print(f"      MISMATCHED scale (h ratio >  median): mean cosine "
+          f"{m_hi:.3f} +/- {c_hi:.3f}  (n={int((q > np.median(q)).sum())})")
+    print()
+
+print("  WHAT THIS CAN AND CANNOT SUPPORT.")
+print("  The DISJOINT set is UNLABELLED: time-disjoint same-camera pairs mix one")
+print("  person returning with two different people appearing at different times, so")
+print("  its mean cosine is not a same-person figure and a drop across it is not a")
+print("  'cost to same-person pairs'. h_ratio also encodes where in the room someone")
+print("  stood, which encodes lighting, pose and viewing angle -- scale is entangled")
+print("  with all of it. Correlation here cannot separate cause from confound.")
+print("  For that, run the controlled version, which holds person, clothing, camera,")
+print("  lighting and room position fixed and varies ONLY resolution:")
+print("    python tests/calibration/degrade_crops_causal.py --clips .")
+
+# --------------------------------------------------------------------------
+header = "4. BLUR AT MATCHED CROP HEIGHT -- is any camera really softer?"
 print()
-print("  A strongly NEGATIVE correlation, and matched-scale pairs scoring well above")
-print("  mismatched ones, means the defect is the INPUT GATE, not the similarity bar:")
-print("  raise reid.quality.min_height / min_area so small crops never enter a")
-print("  prototype. That is a pixels-on-target rule, which transfers across footage.")
-print("  A correlation near zero means crop scale is NOT the driver and the")
-print("  front/back appearance explanation stands.")
+print("=" * 78)
+print(header)
+print("=" * 78)
+print("  Laplacian variance is NOT scale-invariant, and it is measured on the RAW")
+print("  crop before resize (reid/service.py::_crop_quality). The same physical")
+print("  detail spread over more pixels gives smaller per-pixel gradients, so a")
+print("  camera whose people are simply CLOSER reads as 'softer'; and small, distant,")
+print("  noisy crops read as 'sharp' partly on sensor noise. So comparing raw blur")
+print("  across cameras with different crop sizes says nothing. Binning by height is")
+print("  the minimum fix: only compare cameras inside the same band.")
+print()
+bands = [(100, 200), (200, 300), (300, 450), (450, 650), (650, 1200)]
+by_cam_hb = defaultdict(list)
+for (cam, _tid), r in per.items():
+    by_cam_hb[cam].extend(r["hb"])
+cams = sorted(by_cam_hb, key=str)
+print(f"  {'height band':<16}" + "".join(f"{c:>22}" for c in cams))
+for lo_h, hi_h in bands:
+    cells = []
+    for cam in cams:
+        vals = [b for (h, b) in by_cam_hb[cam] if lo_h <= h < hi_h]
+        cells.append(f"{np.median(vals):.0f} (n={len(vals)})" if vals else "-")
+    if all(c == "-" for c in cells):
+        continue
+    print(f"  {f'{lo_h}-{hi_h} px':<16}" + "".join(f"{c:>22}" for c in cells))
+print()
+print("  Read DOWN a column to see the scale artifact inside one camera; read ACROSS")
+print("  a row for the only honest cross-camera comparison. A camera that is still")
+print("  markedly lower in a band it SHARES with another is genuinely softer, and")
+print("  that is a lens/focus problem no threshold can address. If the differences")
+print("  vanish once height is matched, the 'softer camera' reading was the scale")
+print("  artifact again and should be dropped.")
+print()
+print("  Cheapest check of all, and it needs no metric: open ._live_src_cam_219.mp4")
+print("  and look at it. A soft image is obvious in two seconds and no confound can")
+print("  reach that observation.")
