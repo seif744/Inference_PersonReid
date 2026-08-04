@@ -129,7 +129,44 @@ detector:
 
 tracker:
   enabled: true
-  config: bytetrack.yaml     # ships with ultralytics; "botsort.yaml" also works
+  # CHANGED 2026-08-04 from ultralytics' stock `bytetrack.yaml`, which associates on
+  # IoU and motion ONLY -- no appearance cue at all. Full rationale and every value's
+  # reason is in the file itself; the summary of why is here because this is where
+  # someone looks first.
+  #
+  # THE DEFECT IT FIXES, measured rather than argued. reconcile.py assumes "one
+  # ByteTrack track is (barring an id switch) provably one person", and every
+  # prototype, threshold and veto rests on that parenthesis. It is false here: the
+  # operator read contact sheets of each tracklet's two temporal halves
+  # (tests/calibration/contact_sheet_halves.py) on run 20260804_094039 and found BOTH
+  # halves of cam_219:6 and cam_219:14 are DIFFERENT PEOPLE -- one track_id covering
+  # two identities. Four tracklets checked in cam_213/cam_224 were each one person.
+  # 2 of 2 in cam_219, 0 of 4 elsewhere.
+  #
+  # cam_219 is the close-mounted camera -- median crop height 754 px on a 1080-line
+  # frame, people filling the view and passing each other at nearly identical box
+  # sizes. That is the textbook case IoU-plus-motion association loses, and cam_219
+  # is exactly where the operator reported ids changing.
+  #
+  # A SWITCH IS A FALSE MERGE COMMITTED WHERE NOTHING DOWNSTREAM CAN SEE IT. The
+  # tracklet's prototype becomes a mean over two people, so it merges with the wrong
+  # people AND splits from the right ones -- both reported symptoms at once. By
+  # section 5 a fragment is the recoverable direction and reconcile exists to rejoin
+  # fragments, so the new config is deliberately biased toward fragmenting
+  # (with_reid on, track_buffer 30 -> 15).
+  #
+  # EXPECT MORE TRACKLETS AND MORE IDENTITIES, especially in cam_219. That is the
+  # trade being made, not a regression. Judge it with
+  # tests/calibration/find_track_switches.py plus contact sheets, and by watching
+  # output_cam_*.mp4 -- never by an identity count (section 4).
+  #
+  # VALIDATED ONLY AS FAR AS A SMOKE TEST: it loads, `with_reid: True` needs no extra
+  # download, and on 12 easy frames of register_file.avi it produces detections and
+  # track ids identical to bytetrack.yaml (48 dets, ids 1-4). Whether it removes the
+  # cam_219 switches needs a capture. Revert to `bytetrack.yaml` if it regresses.
+  config: trackers/botsort_reid.yaml
+  # Previous value, kept so the revert is one edit: bytetrack.yaml (also stock:
+  # botsort.yaml, which is this file's basis but with with_reid False).
 
 reid:
   enabled: true
