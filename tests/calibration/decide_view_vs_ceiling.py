@@ -153,6 +153,14 @@ def load_clip_crops(clip_dir):
                 if tid is None:
                     continue
                 key = (cam, int(tid))
+                # CO-PRESENCE IS RECORDED BEFORE THE FILTERS, deliberately. It is a
+                # statement about the world -- these two tracklets were detected in
+                # the same frame, so they are two people -- and it does not depend on
+                # whether either crop was big enough to embed or fell inside the
+                # per-track cap. Recording it after the filters truncated the frame
+                # sets and UNDERCOUNTED provable stranger pairs, which is the one
+                # statistic the whole inversion question turns on.
+                frames[key].add(_i)
                 if len(out[key]) >= MAX_PER_TRACK:
                     continue
                 if float(b["y2"]) - float(b["y1"]) < MIN_HEIGHT:
@@ -163,12 +171,6 @@ def load_clip_crops(clip_dir):
                 if crop is None or crop.size == 0:
                     continue
                 out[key].append(crop)
-                # Frame indices, so CO-PRESENCE is computable. Two tracklets sharing
-                # a frame index in one camera are provably two people -- one body
-                # cannot be two simultaneous detections. Every other same-camera pair
-                # is unlabelled and may be one person returning, so a stranger
-                # statistic over all distinct pairs is an upper bound, not a ceiling.
-                frames[key].add(_i)
         cap.release()
     return ({k: v for k, v in out.items() if len(v) >= MIN_OBS},
             {k: v for k, v in frames.items() if len(out.get(k, ())) >= MIN_OBS})
