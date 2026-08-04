@@ -77,7 +77,7 @@ from reid.extractor import ReIDExtractor                          # noqa: E402
 from detector import crop_person                                  # noqa: E402
 from types import SimpleNamespace                                 # noqa: E402
 
-FLAGS = ("--clips", "--cam", "--scales", "--blurs", "--min-height",
+FLAGS = ("--clips", "--cam", "--scales", "--blurs", "--gammas", "--min-height",
          "--min-obs", "--max-per-track", "--device")
 validate_flags(FLAGS)
 
@@ -85,6 +85,18 @@ CLIPS = arg("--clips", ".")
 ONLY_CAM = arg("--cam")
 SCALES = [float(x) for x in (arg("--scales", "2,4,6") or "").split(",") if x]
 BLURS = [float(x) for x in (arg("--blurs", "1.5,3.0,5.0") or "").split(",") if x]
+# EXPOSURE arm. Added 2026-08-04 after the contact sheets showed cam_219:14 -- the
+# WORST control of all 18 at 0.594 -- differs between its halves almost entirely in
+# BRIGHTNESS, not view: first half nearly black, second half normally lit, same
+# seated person, same garment, same pose. Orientation cannot explain that one, and
+# max_exemplar helps it least (0.809 vs 0.944 for the orientation case) precisely
+# because there is no better-matched VIEW to find.
+#
+# Gamma > 1 darkens. Applied on the 0..255 crop before any resize, which is where a
+# real under-exposure lives. It matters that FastReID normalises with FIXED dataset
+# constants -- (batch - mean) / std in backends.py, not per-image -- so a dark crop
+# stays dark relative to the training distribution rather than being corrected.
+GAMMAS = [float(x) for x in (arg("--gammas", "1.8,2.6,3.4") or "").split(",") if x]
 # Only tracklets with real pixels to give away can be degraded meaningfully: you
 # cannot downscale a 90 px crop by 4 and learn anything about a 600 px one.
 MIN_HEIGHT = float(arg("--min-height", "350"))
@@ -163,6 +175,17 @@ def downscale_up(crop, k):
     return cv2.resize(crop, (nw, nh), interpolation=cv2.INTER_AREA)
 
 
+def darken(crop, gamma):
+    """Under-expose by gamma on the 0..255 scale. gamma > 1 darkens."""
+    lut = np.clip(((np.arange(256) / 255.0) ** float(gamma)) * 255.0,
+                  0, 255).astype(np.uint8)
+    return cv2.LUT(crop, lut)
+
+
+def mean_luma(crop):
+    return float(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY).mean())
+
+
 def gaussian_soften(crop, sigma):
     ksize = int(2 * round(3 * sigma) + 1)
     return cv2.GaussianBlur(crop, (ksize, ksize), sigma)
@@ -211,7 +234,8 @@ def main():
     print("  'blur s'  = gaussian sigma s at full size, isolating sharpness from size.")
     print()
     cols = ([f"scale{int(k)}x" if k == int(k) else f"scale{k}x" for k in SCALES]
-            + [f"blur{s}" for s in BLURS])
+            + [f"blur{s}" for s in BLURS]
+            + [f"gam{g}" for g in GAMMAS])
     print(f"  {'tracklet':<16}{'control':>9}" + "".join(f"{c:>10}" for c in cols))
 
     agg = defaultdict(list)
@@ -236,6 +260,14 @@ def main():
             s = float(pa @ pd) if pd is not None else float("nan")
             agg[f"blur{sg}"].append(s)
             row += f"{s:>10.3f}"
+        for g in GAMMAS:
+            dk = [darken(c, g) for c in b]
+            pd = proto(ex, dk)
+            s = float(pa @ pd) if pd is not None else float("nan")
+            agg[f"gam{g}"].append(s)
+            agg[f"luma{g}"].append(float(np.mean([mean_luma(c) for c in dk])))
+            row += f"{s:>10.3f}"
+        agg["luma_native"].append(float(np.mean([mean_luma(c) for c in b])))
         print(row)
 
     header("AGGREGATE")
@@ -262,6 +294,18 @@ def main():
         m, h = ci95(agg[f"blur{sg}"])
         print(f"  {('blur sigma %g' % sg):<14}{m:>13.3f}{'+/- %.3f' % h:>16}"
               f"{cm - m:>18.3f}")
+    for g in GAMMAS:
+        m, h = ci95(agg[f"gam{g}"])
+        lm, _ = ci95(agg[f"luma{g}"])
+        print(f"  {('gamma %g' % g):<14}{m:>13.3f}{'+/- %.3f' % h:>16}"
+              f"{cm - m:>18.3f}   mean luma {lm:.0f}")
+    ln, _ = ci95(agg["luma_native"])
+    print(f"  (native mean luma of the undegraded half: {ln:.0f})")
+    print()
+    print("  CALIBRATE THE GAMMA ARM AGAINST THE REAL CASE. cam_219:14's dark half")
+    print("  is the thing being modelled, so the row that matters is whichever gamma")
+    print("  lands near ITS mean luma -- compare the luma column against the native")
+    print("  figure above and read the drop at the matching row, not the largest one.")
 
     print()
     print("  HOW TO READ IT. A drop whose CI clears zero is a CAUSED effect -- the")
