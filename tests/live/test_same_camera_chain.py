@@ -69,15 +69,13 @@ from collections import defaultdict
 
 import numpy as np
 
-# RESOLVE src/ FROM __file__, NOT FROM THE CWD. `sys.path.insert(0, "src")` only
-# works when this is launched from the repo root, and tests/run_all.py deliberately
-# runs each test with cwd = the test's own directory (so `from _synth import ...`
-# resolves the same way it does when a test is run directly). With the relative
-# path this file raised ModuleNotFoundError under run_all while passing standalone
-# -- i.e. it broke `python tests/run_all.py`, which CLAUDE.md section 8 requires
-# before every commit. Same three lines as tests/live/_synth.py.
-_SRC = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                    "..", "..", "src"))
+# Resolve src/ from THIS FILE, never from the cwd. tests/run_all.py deliberately
+# runs each test with cwd = the test's own directory, and discover() globs
+# tests/**/test_*.py, so a cwd-relative path passes standalone from the repo root
+# and raises ModuleNotFoundError inside the suite -- taking a green run to red on
+# every fresh clone. Same three lines tests/live/_synth.py uses. See CLAUDE.md §7.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_SRC = os.path.abspath(os.path.join(_HERE, "..", "..", "src"))
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
@@ -85,6 +83,25 @@ from identity import reconcile as R
 
 BAR = 0.90
 DIM = 16
+
+# Intra-tracklet spread, in degrees. 0.0 means every observation of a tracklet is
+# the SAME vector -- what shipped, and what the first recorded grid was measured on.
+#
+# !! WITH SPREAD 0 THE SCORING COLUMN OF THE GRID IS UNINFORMATIVE, and that is a
+# limitation of this fixture, not a result. `max_exemplar` is
+# max(prototype, best single observation pair) and `consensus` is a mean over
+# observation pairs, so with zero intra-tracklet variance all three modes return the
+# SAME number by construction. A grid reading "identical for max_exemplar and
+# consensus" therefore says nothing whatever about those modes -- do not carry
+# "scoring mode does not matter" out of it. The mutual-best and linkage conclusions
+# are unaffected; those are what this fixture actually tests.
+#
+# Set this to e.g. 8.0 to give each tracklet a real spread of observations around
+# its angle. `max_exemplar` can then find a matching view pair that the means miss,
+# which is the entire reason those modes exist, and the scoring column becomes a
+# real axis. Expect different numbers throughout; re-read the grid from scratch
+# rather than comparing it to a spread=0 one.
+SPREAD_DEG = 0.0
 
 
 # ------------------------------------------------------------------ fake store
@@ -137,7 +154,7 @@ def _basis():
     return e[0], e[1], e[2]
 
 
-def build_points():
+def build_points(spread_deg=SPREAD_DEG):
     e1, e2, e3 = _basis()
 
     def on_circle(deg):
@@ -145,26 +162,32 @@ def build_points():
         v = np.cos(r) * e1 + np.sin(r) * e2
         return (v / np.linalg.norm(v)).astype(np.float32)
 
-    chain = {"F1": on_circle(0.0), "F2": on_circle(22.0), "F3": on_circle(40.0)}
-
-    # Stranger: fixed cosine to F2, pushed off the chain's plane so its scores
-    # against F1 and F3 fall away by exactly cos(angle to F2).
+    # Stranger direction: fixed cosine to the chain at 22 deg, pushed off the
+    # chain's plane so its scores against F1 and F3 fall away by exactly the cosine
+    # of their angle to 22 deg.
     c = 0.92
-    s = float(np.sqrt(max(1.0 - c * c, 0.0)))
-    stranger = (c * on_circle(22.0) + s * e3).astype(np.float32)
-    stranger /= np.linalg.norm(stranger)
+    off = float(np.sqrt(max(1.0 - c * c, 0.0)))
+
+    def stranger_at(deg):
+        v = (c * on_circle(deg) + off * e3).astype(np.float32)
+        return (v / np.linalg.norm(v)).astype(np.float32)
+
+    n_obs = 4                                   # > min_tracklet_observations=3
+    # Symmetric about the base angle, so spread_deg=0 gives every observation the
+    # identical vector -- byte-for-byte the original fixture.
+    offsets = [(j - (n_obs - 1) / 2.0) * float(spread_deg) for j in range(n_obs)]
 
     tracks = [
-        ("F1", 1, chain["F1"], 100),
-        ("F2", 2, chain["F2"], 200),
-        ("F3", 3, chain["F3"], 300),
-        ("S", 9, stranger, 400),
+        ("F1", 1,  0.0, 100, on_circle),
+        ("F2", 2, 22.0, 200, on_circle),
+        ("F3", 3, 40.0, 300, on_circle),
+        ("S",  9, 22.0, 400, stranger_at),
     ]
 
     points, pid = [], 0
-    for _name, track_id, vec, frame0 in tracks:
-        for j in range(4):                      # > min_tracklet_observations=3
-            points.append(_Point(pid, vec.copy(), {
+    for _name, track_id, base_deg, frame0, maker in tracks:
+        for j, d in enumerate(offsets):
+            points.append(_Point(pid, maker(base_deg + d), {
                 "run_id": "fixture",
                 "camera": "cam_fix",
                 "track_id": track_id,
@@ -285,8 +308,17 @@ def main():
     if not wins:
         print("RESULT  NO setting in this grid achieves both. The trade is real: "
               "reciprocal-best\n        off fuses the stranger, on strands the "
-              "chain. If member_quorum was not\n        available, apply "
-              "RECONCILE_PATCHES.md C1 and re-run before concluding.")
+              "chain.")
+        if not has_quorum:
+            print("\n        member_quorum is absent, so complete linkage is fixed "
+                  "at 1.0 and the\n        chain question is open BY CONSTRUCTION. "
+                  "RECONCILE_PATCHES.md C1 adds it\n        with default 1.0, which "
+                  "is bit-identical to today -- applying that CODE\n        changes "
+                  "no decision and is sanctioned. What is NOT sanctioned is "
+                  "setting\n        the quorum below 1.0 in config.yaml: that voids "
+                  "the bars, needs a sweep\n        and a re-render, and targets the "
+                  "cam_206 stranding rather than the\n        operator's reported "
+                  "split. Apply, re-run this, record the answer, stop.")
     else:
         print("RESULT  settings that closed the chain AND kept the stranger out:")
         for mode, recip, rounds, quorum in wins:

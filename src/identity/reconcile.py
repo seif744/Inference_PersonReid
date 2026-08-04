@@ -261,6 +261,8 @@ def resolve_reconcile_kwargs(cfg, log=print):
         "same_camera_reciprocal_best": bool(
             recon.get("same_camera_reciprocal_best", False)),
         "same_camera_rounds": bool(recon.get("same_camera_rounds", False)),
+        "same_camera_member_quorum": float(
+            recon.get("same_camera_member_quorum", 1.0)),
         "geometry": resolve_geometry_policy(cfg, log=log),
     }
 
@@ -285,6 +287,7 @@ def describe_reconcile_kwargs(kw):
         f" reciprocal={'on' if kw['require_reciprocal_best'] else 'OFF'}"
         f" same_reciprocal={'on' if kw['same_camera_reciprocal_best'] else 'OFF'}"
         f" same_rounds={'on' if kw.get('same_camera_rounds') else 'OFF'}"
+        f" member_quorum={kw.get('same_camera_member_quorum', 1.0)}"
         f" covisibility={'on/' + str(len(covis_pairs)) + ' pairs' if covis_on else 'OFF'}"
         + f" cap={kw.get('max_observations_per_side')}"
         + (f" geometry=on/safety="
@@ -758,6 +761,7 @@ def reconcile_tracklets(store, threshold, run_id=None,
                         covisibility=None,
                         same_camera_reciprocal_best=False,
                         same_camera_rounds=False,
+                        same_camera_member_quorum=1.0,
                         geometry=None,
                         quality_out=None):
     """
@@ -1234,12 +1238,36 @@ def reconcile_tracklets(store, threshold, run_id=None,
     #
     # For singleton clusters this is exactly the old single-pair test, so round 1 --
     # and therefore `same_camera_rounds=False` -- is unchanged by it.
-    def all_member_pairs_clear(ma, mb, bar):
-        for x in ma:
-            for y in mb:
-                if pair_score({x}, {y}, protos[x], protos[y]) < bar:
-                    return False
-        return True
+    def all_member_pairs_clear(ma, mb, bar, quorum=None):
+        """Does the member-pair agreement requirement hold for this cluster pair?
+
+        quorum=1.0 (the default) is COMPLETE LINKAGE: every cross-member pair must
+        clear the bar. That is what shipped, and both counterexamples justifying it
+        are TWO-member cases, where complete linkage and "no weak edge" are the same
+        rule. At three or more members they are not, and complete linkage forbids
+        the case the scoring-modes comment says the design is for: a chain
+        F1(front) .. Fn(back) where every adjacent pair clears the bar but the ends
+        do not can never consolidate, because admitting Fn requires F1 x Fn.
+
+        Note also that round 2's member-pair tests are a SUBSET of round 1's -- in
+        round 1 every cluster is a singleton, so every same-camera pair was already
+        tested pairwise. So same_camera_rounds can only change outcomes via
+        mutual-best re-derivation; it can never admit an edge round 1 rejected on
+        score. A quorum below 1.0 is what actually opens the chain case, and its
+        cost is that a fraction of members may disagree -- so it trades directly
+        against the weak-edge capture this guard was added to stop. Sweep it; do not
+        guess it.
+        """
+        if quorum is None:
+            quorum = same_camera_member_quorum
+        pairs = [(x, y) for x in ma for y in mb]
+        if not pairs:
+            return True
+        clear = sum(1 for x, y in pairs
+                    if pair_score({x}, {y}, protos[x], protos[y]) >= bar)
+        if quorum >= 1.0:
+            return clear == len(pairs)
+        return clear >= max(1, int(round(len(pairs) * quorum)))
 
     accepted_same = set()
     rejected_not_mutual = 0
