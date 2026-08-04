@@ -164,9 +164,37 @@ tracker:
   # download, and on 12 easy frames of register_file.avi it produces detections and
   # track ids identical to bytetrack.yaml (48 dets, ids 1-4). Whether it removes the
   # cam_219 switches needs a capture. Revert to `bytetrack.yaml` if it regresses.
-  config: trackers/botsort_reid.yaml
-  # Previous value, kept so the revert is one edit: bytetrack.yaml (also stock:
-  # botsort.yaml, which is this file's basis but with with_reid False).
+  # ===================== REVERTED SAME DAY, 2026-08-04 =====================
+  # trackers/botsort_reid.yaml made the output MUCH worse and is reverted. Before
+  # it, cross-camera id splitting was confined to cam_219. After it, the operator
+  # reports EVERY camera showing the same defect. Seventh reverted change.
+  #
+  # WHY IT BROKE, and the error is in the reasoning rather than the values.
+  # `track_buffer: 30 -> 15` was justified by CLAUDE.md section 5: a fragment is
+  # recoverable because reconcile's Phase 1 rejoins fragments, while a switch is
+  # not. THAT PREMISE IS FALSE ON THIS SYSTEM, and the same day's own measurements
+  # say so. Phase 1 merges same-camera fragments at 0.80-0.90, and re-appearance
+  # fragment pairs measure 0.57-0.62 (explain_merge_failure.py on 20260804_064551:
+  # cam_219 0020 vs 0008 = 0.574, cam_213 0031 vs 0035 = 0.630). Reconcile CANNOT
+  # rejoin the fragments a shorter buffer creates. So halving the buffer
+  # manufactured more of the exact failure the system has no mechanism to repair,
+  # in every camera at once.
+  #
+  # Compounding it: shorter tracks mean fewer observations per prototype, so every
+  # prototype got noisier, which degrades CROSS-camera matching too -- and
+  # min_tracklet_observations=3 deletes the shortest outright. That is why a change
+  # aimed at one camera's tracker damaged all of them.
+  #
+  # `with_reid: True` with `model: auto` is UNJUDGED. It was bundled with the buffer
+  # change, so this run cannot separate them, and it may well be fine or even
+  # helpful. If it is retried it must go in ALONE, at stock track_buffer: 30, and be
+  # judged on find_track_switches.py plus contact sheets rather than on ids.
+  #
+  # THE ID SWITCHES ARE STILL REAL AND STILL UNFIXED: cam_219:6 and cam_219:14 are
+  # each two people under one track_id, confirmed by eye. This was the wrong remedy,
+  # not a wrong diagnosis. The file is kept at trackers/botsort_reid.yaml with its
+  # rationale intact so the next attempt starts from what was learned.
+  config: bytetrack.yaml     # ships with ultralytics; "botsort.yaml" also works
 
 reid:
   enabled: true
