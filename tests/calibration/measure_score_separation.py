@@ -51,35 +51,71 @@ ex = ReIDExtractor(weights=reid_weights(), model=reid_model(), device="cpu")
 print(f"[calib] ReID: {ex.describe()}")
 model = ex.model
 
+# THE TAP AXIS IS OSNET-ONLY, AND THIS SCRIPT USED TO ASSUME IT UNCONDITIONALLY.
+# Comparing post-ReLU against post-BN means reaching into torchreid OSNet's own `fc`
+# block (Linear -> BatchNorm1d -> ReLU). FastReID has no such block and no选able
+# tap -- its EmbeddingHead returns the post-bnneck feature unconditionally -- so the
+# surgery below raised
+#     AttributeError: 'Sequential' object has no attribute 'global_avgpool'
+# and the script died on line 71, before measuring anything.
+#
+# That mattered more than a broken script: this is the measurement that sets every
+# identity threshold in the system, so from the FastReID switch until 2026-08-03
+# there was NO WAY to derive a threshold for the backbone actually running. Nothing
+# had been recalibrated, and this is why.
+#
+# So the tap axis is now discovered, not assumed. On OSNet both taps are compared as
+# before; on any other backend there is exactly one feature space -- production --
+# and everything else in this script is backend-agnostic and runs unchanged.
+OSNET_FAMILY = all(hasattr(model, a) for a in ("global_avgpool", "featuremaps", "fc"))
+TAPS = ("relu", "bn") if OSNET_FAMILY else ("production",)
+PRODUCTION_TAP = "relu" if OSNET_FAMILY else "production"
+
 
 @torch.no_grad()
 def embed(crops, tap):
-    """tap='relu' reproduces ReIDExtractor.extract_batch exactly; tap='bn' skips
-    the final ReLU."""
+    """tap='production' is exactly what ships, for any backend.
+
+    On the OSNet family only: 'relu' reproduces ReIDExtractor.extract_batch exactly
+    and 'bn' skips the final ReLU, which is what makes the tap comparison possible.
+    """
+    if tap == "production":
+        return ex.extract_batch(crops)
     batch = torch.stack([ex._preprocess(c) for c in crops]).to(ex.device)
     v = model.global_avgpool(model.featuremaps(batch)).view(batch.size(0), -1)
     v = model.fc[0](v)                       # Linear
     v = model.fc[1](v)                       # BatchNorm1d
     if tap == "relu":
-        v = model.fc[2](v)                   # ReLU  <-- ships today
+        v = model.fc[2](v)                   # ReLU  <-- ships on OSNet
     v = torch.nn.functional.normalize(v, p=2, dim=1, eps=1e-12)
     return v.cpu().numpy().astype(np.float32)
 
 
-# The 'relu' path must be bit-equal to production, or nothing below is comparable.
+# The production path must be bit-equal to what ships, or nothing below is comparable.
 probe = [np.random.randint(0, 255, (200, 90, 3), np.uint8) for _ in range(3)]
-delta = np.abs(embed(probe, "relu") - ex.extract_batch(probe)).max()
-assert delta < 1e-5, f"'relu' tap does not reproduce extract_batch (diff {delta:.2e})"
-print(f"[calib] 'relu' tap reproduces production extract_batch (diff {delta:.1e})")
+delta = np.abs(embed(probe, PRODUCTION_TAP) - ex.extract_batch(probe)).max()
+assert delta < 1e-5, (f"tap {PRODUCTION_TAP!r} does not reproduce extract_batch "
+                      f"(diff {delta:.2e})")
+print(f"[calib] tap {PRODUCTION_TAP!r} reproduces production extract_batch "
+      f"(diff {delta:.1e})")
+if not OSNET_FAMILY:
+    print(f"[calib] tap comparison SKIPPED: {ex.describe()} has no selectable tap, "
+          f"so there is one feature space and it is the one that ships.")
 
-header("0. WHAT THE FINAL ReLU DOES TO THE FEATURE SPACE   (Part H.5)")
-for tap in ("relu", "bn"):
+header("0. THE FEATURE SPACE THIS BACKBONE ACTUALLY PRODUCES   (Part H.5)")
+for tap in TAPS:
     f = embed(probe, tap)
-    print(f"  {tap:4s}: min={f.min():+.4f} max={f.max():+.4f} "
+    print(f"  {tap:<11s}: min={f.min():+.4f} max={f.max():+.4f} "
           f"exact-zero dims={100 * (f == 0).mean():5.1f}%  "
           f"negative dims={100 * (f < 0).mean():5.1f}%")
-print("  post-ReLU is confined to the non-negative orthant -> cosine of any two")
-print("  vectors is >= 0, compressing the usable range.")
+if OSNET_FAMILY:
+    print("  post-ReLU is confined to the non-negative orthant -> cosine of any two")
+    print("  vectors is >= 0, compressing the usable range.")
+else:
+    print("  A space with NEGATIVE dimensions uses the full hypersphere, so cosine")
+    print("  can go below 0 and the usable range is wider than post-ReLU OSNet's.")
+    print("  EVERY THRESHOLD DERIVED UNDER OSNET IS THEREFORE MEANINGLESS HERE --")
+    print("  that is what this script exists to re-derive.")
 
 # ---------------------------------------------------------------- gather footage
 frames = sample_frames(VIDEO, NFRAMES, STRIDE)
@@ -91,7 +127,7 @@ det = PersonDetector(model_path=DETECT_WEIGHTS, confidence_threshold=0.4,
                      pose_ensemble=None, iou=0.60)
 
 data = {}
-for tap in ("relu", "bn"):
+for tap in TAPS:
     det_tap = PersonDetector(model_path=DETECT_WEIGHTS, confidence_threshold=0.4,
                              person_class_id=0, tracker_config="bytetrack.yaml",
                              pose_ensemble=None, iou=0.60)
@@ -99,7 +135,7 @@ for tap in ("relu", "bn"):
         frames, det_tap, lambda c, t=tap: embed(c, t))
     data[tap] = proven_distinct_pairs(by_track, cooccur, min_obs=6) + (per_frame,)
 
-usable_r, pairs, excluded, per_frame_r = data["relu"]
+usable_r, pairs, excluded, per_frame_r = data[PRODUCTION_TAP]
 if not pairs:
     raise SystemExit("[calib] no proven-distinct (co-visible) track pairs in this "
                      "clip -- cannot measure. Try more frames or busier footage.")
@@ -198,16 +234,16 @@ MODES = (("RAW crop-to-crop            (Part H.1)", raw_scores),
 summary = {}
 for title, fn in MODES:
     header(title)
-    print(f"  {'tap':<5}{'same p5':>9}{'other p95':>11}{'other MAX':>11}{'margin':>9}")
-    for tap in ("relu", "bn"):
+    print(f"  {'tap':<11}{'same p5':>9}{'other p95':>11}{'other MAX':>11}{'margin':>9}")
+    for tap in TAPS:
         usable, prs, _, _ = data[tap]
         prs = [(a, b) for (a, b) in prs if a in usable and b in usable]
         s, o = fn(usable, prs)
         summary[(title, tap)] = (s, o)
-        print(f"  {tap:<5}{np.percentile(s, 5):>9.3f}{np.percentile(o, 95):>11.3f}"
+        print(f"  {tap:<11}{np.percentile(s, 5):>9.3f}{np.percentile(o, 95):>11.3f}"
               f"{o.max():>11.3f}{margin(s, o):>+9.3f}")
     print()
-    for tap in ("relu", "bn"):
+    for tap in TAPS:
         s, o = summary[(title, tap)]
         print(f"  --- tap={tap} ---")
         print(describe(s, "same person"))
@@ -215,20 +251,39 @@ for title, fn in MODES:
         print_operating_points(s, o)
 
 header("SEPARABILITY SUMMARY -- higher margin is easier to threshold")
-print(f"  {'mode':<40}{'tap':<6}{'margin':>9}{'other MAX':>11}")
+print(f"  {'mode':<40}{'tap':<11}{'margin':>9}{'other MAX':>11}")
 for title, _ in MODES:
-    for tap in ("relu", "bn"):
+    for tap in TAPS:
         s, o = summary[(title, tap)]
-        print(f"  {title:<40}{tap:<6}{margin(s, o):>+9.3f}{o.max():>11.3f}")
+        print(f"  {title:<40}{tap:<11}{margin(s, o):>+9.3f}{o.max():>11.3f}")
 
-print("\n  Configured thresholds for reference:")
-print("    live.identity.same_camera_threshold  = 0.70")
-print("    live.identity.cross_camera_threshold = 0.60")
-print("    identity.reconcile.same_camera_threshold = 0.90")
+# Read the bars from config rather than restating literals. They were hardcoded
+# here as 0.70 / 0.60 / 0.90, which is a second copy that silently goes stale the
+# moment anyone tunes -- and the whole point of this section is to compare the bars
+# IN FORCE against the distributions just measured.
+print("\n  Configured thresholds IN FORCE, for comparison with the numbers above:")
+try:
+    from _common import load_config
+    _c = load_config() or {}
+    _live = ((_c.get("live") or {}).get("identity") or {})
+    _rec = ((_c.get("identity") or {}).get("reconcile") or {})
+    print(f"    live.identity.same_camera_threshold      = "
+          f"{_live.get('same_camera_threshold')}")
+    print(f"    live.identity.cross_camera_threshold     = "
+          f"{_live.get('cross_camera_threshold')}")
+    print(f"    identity.reconcile.same_camera_threshold = "
+          f"{_rec.get('same_camera_threshold')}   per_camera="
+          f"{_rec.get('per_camera') or '{}'}")
+    print(f"    identity.reconcile.threshold (cross)     = "
+          f"{_rec.get('threshold', (_c.get('identity') or {}).get('threshold'))}")
+    print(f"    identity.reconcile.scoring               = {_rec.get('scoring')}")
+except Exception as _e:                                          # noqa: BLE001
+    print(f"    (could not read config.yaml: {_e})")
 
 header("HOW MUCH OF THIS TO TRUST")
 print("""  MEASURED AND STABLE across sample sizes -- safe to act on:
-    * post-BN beats post-ReLU on margin and lowers the different-person ceiling
+    * (OSNet only) post-BN beats post-ReLU on margin and lowers the
+      different-person ceiling. Not applicable to a backend with no tap choice.
     * consensus scoring lowers the different-person ceiling vs max(proto,exemplar)
     * the different-person ceiling sits WELL ABOVE live.identity.same_camera_threshold
       (0.70), so that threshold is inside the range where strangers score

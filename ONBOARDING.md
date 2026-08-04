@@ -35,11 +35,12 @@ and no external identity service.
 ids) → offline reconcile (final ids, geometric reachability veto) → render`
 
 > **State in one line (2026-08-03):** the FastReID wiring is correct and verifiable
-> (`tools/preflight.py --load-model`); the **thresholds are not** — two people
-> are void because the feature space changed (§3.4) — though the run that seemed to
-> prove it had an unknown headcount, so treat the size of the problem as unmeasured
-> and not geometry. The deployment is an **office where people sit at desks**, which
-> constrains geometry in ways §6.6 spells out.
+> (`tools/preflight.py --load-model`). The **thresholds are void** because the
+> feature space changed (§3.4) — the run that seemed to quantify how badly had an
+> unknown headcount, so treat the *size* of that problem as unmeasured, but the bars
+> genuinely do not belong to the space that is running. The deployment is an
+> **office where people sit at desks**, which constrains geometry in ways §6.6
+> spells out.
 
 ---
 
@@ -276,6 +277,43 @@ Independent evidence that thresholds *are* mis-set — headcount-free, so it sur
   there is headroom in the new space. *(Margins are not comparable across feature
   spaces for judging which model is better; this number is being used only to place a
   bar inside FastReID's own space.)*
+
+### 3.4b Why nothing had been recalibrated: the measurement script was broken
+
+Found 2026-08-03, and it is the direct answer to "have you recalibrated for
+FastReID?" — **no, and one of the two tools needed to do it could not run at all.**
+
+`tests/calibration/measure_score_separation.py` — which `tests/calibration/README.md`
+calls *"the measurement that sets every identity threshold in the system"* — died on
+line 71 under FastReID:
+
+```
+AttributeError: 'Sequential' object has no attribute 'global_avgpool'
+```
+
+It hardcoded torchreid OSNet internals (`model.global_avgpool`, `model.featuremaps`,
+`model.fc[0..2]`) because its original subject was comparing OSNet's post-ReLU tap
+against post-BN. FastReID has no such block and **no selectable tap**, so the
+surgery raised before anything was measured.
+
+So from the backbone switch until 2026-08-03 there was **no way to derive a threshold
+for the backbone actually running.** That is why the bars are still OSNet's. Fixed by
+discovering the tap axis from the backend instead of assuming it: OSNet still gets
+both taps, anything else gets one — `production` — and every other section of the
+script is backend-agnostic and runs unchanged.
+
+**The value of this script is that it needs NO operator labels.** Its
+different-person pairs are *proven* by co-occurrence in a single frame (one body
+cannot be two simultaneous detections), so it sidesteps the ground-truth problem in
+§3.4a entirely — for the same-camera axis.
+
+Its limits, from its own closing section:
+
+- **same-camera only.** Cross-camera same-person scores run lower, so
+  `cross_camera_threshold` cannot be calibrated from a single-camera clip.
+- `other MAX` is an extreme-value statistic that **grows with sample size** — prefer
+  p95.
+- small samples are hypotheses. Read the `SAMPLE:` footnote it prints.
 
 ### 3.4a What is actually needed before any threshold is changed
 
