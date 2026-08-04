@@ -129,6 +129,7 @@ def load_clip_crops(clip_dir):
     import glob
     import json
     out = defaultdict(list)
+    frames = defaultdict(set)
     clips = sorted(glob.glob(os.path.join(clip_dir, "._live_src_*.mp4")))
     if not clips:
         raise SystemExit(f"[decide] no ._live_src_*.mp4 in {clip_dir!r}.")
@@ -162,8 +163,15 @@ def load_clip_crops(clip_dir):
                 if crop is None or crop.size == 0:
                     continue
                 out[key].append(crop)
+                # Frame indices, so CO-PRESENCE is computable. Two tracklets sharing
+                # a frame index in one camera are provably two people -- one body
+                # cannot be two simultaneous detections. Every other same-camera pair
+                # is unlabelled and may be one person returning, so a stranger
+                # statistic over all distinct pairs is an upper bound, not a ceiling.
+                frames[key].add(_i)
         cap.release()
-    return {k: v for k, v in out.items() if len(v) >= MIN_OBS}
+    return ({k: v for k, v in out.items() if len(v) >= MIN_OBS},
+            {k: v for k, v in frames.items() if len(out.get(k, ())) >= MIN_OBS})
 
 
 def score_halves(rows_a, rows_b, mode):
@@ -181,7 +189,7 @@ def main():
     header("PRE-REGISTERED DECISION RULES (stated before any result)")
     print(RULES)
 
-    by_track = load_clip_crops(CLIPS)
+    by_track, frames = load_clip_crops(CLIPS)
     if not by_track:
         raise SystemExit(
             f"[decide] no tracklet in {CLIPS!r} has >= {MIN_OBS} crops at >= "
@@ -234,28 +242,55 @@ def main():
     print("  gained nothing, however much it improved in absolute terms.")
     print()
     strangers = defaultdict(list)
+    copresent = defaultdict(list)
     for cam in sorted({k[0] for k in vecs}, key=str):
         ks = [k for k in vecs if k[0] == cam]
         for i, ka in enumerate(ks):
             for kb in ks[i + 1:]:
+                shared = frames.get(ka, set()) & frames.get(kb, set())
                 for mode, tag in ((PROTOTYPE, "proto"), (MAX_EXEMPLAR, "max_ex"),
                                   (CONSENSUS, "consen")):
-                    strangers[(cam, tag)].append(
-                        score_halves(vecs[ka], vecs[kb], mode))
-    print(f"  {'camera':<12}{'n pairs':>9}{'proto p95':>12}{'max_ex p95':>12}"
-          f"{'consen p95':>12}")
+                    sc = score_halves(vecs[ka], vecs[kb], mode)
+                    strangers[(cam, tag)].append(sc)
+                    if shared:
+                        copresent[(cam, tag)].append(sc)
+
+    def _cell(vals, pct=None):
+        x = np.asarray([v for v in vals if v == v])
+        if not len(x):
+            return "-"
+        return f"{np.percentile(x, pct):.3f}" if pct else f"{x.max():.3f}"
+
+    print("  ALL same-camera distinct pairs -- UNLABELLED, so an upper bound:")
+    print(f"  {'camera':<10}{'n':>5}" + "".join(
+        f"{h:>12}" for h in ("proto p95", "proto MAX", "max_ex p95", "max_ex MAX",
+                             "consen p95", "consen MAX")))
     for cam in sorted({c for c, _ in strangers}, key=str):
-        n = len(strangers[(cam, 'proto')])
-        cells = []
+        row = f"  {cam:<10}{len(strangers[(cam, 'proto')]):>5}"
         for tag in ("proto", "max_ex", "consen"):
-            x = np.asarray([v for v in strangers[(cam, tag)] if v == v])
-            cells.append(f"{np.percentile(x, 95):.3f}" if len(x) else "-")
-        print(f"  {cam:<12}{n:>9}" + "".join(f"{c:>12}" for c in cells))
+            row += (f"{_cell(strangers[(cam, tag)], 95):>12}"
+                    f"{_cell(strangers[(cam, tag)]):>12}")
+        print(row)
     print()
-    print("  NOTE these are ALL same-camera pairs of DISTINCT tracklets, which is a")
-    print("  superset of the co-present ones -- two tracklets at different times can")
-    print("  still be one person. So this p95 is an UPPER bound on the stranger")
-    print("  ceiling, i.e. conservative in the direction that matters.")
+    print("  CO-PRESENT pairs only -- PROVABLY two people. This is the real ceiling,")
+    print("  and the MAX matters as well as p95: a hard veto is judged by its worst")
+    print("  case, while CLAUDE.md section 6.3 prefers p95 because max grows with")
+    print("  sample size. Both are printed so neither can be quoted alone.")
+    print()
+    print(f"  {'camera':<10}{'n':>5}{'proto p95':>11}{'proto MAX':>11}"
+          f"{'max_ex p95':>12}{'max_ex MAX':>12}{'consen p95':>12}{'consen MAX':>12}")
+    for cam in sorted({c for c, _ in copresent}, key=str):
+        n = len(copresent[(cam, "proto")])
+        row = f"  {cam:<10}{n:>5}"
+        for tag in ("proto", "max_ex", "consen"):
+            row += f"{_cell(copresent[(cam, tag)], 95):>11}{_cell(copresent[(cam, tag)]):>11}"
+        print(row)
+    print()
+    print("  READ THIS AGAINST THE LOW CONTROLS. A mode has only helped if the")
+    print("  low-control same-person score clears its OWN camera's co-present MAX.")
+    print("  If max_exemplar lifts the same-person figure and the stranger MAX by")
+    print("  the same amount, the window is still empty and nothing was gained --")
+    print("  that is the 'other MAX' trap (0.819 -> 0.936 at 48 vs 90 frames).")
 
     header("VERDICT")
     arr = {i: np.asarray([r[i] for r in rows], dtype=float) for i in (1, 2, 3, 4)}
