@@ -257,6 +257,8 @@ here can create or merge an identity. It can only refuse a merge.
     src/geometry/recorder.py      the LIVE run's writer -- the only place a position
                                   is ever computed
     tools/fit_floor_frame.py      fits the floor frame from people's own foot points
+    tools/backfill_geometry.py    applies a fresh calibration to a run captured
+                                  BEFORE it existed, so one capture suffices
 
 One formula: `required_speed = distance / elapsed`, vetoed above a speed ceiling.
 At `elapsed ≈ 0` that is "one body cannot be in two places"; at `elapsed > 0` it is
@@ -292,6 +294,27 @@ mistake, because overlapping cameras give a distance near zero.
 Ships disabled (`geometry.enabled`, `geometry.reconcile.enabled` both false).
 File-batch mode records nothing — `IdentityService._commit` stores neither `bbox`
 nor `ts` — so use `--mode live` to run geometry over recorded footage.
+
+### Two clocks — `src/live/frame.py`
+`ts` is stamped once at frame read and answers *"when did this frame reach the
+pipeline"* — the right question for scheduler freshness, writer pacing and the live
+engine's TTLs. For a **live camera** it doubles as "when did this happen", because
+the read follows the event by milliseconds and all cameras share one machine clock.
+
+For a **recorded file it does not.** Frames decode as fast as the disk allows (125+
+fps measured), so `ts` tracks decode progress; two files read in parallel get
+timestamps whose difference reflects *thread scheduling*. Anything cross-camera and
+time-sensitive — the co-presence veto, all of geometry's co-temporal pairing — would
+then rest on invented simultaneity that looks entirely plausible.
+
+So a file source also carries `source_ts = offset + frame_index / source_fps`, and
+**`event_ts()`** is what every "when did this happen" consumer reads: the stored
+payload's `ts`, geometry, and the render sidecar. The machinery deliberately stays on
+`ts` — notably the live engine, whose TTL bookkeeping is paired with
+`sweep(time.time())` and would evict every identity on the first pass if fed media
+time. Its ids are provisional, so that asymmetry costs nothing.
+`live.capture.file_time_offsets` lines up recordings that were not started together.
+Both halves are pinned by `tests/live/test_media_time.py`.
 
 ### render_final_videos — `main.py`
 Second render pass, after reconciliation. The live pass only captured per-frame

@@ -31,9 +31,9 @@ directory with a distinct camera name and a local Qdrant, so it cannot overwrite
 | Script | Asserts? | Produces | Run it when |
 |---|---|---|---|
 | `verify_embedding_contract.py` | **yes**, exits non-zero | Part D | after any change to `reid/extractor.py` or `reid/service.py` |
-| `measure_score_separation.py` | no | H.1, H.2, H.3, H.5 | footage, ReID weights, or feature tap changes |
+| `measure_score_separation.py` | no | H.1, H.2, H.3, H.5 | footage, ReID weights, or feature tap changes. **Could not run on FastReID until 2026-08-04** — it reached into torchreid OSNet's `fc` block for its tap comparison, so it raised before measuring anything. The tap axis is now discovered from the backend: OSNet gets both taps, anything else gets one (`production`) |
 | `compare_backbones.py` | no | — | before changing `reid.model`; ranks backbones with threshold-FREE metrics (AUC, R@1) because a cosine bar means nothing across feature spaces. Refuses to name a winner when the footage saturates |
-| `measure_reconcile_thresholds.py` | no | H.4 | before touching any `identity.reconcile.*` threshold |
+| `measure_reconcile_thresholds.py` | no | H.4 | before touching any `identity.reconcile.*` threshold. Backend-agnostic (uses `extract_batch`), so it always worked. **This is the one that produced the FastReID re-anchoring measurement** recorded beside `same_camera_threshold` in `config.yaml` |
 | `measure_detection.py` | no | H.6, H.7 | before proposing any detector-side change |
 | `compare_detector_models.py` | no | H.11 | before changing `detector.model`; answers recall AND whether extra boxes become sustained tracks |
 | `analyze_decision_log.py` | no | J.6, J.10 | after every live run — it is how a threshold change is judged |

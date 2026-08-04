@@ -404,6 +404,67 @@ identity:
                              # spanning cameras, which breaks the product claim.
     same_camera_threshold: 0.90  # stricter merge for fragmented tracks in one camera.
                                  # GLOBAL DEFAULT -- per_camera below overrides it.
+    # ┌──────────────────────────────────────────────────────────────────────────┐
+    # │ MEASURED IN FASTREID SPACE, 2026-08-04. THIS VALUE IS TOO STRICT.        │
+    # │ Value NOT changed -- see "why not changed yet" at the bottom.            │
+    # └──────────────────────────────────────────────────────────────────────────┘
+    # First re-anchoring measurement since the backbone switch. Until 2026-08-04 it
+    # could not be taken at all: measure_score_separation.py crashed on FastReID
+    # (it reached into torchreid OSNet's `fc` block for its tap comparison), so
+    # there was no way to derive a threshold for the model actually running. Fixed;
+    # both scripts below now run on any backend.
+    #
+    #   python tests/calibration/measure_reconcile_thresholds.py register_file.avi 48 4
+    #   python tests/calibration/measure_score_separation.py   register_file.avi 48 6
+    #
+    # A. SAME PERSON, prototype vs prototype (one track split into two DISJOINT
+    #    halves -- exactly what a dropped-then-reacquired track looks like):
+    #        0.75 -> 100.0% of fragments merge
+    #        0.80 -> 100.0%
+    #        0.85 ->  75.0%
+    #        0.90 ->  50.0%   <-- THE CONFIGURED VALUE. Half are refused.
+    #        0.95 ->  25.0%
+    #
+    # B. DIFFERENT PEOPLE, proven distinct by co-occurrence in one frame (needs no
+    #    operator labels -- one body cannot be two simultaneous detections):
+    #        n=6  mean=0.276  p95=0.427  MAX=0.434
+    #        0% wrong merges at 0.63 AND at 0.90 -- strangers are nowhere near.
+    #
+    # C. THE WINDOW:
+    #        same-person fragments  min=0.810  p5=0.821
+    #        different people       MAX=0.434  p95=0.427
+    #        any bar in (0.434, 0.810) is PERFECT on this sample.
+    #        0.90 is OUTSIDE it, above the fragment distribution.
+    #
+    # Corroborated independently by measure_score_separation.py on the same clip:
+    # the different-person ceiling is ~0.46-0.50 across all four scoring modes and
+    # STABLE between 24 and 48 frames (prototype MAX 0.503 -> 0.477), while
+    # same-person p5 is 0.594. The feature space itself confirms the old bars do not
+    # belong here: 62.2% of dimensions NEGATIVE and 0% exactly zero, against OSNet
+    # post-ReLU's 0% negative / 21% zero.
+    #
+    # WHICH VALUE THE EVIDENCE SUPPORTS: 0.80, not the window's midpoint. The two
+    # failure modes are asymmetric -- too low fuses two people (unrecoverable), too
+    # high splits one person (reconcile can still fix it) -- so per the "prefer a
+    # split" bias, pick near the TOP of the window. 0.80 still merges 100% of
+    # fragments and keeps +0.37 of headroom over the measured stranger MAX for when
+    # the sample grows. Note cam_213 and cam_224 already override to exactly 0.80,
+    # so this would only move cam_219 and cam_206.
+    #
+    # WHY NOT CHANGED YET: `MAX` grows with sample size and n=6 proven-distinct
+    # pairs is small, so the window's LOWER edge is soft (its upper edge, from the
+    # fragment distribution, is the one that bounds the bar and is the side that
+    # matters). More importantly, a bar must be watched on video before it ships --
+    # two settings previously chosen from numbers alone made the videos worse. Rank
+    # first, then look:
+    #   python tests/calibration/sweep_reconcile_thresholds.py <run_id> \
+    #     --same "cam_219=0.90,cam_224=0.80 ; cam_219=0.80,cam_224=0.80"
+    #   python tests/calibration/rerender_from_clips.py <run_id> --same "cam_219=0.80,cam_224=0.80"
+    # Then move the value and this block TOGETHER.
+    #
+    # ALSO SUPERSEDED IF YOU DO: the note under per_camera below says cam_219 is
+    # "deliberately LEFT at the global 0.90". That was written in OSNet space about a
+    # July run, and lowering the global overrides it.
 
     # PER-CAMERA same-camera bars (REMEDIATION_PLAN.md #40). Only
     # `same_camera_threshold` is honoured here; any other key is IGNORED with a

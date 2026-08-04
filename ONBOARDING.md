@@ -379,6 +379,89 @@ All git-tracked, so recoverable; none was on the product path.
 
 ---
 
+## 3.8 SESSION LOG — everything that changed on 2026-08-03/04
+
+Written for chat migration: if you are a fresh session, this is what the previous one
+did and what it concluded. Nothing here is a plan; it all landed.
+
+### Code added
+
+| path | what |
+|---|---|
+| `src/geometry/calibration.py` | floor-frame record + the metric-scale guard (`MetricScaleUnavailable`) |
+| `src/geometry/floor.py` | bbox → point on a shared floor; owns the homography and every refusal |
+| `src/geometry/reachability.py` | `required_speed = distance / elapsed` vs a measured ceiling. Imports nothing else from `geometry/` — that is what lets reconcile use it |
+| `src/geometry/recorder.py` | the LIVE run's writer, the only place a position is ever computed |
+| `src/quiet.py` | `suppressed_native_stderr()` — silences the codec probe's C++ stderr |
+| `tools/fit_floor_frame.py` | fits the floor frame from people's own foot points on a finished run |
+| `tools/backfill_geometry.py` | applies a fresh calibration to a run captured before it existed, so ONE capture suffices |
+| `tools/preflight.py` | verifies the configured stack; exits non-zero on silent-garbage conditions |
+
+### Code changed
+
+- **`src/identity/reconcile.py`** — consumes recorded geometry as a hard
+  `GEOMETRIC_UNREACHABLE` veto. Added `resolve_geometry_policy`,
+  `build_speed_envelope`, `closest_pairings`, `reachability_verdict`; `_gather_tracklets`
+  now collects the `floor` rows; `conflict_reason` checks geometry first and returns
+  the *actual* blocking gate (it used to hardcode the same-camera one in Phase 1).
+- **Media time** (`src/live/frame.py`, `capture.py`, `decode_backend.py`,
+  `identity_stage.py`, `render.py`) — `Frame.source_ts` / `event_ts()`. A file's `ts`
+  tracks decode speed, so two files read in parallel got timestamps differing by
+  *thread scheduling*; every cross-camera temporal rule would have been built on
+  invented simultaneity. Also `live.capture.file_time_offsets`.
+- **The annotations sidecar now records `frame_ts`** per frame. Its absence is why the
+  wiped runs' surviving clips cannot be replayed for geometry.
+- **`tests/calibration/measure_score_separation.py`** — see §3.4b. It could not run on
+  FastReID at all.
+- **`_common.py`** — `--geometry` / `--no-geometry` / `--geometry-safety` on all four
+  reconcile-replaying tools; **`explain_merge_failure.py`** taught the new gate, or it
+  would report "no rule refused" about a geometrically vetoed pair.
+
+### Code removed (all git-tracked, recoverable)
+
+`click_covisible_points.py`, `measure_covisible_geometry.py`, `crop_saver.py` + its
+`main.py` wiring + the `crops:` config block, five demo scripts that read `crops/`
+folders nothing writes, `diagnose.py`, `measure_pose_ensemble.py`.
+
+### Tests: 19 files, all passing
+
+New: `test_geometry_reachability.py` (30 checks), `test_geometry_floor_frame.py` (37),
+`test_geometry_not_recomputed.py` (24 — the AST invariant), `test_media_time.py` (17).
+
+### Two bugs the tests caught in the new code
+
+1. Same-timestamp pairs returned `UNAVAILABLE` — silently discarding the *strongest*
+   signal the check has.
+2. `position_error_units` must be **≥** the real cross-camera disagreement for one
+   person, or the same-instant rule vetoes every true co-visible match. The fit now
+   derives it from the held-out reprojection p95, which *is* that disagreement.
+
+### What was retracted
+
+The claim "run `20260803_121136` turned two people into 21 identities". The headcount
+was never established — two were co-visible, others were around. See §3.4. Every
+count-based conclusion from that run is unproven; what survives is label-free.
+
+### What is NOT done
+
+- **No threshold value has been changed.** The measurement is recorded beside
+  `identity.reconcile.same_camera_threshold` in `config.yaml`; the value is still 0.90.
+- Geometry has **never run on real data** — no calibration record exists. Both switches
+  ship `false`.
+- The floor-frame fit has **failed twice** on degenerate footage (§6.3).
+- `cross_camera_threshold` is un-recalibrated and cannot be done from a single-camera
+  clip.
+- **Commits are local only.** No git credentials in the previous session's environment;
+  `./deploy.sh` (from the dev box) or `git push` is a human action.
+
+### The one number that matters most
+
+At `same_camera_threshold: 0.90`, **50% of genuine same-person fragments do not
+merge**, and any bar in **(0.434, 0.810)** is perfect on the sample. The bar sits above
+that window. Evidence and the recommended 0.80 are in `config.yaml`.
+
+---
+
 ## 4. The document map
 
 | Document | What it is | Read when |

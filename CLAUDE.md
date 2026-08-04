@@ -79,6 +79,30 @@ wrong means the number is not the variable.
 So: do not propose a threshold change as a fix. Fix the scoring, or add a physical
 guard, and re-anchor bars only afterwards.
 
+## 3a. The one measurement that exists in FastReID space (2026-08-04).
+
+`identity.reconcile.same_camera_threshold` is **0.90 and too strict**. Measured on
+`register_file.avi` with `measure_reconcile_thresholds.py`, prototype vs prototype:
+
+```
+same-person fragments merging   0.75 →100%   0.80 →100%   0.85 →75%   0.90 →50%
+different people (proven distinct by co-occurrence)   n=6  p95=0.427  MAX=0.434
+=> any bar in (0.434, 0.810) is perfect on this sample; 0.90 is ABOVE it
+```
+
+The evidence supports **0.80** — near the top of the window, because too low fuses
+two people (unrecoverable) while too high splits one (recoverable). `cam_213` and
+`cam_224` already override to 0.80, so it would only move `cam_219`/`cam_206`.
+
+**The value has NOT been changed**, because a bar must be watched on video first
+(§4). Full evidence sits beside the key in `config.yaml`. `cross_camera_threshold`
+cannot be derived from a single-camera clip and remains un-recalibrated.
+
+**A calibration script that cannot run on the shipping backbone is why nothing had
+been recalibrated.** `measure_score_separation.py` crashed on FastReID until
+2026-08-04 — it reached into torchreid OSNet's `fc` block. If a measurement seems
+never to have been taken, check that its script still runs on the current model.
+
 ## 4. A cluster count cannot tell you whether a cluster is one person or three.
 
 Every number quoted for the 2026-07-30 threshold change was **equally consistent
@@ -156,6 +180,11 @@ in doubt, raise `geometry.reconcile.safety_factor`; never lower it.
 - **File-batch mode records no geometry** — `IdentityService._commit` stores neither
   `bbox` nor `ts`. To run geometry over recorded footage use `--mode live` on the
   files.
+- **A veto's error budget must be checked against a SYSTEMATIC error, not just a
+  noisy one.** The geometric check takes a median over pairings, which defends
+  against one bad foot point but *not* against someone seated for a whole tracklet —
+  every pairing is then wrong in the same direction. The deployment is an office
+  where people sit, so this matters; nothing currently detects "not standing".
 - **Never re-add `tests/live/_synth.py` to `.gitignore`.** It was untracked while
   its importers were tracked, and `python tests/run_all.py` failed on every fresh
   clone.

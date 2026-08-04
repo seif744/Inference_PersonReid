@@ -645,6 +645,7 @@ src/
     reconcile.py                 offline cross-camera reconciliation (used by BOTH paths)
     decision_log.py              every merge decision, accepted and rejected, with all gates
     DESIGN.md                    why the layers are separated
+  quiet.py                    silence a C library's stderr for one expected-to-fail call
   geometry/                   IS a merge physically possible? (a CHECK, not a tracker)
     calibration.py             the floor-frame record + the metric-scale guard
     floor.py                    bbox -> point on a shared floor (owns the homography)
@@ -660,7 +661,9 @@ src/
 tests/live/                  deterministic logic tests (synthetic; no GPU/models needed)
 tests/calibration/           measurements on REAL footage (see its README)
 tools/
+  preflight.py               verify the configured stack BEFORE a run (run this first)
   fit_floor_frame.py         fit the floor frame from people's own foot points
+  backfill_geometry.py       give an already-captured run its floor positions
 ```
 
 Also at the root: `deploy.sh` — rsyncs the code (no venv/videos/store) to a GPU
