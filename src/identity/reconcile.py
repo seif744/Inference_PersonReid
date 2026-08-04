@@ -468,6 +468,32 @@ def _view_medoid_score(rows_a, rows_b, proto, k, cap):
 
     Never below `prototype`: with one group per side this IS prototype, so the mode
     can only add evidence, never remove it.
+
+    ================== MEASURED 2026-08-04, AND IT FAILED ======================
+    Do not reach for this mode expecting it to fix the cam_219 inversion. It does
+    not. Measured on run 20260804_094039 against the CO-PRESENT stranger reference
+    (provably two people, n=7 in cam_219):
+
+        cam_219                     proto   max_ex   consen   vmedoid
+          low control :6            0.622    0.944    0.703     0.732
+          low control :14           0.594    0.809    0.609     0.728
+          co-present stranger MAX   0.694    0.734    0.686     0.747
+
+    Both low controls land BELOW view_medoid's own stranger MAX, so cam_219 stays
+    INVERTED and the usable window stays empty. max_exemplar is the only mode that
+    clears the stranger MAX in every camera (+0.075 cam_219, +0.212 cam_224,
+    +0.280 cam_213).
+
+    WHY IT FAILED, which is the useful part. The design assumed group MEANS would be
+    less extreme than single observations, so the max over them would inflate less.
+    That is wrong: averaging DENOISES, and it denoises stranger clusters exactly as
+    much as same-person ones. Two genuinely similar clusters of different people
+    score HIGHER as means than any individual pair of their crops does -- which is
+    why view_medoid's stranger MAX (0.747) came out ABOVE max_exemplar's (0.734)
+    while its same-person score came out 0.08 LOWER. It gave up signal and kept the
+    inflation. Kept in the codebase because the negative result is worth more than
+    the code: any future "average within groups to reduce noise" idea inherits this
+    failure mode.
     """
     ga = _view_split(_subsample_rows(rows_a, cap), int(k))
     gb = _view_split(_subsample_rows(rows_b, cap), int(k))
