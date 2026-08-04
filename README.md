@@ -164,7 +164,7 @@ compatibility, but `reid_id` is the label the pipeline presents. Full per-stage 
 - **One or more video files** (e.g. `.avi`, `.mp4`) **or RTSP/HTTP stream URLs**.
 - **CPU** is fine for file inputs, development, and the (synthetic) logic tests.
   **Live RTSP in real time needs a GPU** — the live pipeline was developed and
-  validated on an **NVIDIA A100** server (it auto-detects the device). CPU drops
+  validated on an **NVIDIA A6000** server (it auto-detects the device). CPU drops
   too many frames to keep up with live streams or to judge live reid quality;
   never benchmark the live path on CPU.
 
@@ -212,7 +212,7 @@ installs automatically.
 > machines — the *same* `pip install -r requirements.txt` is correct on the CPU
 > dev box and on the GPU server.
 
-> **2. On the A100 server.** Same install, no extra step — the server only needs
+> **2. On the A6000 server.** Same install, no extra step — the server only needs
 > a compatible NVIDIA driver for the bundled CUDA runtime to work. Check it with
 > `nvidia-smi`, and confirm torch can see the GPU with
 > `python -c "import torch; print(torch.cuda.is_available())"`. If that prints
@@ -701,7 +701,7 @@ implemented. The following are deferred — documented but not built:
 Built but **off by default**: the camera transition graph
 ([`src/live/topology.py`](src/live/topology.py), `live.topology.enabled: false`)
 vetoes cross-camera matches that would need faster-than-possible transit between
-cameras. It was A100-tested and disabled: with these four cameras the views are
+cameras. It was A6000-tested and disabled: with these four cameras the views are
 adjacent/overlapping, so the minimum transit time is ~0 and the veto pruned true
 matches instead of false ones. Turn it on only for cameras with a real physical
 gap between their fields of view.

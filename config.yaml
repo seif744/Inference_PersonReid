@@ -356,12 +356,33 @@ identity:
   # which the sticky live decision cannot catch.
   reconcile:
     enabled: true
-    threshold: 0.63          # prototype cosine to merge cross-camera; blank = use
-                             # identity.threshold. Set explicitly here because this
-                             # runs independently of the verifier (see verifier.py) --
-                             # it must be recalibrated whenever identity.threshold is.
+    threshold: 0.45          # cross-camera merge bar, in CONSENSUS space -- see
+                             # `scoring` below, which moved to consensus in the same
+                             # change. Blank = use identity.threshold. Set explicitly
+                             # here because this runs independently of the verifier
+                             # (see verifier.py) -- it must be recalibrated whenever
+                             # identity.threshold is.
                              #
-                             # THE VALUE IS 0.63 AND THE MEASUREMENT BELOW SAYS 0.70.
+                             # 0.45 MEASURED 2026-08-04 on run 20260803_131521 with
+                             # sweep_reconcile_thresholds.py --scoring consensus, at
+                             # this file's consensus_top_frac 0.25, i.e. the estimator
+                             # that actually ships:
+                             #   0.40 -> 27 ids, max 3, multi 8, lowest accepted 0.453
+                             #   0.45 -> 27 ids, max 3, multi 8, lowest accepted 0.453
+                             #   0.50 -> 29 ids, max 3, multi 6
+                             #   0.55 -> 31 ids, max 3, multi 4
+                             # 0.40 and 0.45 are BYTE-IDENTICAL, so the answer is
+                             # insensitive across that span; 0.45 is its top edge, the
+                             # highest bar that keeps every link. Above 0.50 the
+                             # cam_219 <-> cam_224 pairings start dying off.
+                             #
+                             # EVERYTHING BELOW THIS LINE IS PROTOTYPE-SPACE HISTORY.
+                             # Kept because the measurements were real, but none of it
+                             # constrains the value above -- consensus is a different
+                             # scale, and comparing a score across modes is the same
+                             # error as comparing one across backbones.
+                             #
+                             # THE VALUE WAS 0.63 AND THE MEASUREMENT BELOW SAYS 0.70.
                              # That is not an oversight in the measurement, it is a
                              # revert: commit a77895fe ("back to run 2's reconcile
                              # settings") put this number back to 0.63 and left the
@@ -569,13 +590,42 @@ identity:
     # Part H agrees independently: consensus had the lowest different-person
     # ceiling of the three modes at both sample sizes.
     #
-    # STILL `prototype` HERE because CHANGING THE MODE VOIDS EVERY THRESHOLD above
-    # -- each mode has its own scale. Test on a captured run first, which needs no
-    # camera time now that clips are kept:
-    #   python tests/calibration/sweep_reconcile_thresholds.py <run_id> --scoring consensus --cross 0.60,0.70,0.80
-    #   python tests/calibration/rerender_from_clips.py <run_id> --scoring prototype,consensus
-    # then set the mode AND its re-derived bars together.
-    scoring: prototype
+    # CHANGED TO `consensus` 2026-08-04, together with `threshold` above (0.63 ->
+    # 0.45) because each mode has its own scale and the two must move as one.
+    #
+    # THE SYMPTOM IT FIXES, reported by the operator: one person carried a DIFFERENT
+    # reid in cam_219 than in cam_224, front angle vs back angle, and offline
+    # reconcile did not repair it. That is this block's opening paragraph happening
+    # in production -- and cam_219 + cam_224 SHARE A ROOM, so they see opposite sides
+    # of the same person AT THE SAME INSTANT. A mean over front and back views is
+    # then the worst possible summary, systematically, not occasionally.
+    #
+    # MEASURED on run 20260803_131521 (3 cameras, 1753 observations) with
+    # sweep_reconcile_thresholds.py --scoring prototype,consensus. The sweep reads
+    # consensus_top_frac from this file, so its consensus rows ARE this estimator:
+    #
+    #   prototype, cross 0.50..0.80 : max cluster stays 7 at EVERY bar
+    #   consensus, cross 0.40..0.80 : max cluster is 3 at EVERY bar
+    #
+    # Under prototype, cam_224's tracklets 1/48/79/103 were welded together
+    # same-camera and no cross-camera bar could separate them -- exactly the "a
+    # cluster welded inside a camera cannot be split by any cross bar" case. That
+    # weld is why cam_219 had nothing to link to. Under consensus the weld does not
+    # form at any bar, and each cam_219 tracklet pairs with ONE cam_224 tracklet:
+    #   219(49)->224(48)  219(10)->224(79)  219(11)->224(5)   219(12)->224(3)
+    #   219(85)->224(77)  219(112)->224(103) 219(116)->224(1)
+    # Four of those pairings (112/103, 116/1, 12/3, 10/79) prototype never made at
+    # ANY threshold.
+    #
+    # NOT EVIDENCE, deliberately: the identity COUNT. People walk in and out of this
+    # room, so no run has a count to hit, and CLAUDE.md section 4 is the standing
+    # reminder that a count cannot tell one person from three.
+    #
+    # STILL UNVERIFIED, and the reason to watch the next run's video: whether the
+    # clusters above are correct, and consensus's own different-person ceiling, which
+    # has never been measured in FastReID space. Re-derive the same-camera bars too --
+    # consensus also re-pairs cam_213 (88+93 under prototype, 88+119 here).
+    scoring: consensus
     consensus_top_frac: 0.25   # what FRACTION of observation pairs must agree.
                                # Part H's "top half" was measured on whole tracks,
                                # where most view pairs match; between a mostly-front
