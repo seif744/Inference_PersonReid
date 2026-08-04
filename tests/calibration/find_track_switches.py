@@ -66,7 +66,7 @@ from identity.reconcile import _prototype                              # noqa: E
 from types import SimpleNamespace                                      # noqa: E402
 
 FLAGS = ("--clips", "--cam", "--min-height", "--min-obs", "--max-per-track",
-         "--device", "--edge", "--flag-gap", "--seed")
+         "--device", "--edge", "--min-side-frac", "--flag-gap", "--seed")
 validate_flags(FLAGS)
 
 CLIPS = arg("--clips", ".")
@@ -81,6 +81,19 @@ MAX_PER_TRACK = int(arg("--max-per-track", "40"))
 DEVICE = arg("--device", "cuda")
 # Both sides of a cut need enough observations for a prototype to mean anything.
 EDGE = int(arg("--edge", "3"))
+# ...and a FRACTION, which is the part that matters. With edge=3 alone the scan was
+# free to cut off the first or last three crops, and on run 20260804_094039 that is
+# where it landed for almost every "suspect": 3, 4, 5, 34 or 37 out of 40. Those are
+# exactly the frames where a person is entering or leaving view -- clipped by the
+# frame boundary, occluded, motion-blurred -- so a 3-crop prototype built from them
+# disagrees with everything and the scan reported entry/exit noise as a switch.
+# cam_213:19 took the highest gap of all 36 tracklets (0.746) cutting at 5/40, while
+# its contact sheet shows one person in a patterned shirt throughout.
+#
+# A real switch divides a track into two SUBSTANTIAL parts, so requiring both sides
+# to hold this fraction of the observations costs nothing real and removes the
+# artifact. 0.25 still finds a switch anywhere in the middle half of a track.
+MIN_SIDE_FRAC = float(arg("--min-side-frac", "0.25"))
 FLAG_GAP = float(arg("--flag-gap", "0.20"))
 SEED = int(arg("--seed", "1234"))
 
@@ -128,9 +141,12 @@ def load_clip_crops(clip_dir):
 
 
 def scan(v):
-    """-> (min_score, best_k, curve) over every split point with EDGE on each side."""
+    """-> (min_score, best_k, curve) over cuts leaving a real tracklet on both sides."""
+    lo = max(EDGE, int(round(len(v) * MIN_SIDE_FRAC)))
+    if len(v) - lo < lo:
+        return None
     scores, ks = [], []
-    for k in range(EDGE, len(v) - EDGE + 1):
+    for k in range(lo, len(v) - lo + 1):
         pa, pb = _prototype(v[:k]), _prototype(v[k:])
         if pa is None or pb is None:
             continue
@@ -168,7 +184,7 @@ def main():
     header("SETUP")
     print(f"  ReID: {ex.describe()}")
     print(f"  min_height={MIN_HEIGHT:.0f} min_obs={MIN_OBS} cap={MAX_PER_TRACK} "
-          f"edge={EDGE} flag_gap={FLAG_GAP}")
+          f"edge={EDGE} min_side_frac={MIN_SIDE_FRAC} flag_gap={FLAG_GAP}")
     print(f"  {len(by_track)} tracklet(s)")
 
     header("SCAN -- the split point that MINIMISES similarity within each track")
