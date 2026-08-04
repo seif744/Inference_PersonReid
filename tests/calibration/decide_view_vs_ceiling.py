@@ -71,7 +71,7 @@ bootstrap()
 from reid.extractor import ReIDExtractor                               # noqa: E402
 from detector import crop_person                                       # noqa: E402
 from identity.reconcile import (score_observation_sets, _prototype,     # noqa: E402
-                                PROTOTYPE, MAX_EXEMPLAR, CONSENSUS)
+                                PROTOTYPE, MAX_EXEMPLAR, CONSENSUS, VIEW_MEDOID)
 from types import SimpleNamespace                                      # noqa: E402
 
 FLAGS = ("--clips", "--cam", "--min-height", "--min-obs", "--max-per-track",
@@ -217,7 +217,7 @@ def main():
     print("  temporal = first half vs second half. random = same observations,")
     print("  shuffled partition, so temporal structure is destroyed and nothing else.")
     print()
-    print(f"  {'tracklet':<16}{'proto':>8}{'max_ex':>9}{'consen':>9}"
+    print(f"  {'tracklet':<16}{'proto':>8}{'max_ex':>9}{'consen':>9}{'vmedoid':>9}"
           f"{'rand_proto':>12}{'rand-temp':>11}")
 
     rng = random.Random(SEED)
@@ -229,12 +229,13 @@ def main():
         p = score_halves(a, b, PROTOTYPE)
         mx = score_halves(a, b, MAX_EXEMPLAR)
         cs = score_halves(a, b, CONSENSUS)
+        vm = score_halves(a, b, VIEW_MEDOID)
         idx = list(range(len(v)))
         rng.shuffle(idx)
         ra, rb = v[idx[:mid]], v[idx[mid:]]
         rp = score_halves(ra, rb, PROTOTYPE)
-        rows.append((key, p, mx, cs, rp))
-        print(f"  {key[0]}:{key[1]:<8}{p:>8.3f}{mx:>9.3f}{cs:>9.3f}"
+        rows.append((key, p, mx, cs, rp, vm))
+        print(f"  {key[0]}:{key[1]:<8}{p:>8.3f}{mx:>9.3f}{cs:>9.3f}{vm:>9.3f}"
               f"{rp:>12.3f}{rp - p:>11.3f}")
 
     # Stranger reference: co-present tracklets in one camera are provably two people.
@@ -251,7 +252,7 @@ def main():
             for kb in ks[i + 1:]:
                 shared = frames.get(ka, set()) & frames.get(kb, set())
                 for mode, tag in ((PROTOTYPE, "proto"), (MAX_EXEMPLAR, "max_ex"),
-                                  (CONSENSUS, "consen")):
+                                  (CONSENSUS, "consen"), (VIEW_MEDOID, "vmed")):
                     sc = score_halves(vecs[ka], vecs[kb], mode)
                     strangers[(cam, tag)].append(sc)
                     if shared:
@@ -266,10 +267,10 @@ def main():
     print("  ALL same-camera distinct pairs -- UNLABELLED, so an upper bound:")
     print(f"  {'camera':<10}{'n':>5}" + "".join(
         f"{h:>12}" for h in ("proto p95", "proto MAX", "max_ex p95", "max_ex MAX",
-                             "consen p95", "consen MAX")))
+                             "consen p95", "consen MAX", "vmed p95", "vmed MAX")))
     for cam in sorted({c for c, _ in strangers}, key=str):
         row = f"  {cam:<10}{len(strangers[(cam, 'proto')]):>5}"
-        for tag in ("proto", "max_ex", "consen"):
+        for tag in ("proto", "max_ex", "consen", "vmed"):
             row += (f"{_cell(strangers[(cam, tag)], 95):>12}"
                     f"{_cell(strangers[(cam, tag)]):>12}")
         print(row)
@@ -280,11 +281,12 @@ def main():
     print("  sample size. Both are printed so neither can be quoted alone.")
     print()
     print(f"  {'camera':<10}{'n':>5}{'proto p95':>11}{'proto MAX':>11}"
-          f"{'max_ex p95':>12}{'max_ex MAX':>12}{'consen p95':>12}{'consen MAX':>12}")
+          f"{'max_ex p95':>12}{'max_ex MAX':>12}{'consen p95':>12}{'consen MAX':>12}"
+          f"{'vmed p95':>11}{'vmed MAX':>11}")
     for cam in sorted({c for c, _ in copresent}, key=str):
         n = len(copresent[(cam, "proto")])
         row = f"  {cam:<10}{n:>5}"
-        for tag in ("proto", "max_ex", "consen"):
+        for tag in ("proto", "max_ex", "consen", "vmed"):
             row += f"{_cell(copresent[(cam, tag)], 95):>11}{_cell(copresent[(cam, tag)]):>11}"
         print(row)
     print()
@@ -295,11 +297,11 @@ def main():
     print("  that is the 'other MAX' trap (0.819 -> 0.936 at 48 vs 90 frames).")
 
     header("VERDICT")
-    arr = {i: np.asarray([r[i] for r in rows], dtype=float) for i in (1, 2, 3, 4)}
+    arr = {i: np.asarray([r[i] for r in rows], dtype=float) for i in (1, 2, 3, 4, 5)}
     low = [r for r in rows if r[1] == r[1] and r[1] < 0.70]
     print(f"  n = {len(rows)} tracklet(s);  {len(low)} with prototype control < 0.70")
     for i, name in ((1, "prototype"), (2, "max_exemplar"), (3, "consensus"),
-                    (4, "random prototype")):
+                    (5, "view_medoid"), (4, "random prototype")):
         x = arr[i][~np.isnan(arr[i])]
         print(f"    {name:<18} all: mean={x.mean():.3f} min={x.min():.3f}")
     if not low:
@@ -315,8 +317,11 @@ def main():
     print(f"    prototype        mean={lp.mean():.3f}")
     print(f"    max_exemplar     mean={lm.mean():.3f}   <- the deciding number")
     print(f"    random prototype mean={lr.mean():.3f}")
-    for k, p, mx, cs, rp in low:
-        print(f"      {k[0]}:{k[1]:<8} proto={p:.3f} max_ex={mx:.3f} rand={rp:.3f}")
+    lv = np.asarray([r[5] for r in low], dtype=float)
+    print(f"    view_medoid      mean={lv.mean():.3f}")
+    for k, p, mx, cs, rp, vm in low:
+        print(f"      {k[0]}:{k[1]:<8} proto={p:.3f} max_ex={mx:.3f} "
+              f"vmedoid={vm:.3f} rand={rp:.3f}")
 
     print()
     if lm.mean() >= 0.85:

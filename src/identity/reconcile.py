@@ -256,6 +256,11 @@ def resolve_reconcile_kwargs(cfg, log=print):
         "min_tracklet_observations": int(recon.get("min_tracklet_observations", 3)),
         "scoring": recon.get("scoring", PROTOTYPE),
         "consensus_top_frac": float(recon.get("consensus_top_frac", 0.25)),
+        # How many VIEW groups a tracklet is split into under scoring=view_medoid.
+        # 2 is the front/back case the split-half measurement found; higher values
+        # add draws to the max, and `other MAX` grows with draws, so raise it only
+        # with the stranger reference in hand.
+        "view_medoid_k": int(recon.get("view_medoid_k", 2)),
         "max_observations_per_side": int(recon.get("max_observations_per_side", 64)),
         "covisibility": resolve_covisibility(recon, log=log),
         "same_camera_reciprocal_best": bool(
@@ -283,6 +288,7 @@ def describe_reconcile_kwargs(kw):
            if per_cam else "")
         + f" scoring={kw['scoring']}"
         + (f"/top_frac={kw['consensus_top_frac']}" if kw["scoring"] == CONSENSUS else "")
+        + (f"/k={kw.get('view_medoid_k')}" if kw["scoring"] == VIEW_MEDOID else "")
         + f" min_obs={kw['min_tracklet_observations']}"
         f" reciprocal={'on' if kw['require_reciprocal_best'] else 'OFF'}"
         f" same_reciprocal={'on' if kw['same_camera_reciprocal_best'] else 'OFF'}"
@@ -348,7 +354,8 @@ def strictest_same_camera_bar(cameras, per_camera, default):
 PROTOTYPE = "prototype"
 MAX_EXEMPLAR = "max_exemplar"
 CONSENSUS = "consensus"
-SCORING_MODES = (PROTOTYPE, MAX_EXEMPLAR, CONSENSUS)
+VIEW_MEDOID = "view_medoid"
+SCORING_MODES = (PROTOTYPE, MAX_EXEMPLAR, CONSENSUS, VIEW_MEDOID)
 
 
 def _unit_rows(vectors):
@@ -370,7 +377,8 @@ def _subsample_rows(mat, cap):
 
 
 def score_observation_sets(rows_a, rows_b, proto_a, proto_b,
-                           mode=PROTOTYPE, top_frac=0.25, cap=64):
+                           mode=PROTOTYPE, top_frac=0.25, cap=64,
+                           view_medoid_k=2):
     """Similarity between two sets of observations, under one scoring mode.
 
     prototype     -- cosine of the two means. What reconcile has always used.
@@ -400,6 +408,8 @@ def score_observation_sets(rows_a, rows_b, proto_a, proto_b,
     proto = float(proto_a @ proto_b)
     if mode == PROTOTYPE:
         return proto
+    if mode == VIEW_MEDOID:
+        return _view_medoid_score(rows_a, rows_b, proto, view_medoid_k, cap)
     sims = _subsample_rows(rows_a, cap) @ _subsample_rows(rows_b, cap).T
     if mode == MAX_EXEMPLAR:
         return max(proto, float(sims.max()))
@@ -409,6 +419,69 @@ def score_observation_sets(rows_a, rows_b, proto_a, proto_b,
         return float(flat[:k].mean())
     raise ValueError(f"unknown reconcile scoring mode {mode!r}; "
                      f"expected one of {list(SCORING_MODES)}")
+
+
+def _view_split(rows, k):
+    """Split observations into k VIEW groups along their dominant variation axis.
+
+    DETERMINISTIC BY CONSTRUCTION, which k-means is not. A replay has to reproduce
+    the score exactly (same reason _subsample_rows is evenly spaced and never
+    random), so this projects onto the top principal direction -- found by fixed
+    power iteration from a fixed start -- sorts by that projection and cuts into k
+    contiguous equal groups. No seed, no initialisation, no convergence test.
+
+    WHY THE PRINCIPAL DIRECTION IS THE RIGHT AXIS. Measured on run 20260804_094039:
+    a tracklet's two temporal halves score 0.594 while a RANDOM half-split of the
+    same observations scores 0.942 -- so the within-tracklet variation is large and
+    ORDERED, i.e. the person's appearance changes as they turn. The direction of
+    greatest variance is that change. Splitting along it separates front from back;
+    splitting at random would mix them, which is exactly what the mean does.
+    """
+    m = np.asarray(rows, dtype=np.float32)
+    if m.ndim != 2 or m.shape[0] < 2 * k or k < 2:
+        return [m]
+    centred = m - m.mean(axis=0, keepdims=True)
+    v = centred[0]
+    n = float(np.linalg.norm(v))
+    if n == 0:
+        return [m]
+    v = v / n
+    for _ in range(8):                       # fixed count: determinism over precision
+        v = centred.T @ (centred @ v)
+        n = float(np.linalg.norm(v))
+        if n == 0:
+            return [m]
+        v = v / n
+    order = np.argsort(centred @ v, kind="stable")
+    return [m[idx] for idx in np.array_split(order, k) if len(idx)]
+
+
+def _view_medoid_score(rows_a, rows_b, proto, k, cap):
+    """Best-matching VIEW pair: max over the k x k group-mean cosines.
+
+    The point is to keep max_exemplar's ability to match one person's front against
+    their own back, without its inflation. max_exemplar maxes over every observation
+    pair -- with the 64-row cap that is up to 4096 draws, and `other MAX` grows with
+    the number of draws (0.819 -> 0.936 at 48 vs 90 frames on one clip). Here the max
+    is over k*k group MEANS: 4 draws at k=2, and each side is an average rather than
+    a single crop, so one bad crop cannot carry a merge.
+
+    Never below `prototype`: with one group per side this IS prototype, so the mode
+    can only add evidence, never remove it.
+    """
+    ga = _view_split(_subsample_rows(rows_a, cap), int(k))
+    gb = _view_split(_subsample_rows(rows_b, cap), int(k))
+    best = proto
+    for x in ga:
+        px = _prototype(x)
+        if px is None:
+            continue
+        for y in gb:
+            py = _prototype(y)
+            if py is None:
+                continue
+            best = max(best, float(px @ py))
+    return best
 
 
 def _prototype(vectors):
@@ -757,6 +830,7 @@ def reconcile_tracklets(store, threshold, run_id=None,
                         decision_log=None, top2_margin_threshold=None,
                         top2_margin_basis="eligible",
                         scoring=PROTOTYPE, consensus_top_frac=0.25,
+                        view_medoid_k=2,
                         max_observations_per_side=64,
                         covisibility=None,
                         same_camera_reciprocal_best=False,
@@ -1019,6 +1093,7 @@ def reconcile_tracklets(store, threshold, run_id=None,
         return score_observation_sets(
             cluster_rows(members_a), cluster_rows(members_b), proto_a, proto_b,
             mode=scoring, top_frac=consensus_top_frac,
+            view_medoid_k=view_medoid_k,
             cap=max_observations_per_side)
 
     parent = {k: k for k in keys}
