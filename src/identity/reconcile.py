@@ -134,8 +134,13 @@ def resolve_same_camera_thresholds(recon_cfg, log=print):
             log(f"  [reconcile] per_camera[{cam!r}].same_camera_threshold={raw!r} "
                 f"is not a number -- ignored, the global value applies.")
             continue
-        # Prototypes are unit vectors and the shipped embedding is post-ReLU, so a
-        # cosine bar outside [0, 1] is a typo, not a choice.
+        # A same-camera bar outside [0, 1] is a typo, not a choice -- an unnoticed
+        # `80` where `0.80` was meant disables same-camera merging for that camera
+        # entirely, which is the failure this whole resolver exists to prevent.
+        # NOTE the old justification here -- "the shipped embedding is post-ReLU" --
+        # is NO LONGER TRUE. FastReID's post-bnneck features are ~60.5% negative
+        # dimensions, so a cosine can legitimately be negative. The clamp stays as a
+        # typo guard; nothing may assume non-negativity from it.
         if not 0.0 <= value <= 1.0:
             log(f"  [reconcile] per_camera[{cam!r}].same_camera_threshold={value} "
                 f"is outside [0, 1] (it is a cosine) -- ignored, the global value "
@@ -166,12 +171,14 @@ def resolve_covisibility(recon_cfg, log=print):
     default_tol = cfg.get("default_tolerance_sec", 1.0)
     pairs = {}
     for entry in (cfg.get("pairs") or []):
-        try:
-            a, b, spec = entry[0], entry[1], entry[2]
-        except (TypeError, IndexError):
+        # EXPLICIT TYPE CHECK. A bare string indexes cleanly ("abc" -> 'a','b','c')
+        # so a YAML typo silently became a camera pair named after two characters;
+        # a dict raised KeyError, which was not caught, so it killed the run.
+        if not isinstance(entry, (list, tuple)) or len(entry) < 3:
             log(f"  [reconcile] covisibility: skipping malformed pair {entry!r} "
-                f"(expected [cam_a, cam_b, seconds|'covisible']).")
+                f"(expected a 3-item list [cam_a, cam_b, seconds|'covisible']).")
             continue
+        a, b, spec = entry[0], entry[1], entry[2]
         key = frozenset((str(a), str(b)))
         if isinstance(spec, str) and spec.strip().lower() == COVISIBLE:
             pairs[key] = None
@@ -279,13 +286,19 @@ def describe_reconcile_kwargs(kw):
         f" same_reciprocal={'on' if kw['same_camera_reciprocal_best'] else 'OFF'}"
         f" same_rounds={'on' if kw.get('same_camera_rounds') else 'OFF'}"
         f" covisibility={'on/' + str(len(covis_pairs)) + ' pairs' if covis_on else 'OFF'}"
-        + f" geometry={'on' if (kw.get('geometry') or {}).get('enabled') else 'OFF'}")
+        + f" cap={kw.get('max_observations_per_side')}"
+        + (f" geometry=on/safety="
+           f"{(kw.get('geometry') or {}).get('safety_factor')}"
+           f"/clock={(kw.get('geometry') or {}).get('clock_error_sec')}"
+           if (kw.get('geometry') or {}).get('enabled') else " geometry=OFF"))
 
 
 def temporal_overlap_sec(span_a, span_b):
-    """Seconds two wall-clock spans overlap (0.0 when they do not, None if either
-    span is missing). A single-observation tracklet has a zero-length span, so it
-    can never register an overlap -- consistent fail-open."""
+    """Seconds two wall-clock spans overlap. NEGATIVE when they do not (the size of
+    the gap), None if either span is missing -- callers compare `> tol`, so a
+    negative value fails every tolerance, which is the intended fail-open. A
+    single-observation tracklet has a zero-length span, so it can never register an
+    overlap."""
     if not span_a or not span_b:
         return None
     return min(span_a[1], span_b[1]) - max(span_a[0], span_b[0])
@@ -510,7 +523,11 @@ def _gather_tracklets(store, run_id):
                 data[key]["floor"].append(
                     (pos.ts, pos.x, pos.y, pos.error, pos.group))
 
-            gid = pl.get("reid_id", pl.get("global_id"))
+            # Explicit, not a dict default: a payload carrying reid_id=null would
+            # take the None and never fall through to global_id.
+            gid = pl.get("reid_id")
+            if gid is None:
+                gid = pl.get("global_id")
             if gid is not None:
                 data[key]["gids"].add(int(gid))
 
@@ -523,10 +540,23 @@ def _gather_tracklets(store, run_id):
             continue
         frames = info["frames"]
         times = info["times"]
+        # OBSERVATION ORDER IS CAPTURE ORDER, not Qdrant scroll order. `scroll`
+        # returns points in point-id order, so `vectors` / `points` arrived in an
+        # order with no temporal meaning -- which made _subsample_rows' "evenly
+        # spaced" sampling evenly spaced in ID space, and made its determinism
+        # claim rest on the store's internal ordering rather than on anything this
+        # module controls. Sorted by FRAME INDEX (always present; `ts` can be
+        # missing), so `vectors`, `points` and `frames` are INDEX-ALIGNED.
+        # `times` is deliberately NOT in that alignment -- it is only appended when
+        # a usable ts exists, so it can be shorter -- and stays its own sorted list.
+        order = sorted(range(len(frames)), key=lambda i: frames[i])
+        vectors = [info["vectors"][i] for i in order]
+        points = [info["points"][i] for i in order]
+        frames = [frames[i] for i in order]
         out[key] = {
-            "vectors": info["vectors"],
-            "points": info["points"],
-            "span": (min(frames), max(frames)),
+            "vectors": vectors,
+            "points": points,
+            "span": (frames[0], frames[-1]),
             # None when no usable ts was stored, which is the signal every
             # ts-dependent rule uses to fail open rather than guess.
             "span_ts": ((min(times), max(times)) if times else None),
@@ -536,7 +566,7 @@ def _gather_tracklets(store, run_id):
             # same-camera veto then reads a gap as occupancy. Anything that wants to
             # ask "were these two ever really co-present" needs the instants (Part
             # M.2); explain_merge_failure.py does exactly that.
-            "frames": sorted(frames),
+            "frames": frames,          # already sorted above, with vectors/points
             "times": sorted(times),
             "gids": info["gids"],
             # Sorted by ts so the reachability check can pair observations by
@@ -720,7 +750,7 @@ def reconcile_tracklets(store, threshold, run_id=None,
                         same_camera_threshold=0.90,
                         same_camera_thresholds=None,
                         require_reciprocal_best=True,
-                        min_tracklet_observations=1, log=print,
+                        min_tracklet_observations=3, log=print,
                         decision_log=None, top2_margin_threshold=None,
                         top2_margin_basis="eligible",
                         scoring=PROTOTYPE, consensus_top_frac=0.25,
@@ -876,6 +906,7 @@ def reconcile_tracklets(store, threshold, run_id=None,
             f"(geometry.reconcile.enabled is false) -- nothing is vetoed.")
 
     geo_details = {}          # (key_a, key_b) -> detail dict, for the log/summary
+    geo_unavailable = set()   # pairs geometry could NOT judge -- cached, see below
     geo_vetoes = 0
 
     def geometry_blocks(a, b):
@@ -886,9 +917,19 @@ def reconcile_tracklets(store, threshold, run_id=None,
         pair = (a, b) if a <= b else (b, a)
         if pair in geo_details:
             return geo_details[pair].get("verdict") == IMPOSSIBLE
+        # FAIL-OPEN VERDICTS ARE CACHED TOO. reachability_verdict returns
+        # detail=None for every fail-open path -- no recorded positions, mixed floor
+        # groups, an unmeasured group, too few pairings -- and those are the COMMON
+        # cases today. Caching only judged pairs meant recomputing each of those on
+        # every call. Separate set so geo_details stays "pairs geometry judged",
+        # which is what the run summary reports.
+        if pair in geo_unavailable:
+            return False
         impossible, detail = reachability_verdict(
             tracklets[a].get("floor"), tracklets[b].get("floor"), geo_envelopes)
-        if detail is not None:
+        if detail is None:
+            geo_unavailable.add(pair)
+        else:
             geo_details[pair] = detail
         if impossible:
             geo_vetoes += 1
@@ -932,6 +973,16 @@ def reconcile_tracklets(store, threshold, run_id=None,
             f"identity (nothing to merge with)")
 
     protos = {k: _prototype(tracklets[k]["vectors"]) for k in keys}
+    # A zero-norm prototype cannot be scored, so the tracklet cannot be clustered.
+    # It used to vanish from `keys` SILENTLY -- never entering `remap`, its points
+    # never cleared, keeping whatever provisional gid the live run gave it, with
+    # nothing in the output saying so.
+    for k in [k for k in keys if protos[k] is None]:
+        store.clear_global_id(tracklets[k]["points"])
+        log(f"  tracklet reconcile: DEGENERATE prototype for {k} "
+            f"({len(tracklets[k]['vectors'])} obs, unnormalizable) -> id cleared; "
+            f"it cannot be clustered")
+        _record_outcome(k, dlog.SUPPRESSED)
     keys = [k for k in keys if protos[k] is not None]
 
     # ---- pair scoring (plan #45a) -----------------------------------------
@@ -1019,12 +1070,18 @@ def reconcile_tracklets(store, threshold, run_id=None,
         """
         for a in set_a:
             for b in set_b:
+                # CERTAIN AND CHEAP RULE FIRST. Two comparisons, and the claim is
+                # provable. Geometry costs a binary search plus up to
+                # MAX_GEOMETRY_PAIRINGS envelope evaluations and, as of 2026-08-04,
+                # has never run on real data. Evaluating it first attributed every
+                # pair that violated BOTH rules to geometry, pointing the next
+                # investigation at the least-validated gate.
+                if a[0] == b[0] and not _spans_disjoint(tracklets[a]["span"],
+                                                        tracklets[b]["span"]):
+                    return dlog.TEMPORAL_CONFLICT_SAME_CAMERA
                 if geometry_blocks(a, b):
                     return dlog.GEOMETRIC_UNREACHABLE
                 if a[0] == b[0]:
-                    if not _spans_disjoint(tracklets[a]["span"],
-                                           tracklets[b]["span"]):
-                        return dlog.TEMPORAL_CONFLICT_SAME_CAMERA
                     continue
                 if not covis_enabled:
                     continue
@@ -1251,6 +1308,12 @@ def reconcile_tracklets(store, threshold, run_id=None,
             f"{rejected_not_mutual} above-bar pair(s) refused for not being each "
             f"other's best")
 
+    # Phase 1 cluster membership, captured BEFORE Phase 2 touches it. The
+    # instrumentation below iterates TRACKLET keys, while `accepted_same` holds
+    # ROOT pairs as they were at merge time -- identical on round 1, divergent once
+    # same_camera_rounds is on. Log-only.
+    same_camera_root = {k: find(k) for k in keys}
+
     # ---- Phase 1 instrumentation, subject-centric so the margin is meaningful.
     # Runs AFTER the merges above and reads only `protos` / `tracklets`, so it
     # cannot influence anything. Every same-camera peer is scored (including
@@ -1297,8 +1360,9 @@ def reconcile_tracklets(store, threshold, run_id=None,
             partner = None
             if best is not None:
                 bkey = next(b for b in peers if handles[b] == best.handle)
-                partner = (best.handle if ((a, bkey) in accepted_same
-                                           or (bkey, a) in accepted_same) else None)
+                partner = (best.handle
+                           if same_camera_root[a] == same_camera_root[bkey]
+                           else None)
             _emit(handles[a], "same_camera", 0, {a}, cands, {
                 dlog.MIN_OBSERVATIONS: GateResult(
                     value=_obs(a), threshold=min_tracklet_observations,
