@@ -158,6 +158,16 @@ def main():
                   "-- nothing to draw. Check the run_id against the store.")
             continue
         print(f"  {len(remap)} tracklet(s) -> {len(set(remap.values()))} identities")
+        # PRINT THE DECISIONS, not just the count. `lines` has always collected
+        # reconcile's full log via log=lines.append and then DISCARDED it, so this
+        # tool reported "20 tracklets -> 12 identities" and nothing about WHICH
+        # merges a setting caused. That is precisely the failure CLAUDE.md section 4
+        # names -- a cluster count cannot tell you whether a cluster is one person or
+        # three -- in the one offline feedback loop this project has. A comparison of
+        # two settings is unreadable without these lines: 15 -> 12 is three merges,
+        # and which three is the entire question.
+        for _ln in lines:
+            print(f"  {_ln}")
 
         # Each camera keeps its own recorded rate unless overridden, so the
         # re-render does not inherit the single global output fps that makes
