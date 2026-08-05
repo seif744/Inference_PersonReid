@@ -95,6 +95,162 @@ def store_tracklets(run_id):
     return {k: (n, gid.get(k)) for k, n in obs.items()}
 
 
+# EVERY gate in reid/service.py, because all of them are reproducible here.
+#
+# An earlier version of this file excluded min_blur and brightness, claiming they
+# "need pixels". They do -- and the pixels are in the clip, which is sitting next to
+# the sidecar. Worse, the argument offered for skipping them ("Laplacian variance
+# fluctuates frame to frame, so neither can hold for a whole track") is true of BLUR
+# and FALSE OF BRIGHTNESS: a STATIC object in shadow, or against a window, has
+# constant brightness, so min_brightness/max_brightness can reject all of its frames.
+# For the case this script exists to explain -- a track that never stored anything --
+# brightness is therefore a leading candidate, not an excluded one.
+GEO_GATES = ("too_narrow", "too_short", "too_small", "too_tiny_in_frame",
+             "bad_aspect_lo", "bad_aspect_hi", "occluded")
+PIXEL_GATES = ("blurry", "bad_brightness")
+ALL_GATES = GEO_GATES + PIXEL_GATES
+PIXEL_SAMPLES = 24            # frames sampled per track; the gates are per-frame
+
+
+def load_quality_cfg():
+    """reid.quality as it SHIPS. Read from config.yaml so this can never drift from
+    the gate that actually ran."""
+    defaults = {"min_width": 24, "min_height": 64, "min_area": 2500,
+                "min_box_area_ratio": 0.002, "min_aspect": 0.20,
+                "max_aspect": 1.20, "max_occlusion_ratio": 1.0,
+                "min_blur": 20.0, "min_brightness": 20.0, "max_brightness": 235.0}
+    try:
+        import yaml
+        with open("config.yaml") as f:
+            cfg = yaml.safe_load(f) or {}
+        q = ((cfg.get("reid") or {}).get("quality") or {})
+        return {k: q.get(k, v) for k, v in defaults.items()}
+    except Exception as e:                                        # noqa: BLE001
+        print(f"  (could not read reid.quality from config.yaml: {e}; using "
+              f"defaults)")
+        return defaults
+
+
+def clip_size(clip_dir, cam):
+    """(width, height) of a camera's clip, for the box_area_ratio gate. One frame
+    probe, no model."""
+    import cv2
+    path = os.path.join(clip_dir, f"._live_src_{cam}.mp4")
+    if not os.path.exists(path):
+        return None
+    cap = cv2.VideoCapture(path)
+    try:
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    finally:
+        cap.release()
+    return (w, h) if w > 0 and h > 0 else None
+
+
+def _occlusion(mine, others):
+    """Largest fraction of `mine` covered by another box -- verbatim the rule in
+    reid/service.py::_occlusion_ratio."""
+    x1, y1, x2, y2 = mine
+    area = max(1, (x2 - x1) * (y2 - y1))
+    worst = 0.0
+    for ox1, oy1, ox2, oy2 in others:
+        iw = min(x2, ox2) - max(x1, ox1)
+        ih = min(y2, oy2) - max(y1, oy1)
+        if iw > 0 and ih > 0:
+            worst = max(worst, (iw * ih) / area)
+    return worst
+
+
+def box_motion(boxes):
+    """Std-dev of the box CENTRE across a track, in pixels -- "is this thing moving?"
+
+    The cheapest discriminator between a person and a static false positive (a coat
+    on a chair, a poster, a reflection), and it needs no pixels at all. A person
+    walking through a 2560-wide frame moves hundreds of pixels; a stationary object
+    is near zero. A track that spans an ENTIRE clip with near-zero motion is almost
+    certainly not a person, which changes what the quality gate result even means.
+    """
+    if not boxes:
+        return None
+    cx = [((b[0][0] + b[0][2]) / 2.0) for b in boxes]
+    cy = [((b[0][1] + b[0][3]) / 2.0) for b in boxes]
+    return float(np.hypot(np.std(cx), np.std(cy)))
+
+
+def pixel_gate_failures(clip_dir, cam, track_boxes, q, samples=PIXEL_SAMPLES):
+    """-> {blurry: frac, bad_brightness: frac} by decoding the clip.
+
+    `track_boxes` is [(frame_index, (x1,y1,x2,y2)), ...]. Reproduces
+    reid/service.py::_crop_quality's blur and brightness terms exactly: Laplacian
+    variance and mean gray of the BGR crop. Returns None values when the clip cannot
+    be read, so a missing clip degrades the row rather than the script.
+    """
+    import cv2
+    path = os.path.join(clip_dir, f"._live_src_{cam}.mp4")
+    if not os.path.exists(path) or not track_boxes:
+        return {g: None for g in PIXEL_GATES}
+    idx = np.linspace(0, len(track_boxes) - 1,
+                      min(samples, len(track_boxes))).round().astype(int)
+    want = {int(track_boxes[i][0]): track_boxes[i][1] for i in idx}
+    cap = cv2.VideoCapture(path)
+    blur_fail = bright_fail = seen = 0
+    try:
+        for fi in sorted(want):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                continue
+            h, w = frame.shape[:2]
+            x1, y1, x2, y2 = want[fi]
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w, x2), min(h, y2)
+            if x2 <= x1 or y2 <= y1:
+                continue
+            gray = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
+            seen += 1
+            if float(cv2.Laplacian(gray, cv2.CV_64F).var()) < q["min_blur"]:
+                blur_fail += 1
+            b = float(gray.mean())
+            if not (q["min_brightness"] <= b <= q["max_brightness"]):
+                bright_fail += 1
+    finally:
+        cap.release()
+    if not seen:
+        return {g: None for g in PIXEL_GATES}
+    return {"blurry": blur_fail / seen, "bad_brightness": bright_fail / seen}
+
+
+def gate_failures(boxes, q, frame_size):
+    """-> {gate: fraction of boxes it would reject}. None for a gate that cannot be
+    evaluated (box_area_ratio without the frame size)."""
+    n = len(boxes)
+    fails = {g: 0 for g in GEO_GATES}
+    frame_area = (frame_size[0] * frame_size[1]) if frame_size else None
+    for mine, others, _fi in boxes:
+        x1, y1, x2, y2 = mine
+        w, h = x2 - x1, y2 - y1
+        area = w * h
+        aspect = w / max(1, h)
+        if w < q["min_width"]:
+            fails["too_narrow"] += 1
+        if h < q["min_height"]:
+            fails["too_short"] += 1
+        if area < q["min_area"]:
+            fails["too_small"] += 1
+        if frame_area and (area / frame_area) < q["min_box_area_ratio"]:
+            fails["too_tiny_in_frame"] += 1
+        if aspect < q["min_aspect"]:
+            fails["bad_aspect_lo"] += 1
+        if aspect > q["max_aspect"]:
+            fails["bad_aspect_hi"] += 1
+        if _occlusion(mine, others) > q["max_occlusion_ratio"]:
+            fails["occluded"] += 1
+    out = {g: (c / n if n else 0.0) for g, c in fails.items()}
+    if not frame_area:
+        out["too_tiny_in_frame"] = None
+    return out
+
+
 NO_TRACK = "no track_id (ByteTrack unconfirmed)"
 NOT_STORED = "never reached the store (quality gate / throttle)"
 CLEARED = "stored but id CLEARED (< min_tracklet_observations)"
@@ -151,15 +307,22 @@ def main():
                   f"verify it belongs to {args.run_id}. Check its frame count "
                   f"against the run's stored frame span before trusting this.")
         counts = collections.Counter()
-        # per-track: first/last frame index seen, box heights
-        seen = collections.defaultdict(lambda: {"first": None, "last": None, "h": []})
-        for fi, boxes in enumerate(annos):
-            for b in boxes:
+        # per-track: first/last frame index, heights, and the FULL boxes plus the
+        # other boxes present in the same frame -- the latter is what makes the
+        # occlusion gate reproducible without re-running the detector.
+        seen = collections.defaultdict(
+            lambda: {"first": None, "last": None, "h": [], "boxes": []})
+        for fi, raw_boxes in enumerate(annos):
+            parsed = []
+            for b in raw_boxes:
                 if isinstance(b, dict):
                     tid = b.get("track_id")
-                    y1, y2 = b.get("y1"), b.get("y2")
+                    x1, y1, x2, y2 = b.get("x1"), b.get("y1"), b.get("x2"), b.get("y2")
                 else:
-                    tid, y1, y2 = b[4], b[1], b[3]
+                    x1, y1, x2, y2, tid = b[0], b[1], b[2], b[3], b[4]
+                parsed.append((tid, x1, y1, x2, y2))
+            others = [p[1:] for p in parsed if None not in p[1:]]
+            for tid, x1, y1, x2, y2 in parsed:
                 if tid is None:
                     counts[NO_TRACK] += 1
                     continue
@@ -167,8 +330,12 @@ def main():
                 rec = seen[tid]
                 rec["first"] = fi if rec["first"] is None else rec["first"]
                 rec["last"] = fi
-                if y1 is not None and y2 is not None:
+                if None not in (x1, y1, x2, y2):
                     rec["h"].append(int(y2) - int(y1))
+                    mine = (int(x1), int(y1), int(x2), int(y2))
+                    # (box, co-present boxes, FRAME INDEX) -- the index is what lets
+                    # the pixel gates seek the clip to this exact frame.
+                    rec["boxes"].append((mine, [o for o in others if o != mine], fi))
                 entry = store.get((cam, tid))
                 if entry is None:
                     counts[NOT_STORED] += 1
@@ -225,6 +392,52 @@ def main():
             span = "{}-{}".format(r["first"], r["last"])
             med_h = int(np.median(r["h"])) if r["h"] else 0
             print(f"    {cam:<10}{t:>7}{sec:>7.1f}{span:>16}{med_h:>14}")
+
+    header("C. ATTRIBUTION -- replay EVERY gate on the never-stored tracks")
+    print("  All seven gates are reproducible: the geometric ones from the sidecar,")
+    print("  blur and brightness by decoding the clip. No instrumentation, no model.")
+    print("  `% fail` is the fraction of that track's boxes the gate would reject, and")
+    print("  a gate at 100% is a sufficient explanation -- a never-stored track had")
+    print("  EVERY crop rejected. `motion` is the std-dev of the box centre in px:")
+    print("  near-zero over a long track means a STATIC object, not a person, which")
+    print("  changes what any gate result means.\n")
+    q = load_quality_cfg()
+    print("  gates in force: " + ", ".join(f"{k}={v}" for k, v in sorted(q.items())))
+    print()
+    print(f"  {'camera':<10}{'track':>6}{'boxes':>7}{'secs':>6}{'motion':>8}"
+          + "".join(f"{name:>12}" for name in ALL_GATES))
+    for cam, (seen, fts, nframes) in sorted(per_cam_tracks.items()):
+        size = clip_size(args.clips, cam)
+        if size is None:
+            print(f"  {cam}: could not read the clip's resolution -> "
+                  f"box_area_ratio and the pixel gates are not checkable")
+        fps = None
+        if fts and len(fts) > 1 and fts[0] is not None and fts[-1] is not None:
+            span = fts[-1] - fts[0]
+            fps = (len(fts) - 1) / span if span > 0 else None
+        never = [(t, r) for t, r in seen.items() if (cam, t) not in store]
+        never.sort(key=lambda tr: -(tr[1]["last"] - tr[1]["first"]))
+        for t, r in never:
+            boxes = r["boxes"]
+            if not boxes:
+                continue
+            nf = r["last"] - r["first"] + 1
+            fails = gate_failures(boxes, q, size)
+            fails.update(pixel_gate_failures(
+                args.clips, cam, [(b[2], b[0]) for b in boxes], q))
+            mot = box_motion(boxes)
+            row = (f"  {cam:<10}{t:>6}{len(boxes):>7}"
+                   f"{(nf / fps if fps else float('nan')):>6.1f}"
+                   f"{(mot if mot is not None else float('nan')):>8.1f}")
+            for name in ALL_GATES:
+                v = fails.get(name)
+                cell = "--" if v is None else f"{v:.0%}"
+                if v is not None and v >= 0.999:
+                    cell += " *"
+                row += f"{cell:>12}"
+            print(row)
+    print("\n  * = rejects EVERY box of that track, i.e. a sufficient explanation.")
+    print("  motion < ~5 px over a track spanning the whole clip => not a person.")
 
     header("WHAT TO DO WITH THIS")
     print("  * A high `not stored` fraction with LONG durations => the crop-quality")

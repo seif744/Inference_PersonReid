@@ -206,9 +206,31 @@ in doubt, raise `geometry.reconcile.safety_factor`; never lower it.
   ordinary run and nothing warns you. It has already cost this project its entire
   corpus once (`ONBOARDING.md` §7 attributes the 2026-08-03 wipe to exactly this
   command), and the store currently holds the **only run with usable ground truth**
-  — `20260804_064551`, 2238 observations, clips and sidecars intact. Every
-  measurement tool reads stored observations, so a wipe blocks all of them and no
-  re-capture recovers the run that was watched.
+  — `20260804_064551`, 2238 observations. Every measurement tool reads stored
+  observations, so a wipe blocks all of them and no re-capture recovers the run that
+  was watched.
+- **`20260804_064551`'s CLIPS ARE GONE, and this file used to claim otherwise.**
+  It said "clips and sidecars intact"; they were overwritten by `20260804_094039`
+  and then `20260804_120409`. `._live_src_<cam>.mp4` carries **no run_id** and every
+  run overwrites it, while `keep_frames: true` only stops the *final render* deleting
+  it. So that run is **store-only, permanently**: it can never be re-rendered,
+  contact-sheeted or re-embedded, and its three operator-confirmed pairs can never be
+  extended. **Before every capture, copy the previous run's clips aside:**
+  `for f in ._live_src_*; do cp -a "$f" "clips_<run_id>/$f"; done`
+- **A stale CLIP is worse than a stale output.** Re-rendering run A while run B's
+  clips are on disk draws A's stored ids onto B's pixels, and ByteTrack renumbers
+  every run, so the two id spaces barely intersect: measured, `20260804_064551`
+  against `20260804_120409`'s clips reported cam_219 **100% UNRESOLVED** and 84% of
+  all boxes unidentified. That is a join error that looks exactly like a total
+  identity failure, and it cost this project one round of operator video review.
+  `rerender_from_clips.py` and `measure_unresolved.py` now REFUSE a sidecar whose
+  `run_id` differs; the field was there all along and nothing checked it.
+- **Every measurement in this project reads the STORE, so anything that fails
+  upstream of the store is invisible to all of them.** The annotations sidecar is the
+  only independent source — it holds every drawn box, including those of people who
+  never produced a stored observation. Joining sidecar against store is what finally
+  measured the "visible person with no id" rate (`measure_unresolved.py`). Any future
+  claim about coverage must use it; a store-only statistic cannot see its own gaps.
 - **`output_cam_*.mp4` existing does not mean the last run succeeded.** They are
   only overwritten by a completed render, so stale files look like success. Check
   mtime against the `run_id`.
