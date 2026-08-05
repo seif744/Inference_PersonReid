@@ -68,9 +68,28 @@ class _ReadOnlyStore:
         pass
 
 
-def load_clips(pattern="._live_src_*.mp4"):
-    """-> [(camera, clip_path, annotations)] for every clip WITH its sidecar."""
-    found, missing = [], []
+def load_clips(pattern="._live_src_*.mp4", run_id=None):
+    """-> [(camera, clip_path, annotations)] for every clip WITH its sidecar.
+
+    REFUSES a clip whose sidecar names a DIFFERENT run_id, and this is a hard
+    refusal rather than a warning.
+
+    THE FAILURE IT PREVENTS, which already happened. Clip filenames carry no
+    run_id -- `._live_src_<cam>.mp4` is a fixed name that every run OVERWRITES --
+    while `keep_frames: true` guarantees the files persist. So the clips on disk
+    belong to the LAST run, and re-rendering an EARLIER run silently drew that
+    earlier run's stored ids onto the later run's pixels. ByteTrack restarts its
+    numbering every run, so the two id spaces are near-disjoint: measured on
+    20260804_064551 reconciled against 20260804_120409's clips, cam_219 came out
+    100% UNRESOLVED and 84% of all person-boxes carried no identity. The video
+    looks like a catastrophic identity failure and is really a join error.
+
+    That is ONBOARDING 5.6's "stale files look like success" one level deeper and
+    worse: a stale OUTPUT is merely stale, but a stale CLIP produces a plausible
+    composite of two different runs. The run_id has been in the sidecar all along
+    (render.py `_write_annotations` writes it); nothing checked it.
+    """
+    found, missing, wrong = [], [], []
     for clip in sorted(glob.glob(pattern)):
         side = os.path.splitext(clip)[0] + ".annotations.json"
         if not os.path.exists(side):
@@ -79,11 +98,30 @@ def load_clips(pattern="._live_src_*.mp4"):
         with open(side) as f:
             blob = json.load(f)
         cam = blob.get("camera") or os.path.basename(clip)[len("._live_src_"):-4]
+        clip_run = blob.get("run_id")
+        if run_id is not None and clip_run is not None and clip_run != run_id:
+            wrong.append((clip, clip_run))
+            continue
+        if run_id is not None and clip_run is None:
+            print(f"[rerender] {clip}: sidecar records NO run_id (written before "
+                  f"that field existed) -- CANNOT verify it belongs to {run_id}. "
+                  f"Check the frame count against the run's stored frame span "
+                  f"before trusting anything it renders.")
         found.append((cam, clip, blob))
     for clip in missing:
         print(f"[rerender] {clip} has no .annotations.json sidecar -- skipped. "
               f"(Runs captured before that sidecar existed cannot be re-rendered; "
               f"the box geometry was only ever in memory.)")
+    if wrong:
+        print(f"[rerender] REFUSED {len(wrong)} clip(s) belonging to a DIFFERENT run:")
+        for clip, clip_run in wrong:
+            print(f"[rerender]   {clip} is from run {clip_run}, not {run_id}")
+        print(f"[rerender] Clip filenames carry no run_id and every run OVERWRITES "
+              f"them, so {run_id}'s footage is gone unless it was copied aside. "
+              f"Rendering it against these clips would draw {run_id}'s ids onto "
+              f"another run's pixels -- which looks exactly like a total identity "
+              f"failure. Re-render run {wrong[0][1]} instead, or use --clips on a "
+              f"directory holding the right run's copies.")
     return found
 
 
@@ -118,7 +156,7 @@ def main():
     os.chdir(clip_dir)
     print(f"[rerender] clips from {clip_dir}")
 
-    clips = load_clips()
+    clips = load_clips(run_id=run_id)
     if not clips:
         raise SystemExit(
             "[rerender] no ._live_src_*.mp4 + .annotations.json pairs in this "

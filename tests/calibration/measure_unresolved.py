@@ -55,15 +55,15 @@ COLLECTION = os.environ.get("QDRANT_COLLECTION", "persons")
 
 
 def load_sidecar(path):
-    """-> (annotations, frame_ts). Accepts a bare list or a dict wrapper, because the
-    sidecar's shape has changed once already and a hard assumption here would make
-    this script fail on exactly the old runs it is most useful for."""
+    """-> (annotations, frame_ts, run_id). Accepts a bare list or a dict wrapper,
+    because the sidecar's shape has changed once already and a hard assumption here
+    would make this script fail on exactly the old runs it is most useful for."""
     with open(path) as f:
         raw = json.load(f)
     if isinstance(raw, dict):
         annos = raw.get("annotations") or raw.get("frames") or []
-        return annos, raw.get("frame_ts") or []
-    return raw, []
+        return annos, raw.get("frame_ts") or [], raw.get("run_id")
+    return raw, [], None
 
 
 def store_tracklets(run_id):
@@ -131,7 +131,25 @@ def main():
     per_cam_tracks = {}
     for sc in sidecars:
         cam = os.path.basename(sc)[len("._live_src_"):-len(".annotations.json")]
-        annos, fts = load_sidecar(sc)
+        annos, fts, clip_run = load_sidecar(sc)
+        # HARD REFUSAL on a cross-run join. Clip filenames carry no run_id --
+        # `._live_src_<cam>.mp4` is overwritten by every run while keep_frames
+        # preserves it -- so the files on disk belong to the LAST run. Joining an
+        # earlier run's store against them compares two disjoint ByteTrack id
+        # spaces, which reads as a total identity failure: measured on 064551 vs
+        # 120409's clips, cam_219 came out 100% UNRESOLVED and the headline was
+        # 84% of all boxes. That number was a join error, not a pipeline failure.
+        if clip_run is not None and clip_run != args.run_id:
+            print(f"  REFUSED {os.path.basename(sc)}: sidecar is from run "
+                  f"{clip_run}, not {args.run_id}. ByteTrack renumbers every run, "
+                  f"so joining them would report a meaningless UNRESOLVED rate. "
+                  f"Measure run {clip_run} instead, or point --clips at a copy of "
+                  f"{args.run_id}'s footage.")
+            continue
+        if clip_run is None:
+            print(f"  {os.path.basename(sc)}: NO run_id in the sidecar -- cannot "
+                  f"verify it belongs to {args.run_id}. Check its frame count "
+                  f"against the run's stored frame span before trusting this.")
         counts = collections.Counter()
         # per-track: first/last frame index seen, box heights
         seen = collections.defaultdict(lambda: {"first": None, "last": None, "h": []})
