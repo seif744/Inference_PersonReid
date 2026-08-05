@@ -1,0 +1,49 @@
+/home/easemyai/seifer_work/Inference_PersonReid/venv/lib/python3.12/site-packages/torchreid/reid/metrics/rank.py:11: UserWarning: Cython evaluation (very fast so highly recommended) is unavailable, now use python evaluation.
+  warnings.warn(
+[tcp @ 0x793274004080] Failed to resolve hostname ...213: Name or service not known
+[tcp @ 0x793268003f00] Failed to resolve hostname ...224: Name or service not known
+[tcp @ 0x793260003f00] Failed to resolve hostname ...219: Name or service not known
+[tcp @ 0x79326c004140] Failed to resolve hostname ...206: Name or service not known
+[main] Preparing 4 video(s) from --videos: cam_213, cam_224, cam_206, cam_219
+[main] Run id: 20260730_111101
+[main] Capability report: {'torch': '2.12.1+cu130', 'cuda_available': True, 'device': 'cuda:0', 'opencv': '5.0.0', 'nvdec_usable': False, 'decode_backend': 'cpu'}
+[live] Starting LivePipeline on 4 source(s): cam_213, cam_224, cam_206, cam_219 | device=cuda:0
+[live] gallery store ready at http://localhost:6333 (existing points: 9362).
+[live] offline reconcile ENABLED (run_id=20260730_111102): live reids are provisional; the CORRECT cross-camera ids are settled on Ctrl-C and re-rendered into output_<cam>.mp4.
+[stop] To stop: press Ctrl-C ONCE. The run then reconciles cross-camera ids and re-renders output_<cam>.mp4 -- that step can take a while and prints as it goes. Extra Ctrl-C presses during it are IGNORED on purpose, so they can no longer cost you the reconciled ids (use Ctrl-\ if you must abort anyway).
+[live] pose ensemble DISABLED for the live path (throughput: 1 detection model/frame instead of 2).
+[detector] Loading model 'yolo11m.pt' (first run may download it)...
+[detector] Model ready.
+[detector] Loading model 'yolo11m.pt' (first run may download it)...
+[detector] Model ready.
+[detector] Loading model 'yolo11m.pt' (first run may download it)...
+[detector] Model ready.
+[detector] Loading model 'yolo11m.pt' (first run may download it)...
+[detector] Model ready.
+[live] warm-up complete (detector + ReID initialised).
+[live] cross-camera topology veto: OFF (appearance-only; intended, not an error -- enable live.topology with measured transit times to use it).
+[capture:cam_219] could not open source: Could not open stream: 'rtsp://...219/ch01/0'. The URL may be unreachable, wrong, or need credentials.
+[capture:cam_213] could not open source: Could not open stream: 'rtsp://...213/1/1'. The URL may be unreachable, wrong, or need credentials.
+[capture:cam_224] could not open source: Could not open stream: 'rtsp://...224/ch01/0'. The URL may be unreachable, wrong, or need credentials.
+[capture:cam_206] could not open source: Could not open stream: 'rtsp://...206/1/1'. The URL may be unreachable, wrong, or need credentials.
+[live] all sources ended -> draining and finalizing...
+[live:metrics] final SUMMARY  (elapsed=1.2s, max_batch=8)
+    cam_213: read=0 (0.0fps)  rendered=0  written=0 (0.0fps)  slot_drop=0  rq_drop=0  wq_drop=0  reconnects=0
+    cam_224: read=0 (0.0fps)  rendered=0  written=0 (0.0fps)  slot_drop=0  rq_drop=0  wq_drop=0  reconnects=0
+    cam_206: read=0 (0.0fps)  rendered=0  written=0 (0.0fps)  slot_drop=0  rq_drop=0  wq_drop=0  reconnects=0
+    cam_219: read=0 (0.0fps)  rendered=0  written=0 (0.0fps)  slot_drop=0  rq_drop=0  wq_drop=0  reconnects=0
+    scheduler: batches=0 frames=0 avg_batch=0.00 util=0% stale_skipped=0
+    drops/peaks: infer_q=0/0 identity_in=0/0 identity_fair_drop=0 writer_q_peak=0 | inference_done=0
+    identity: minted=0 reacquired=0 linked=0 active=0 resolved_frames=0 stored=0
+    x-camera: attempts=0 linked=0 rejected[thresh=0 margin=0 recip=0 topology=0] max_subthreshold_score=0.000
+    same-cam reacquire: attempts=0 ok=0 rejected_below_thr=0 max_rejected_score=0.000  (high rejected_below_thr => fragmentation; same_camera_threshold too strict)
+    coactive_vetoes=0  (co-present same-camera false-merges prevented)   topology_pruned=0  (impossible cross-camera candidates removed)
+    score histograms (best candidate per attempt)   bins: <.5 .5-.6 .6-.7 .7-.8 .8-.9 .9+
+      same-cam reacquire:    0    0    0    0    0    0   (pick same_camera_threshold below the same-person cluster)
+      cross-camera:          0    0    0    0    0    0   (pick cross_camera_threshold below the true-match cluster)
+
+[live] Please wait a moment while we render the final outputs (offline reconciliation)...
+[live] persisted 0 observation(s) for run 20260730_111102.
+[live] no observations were persisted -> nothing to reconcile; skipping final render.
+[live] shutdown complete.
+[main] All done.

@@ -1,0 +1,266 @@
+/home/easemyai/seifer_work/Inference_PersonReid/venv/lib/python3.12/site-packages/torchreid/reid/metrics/rank.py:11: UserWarning: Cython evaluation (very fast so highly recommended) is unavailable, now use python evaluation.
+  warnings.warn(
+[main] Preparing 3 video(s) from --videos: cam_213, cam_224, cam_219
+[main] Run id: 20260730_120550
+[main] Capability report: {'torch': '2.12.1+cu130', 'cuda_available': True, 'device': 'cuda:0', 'opencv': '5.0.0', 'nvdec_usable': False, 'decode_backend': 'cpu'}
+[live] Starting LivePipeline on 3 source(s): cam_213, cam_224, cam_219 | device=cuda:0
+[live] gallery store ready at http://localhost:6333 (existing points: 14410).
+[live] offline reconcile ENABLED (run_id=20260730_120551): live reids are provisional; the CORRECT cross-camera ids are settled on Ctrl-C and re-rendered into output_<cam>.mp4.
+[stop] To stop: press Ctrl-C ONCE. The run then reconciles cross-camera ids and re-renders output_<cam>.mp4 -- that step can take a while and prints as it goes. Extra Ctrl-C presses during it are IGNORED on purpose, so they can no longer cost you the reconciled ids (use Ctrl-\ if you must abort anyway).
+[live] pose ensemble DISABLED for the live path (throughput: 1 detection model/frame instead of 2).
+[detector] Loading model 'yolo11m.pt' (first run may download it)...
+[detector] Model ready.
+[detector] Loading model 'yolo11m.pt' (first run may download it)...
+[detector] Model ready.
+[detector] Loading model 'yolo11m.pt' (first run may download it)...
+[detector] Model ready.
+[live] warm-up complete (detector + ReID initialised).
+[live] cross-camera topology veto: OFF (appearance-only; intended, not an error -- enable live.topology with measured transit times to use it).
+[live:metrics] t=+10s  (elapsed=10.0s, max_batch=8)
+    cam_213: read=229 (22.9fps)  rendered=168  written=0 (0.0fps)  slot_drop=5  rq_drop=0  wq_drop=0  reconnects=0
+    cam_224: read=123 (12.3fps)  rendered=108  written=0 (0.0fps)  slot_drop=0  rq_drop=0  wq_drop=0  reconnects=0
+    cam_219: read=170 (17.0fps)  rendered=158  written=0 (0.0fps)  slot_drop=0  rq_drop=0  wq_drop=0  reconnects=0
+    scheduler: batches=211 frames=517 avg_batch=2.45 util=31% stale_skipped=0
+    drops/peaks: infer_q=4/2 identity_in=0/3 identity_fair_drop=0 writer_q_peak=0 | inference_done=495
+    identity: minted=6 reacquired=1 linked=2 active=6 resolved_frames=495 stored=114
+    x-camera: attempts=6 linked=2 rejected[thresh=2 margin=0 recip=2 topology=0] max_subthreshold_score=0.544
+    same-cam reacquire: attempts=1 ok=1 rejected_below_thr=0 max_rejected_score=0.000  (high rejected_below_thr => fragmentation; same_camera_threshold too strict)
+    coactive_vetoes=7  (co-present same-camera false-merges prevented)   topology_pruned=0  (impossible cross-camera candidates removed)
+    score histograms (best candidate per attempt)   bins: <.5 .5-.6 .6-.7 .7-.8 .8-.9 .9+
+      same-cam reacquire:    0    0    0    1    0    0   (pick same_camera_threshold below the same-person cluster)
+      cross-camera:          1    1    3    0    1    0   (pick cross_camera_threshold below the true-match cluster)
+[live:metrics] t=+20s  (elapsed=20.0s, max_batch=8)
+    cam_213: read=480 (24.0fps)  rendered=417  written=0 (0.0fps)  slot_drop=6  rq_drop=0  wq_drop=0  reconnects=0
+    cam_224: read=274 (13.7fps)  rendered=259  written=0 (0.0fps)  slot_drop=0  rq_drop=0  wq_drop=0  reconnects=0
+    cam_219: read=420 (21.0fps)  rendered=408  written=0 (0.0fps)  slot_drop=0  rq_drop=0  wq_drop=0  reconnects=0
+    scheduler: batches=451 frames=1168 avg_batch=2.59 util=32% stale_skipped=0
+    drops/peaks: infer_q=4/2 identity_in=0/3 identity_fair_drop=0 writer_q_peak=0 | inference_done=1146
+    identity: minted=8 reacquired=1 linked=2 active=8 resolved_frames=1146 stored=262
+    x-camera: attempts=8 linked=2 rejected[thresh=3 margin=1 recip=2 topology=0] max_subthreshold_score=0.599
+    same-cam reacquire: attempts=3 ok=1 rejected_below_thr=2 max_rejected_score=0.612  (high rejected_below_thr => fragmentation; same_camera_threshold too strict)
+    coactive_vetoes=10  (co-present same-camera false-merges prevented)   topology_pruned=0  (impossible cross-camera candidates removed)
+    score histograms (best candidate per attempt)   bins: <.5 .5-.6 .6-.7 .7-.8 .8-.9 .9+
+      same-cam reacquire:    0    1    1    1    0    0   (pick same_camera_threshold below the same-person cluster)
+      cross-camera:          1    2    4    0    1    0   (pick cross_camera_threshold below the true-match cluster)
+[live:metrics] t=+30s  (elapsed=30.0s, max_batch=8)
+    cam_213: read=730 (24.3fps)  rendered=666  written=0 (0.0fps)  slot_drop=8  rq_drop=0  wq_drop=0  reconnects=0
+    cam_224: read=424 (14.1fps)  rendered=409  written=0 (0.0fps)  slot_drop=0  rq_drop=0  wq_drop=0  reconnects=0
+    cam_219: read=670 (22.3fps)  rendered=658  written=0 (0.0fps)  slot_drop=0  rq_drop=0  wq_drop=0  reconnects=0
+    scheduler: batches=690 frames=1816 avg_batch=2.63 util=33% stale_skipped=0
+    drops/peaks: infer_q=4/2 identity_in=0/3 identity_fair_drop=0 writer_q_peak=0 | inference_done=1794
+    identity: minted=8 reacquired=2 linked=2 active=8 resolved_frames=1794 stored=375
+    x-camera: attempts=8 linked=2 rejected[thresh=3 margin=1 recip=2 topology=0] max_subthreshold_score=0.599
+    same-cam reacquire: attempts=4 ok=2 rejected_below_thr=2 max_rejected_score=0.612  (high rejected_below_thr => fragmentation; same_camera_threshold too strict)
+    coactive_vetoes=10  (co-present same-camera false-merges prevented)   topology_pruned=0  (impossible cross-camera candidates removed)
+    score histograms (best candidate per attempt)   bins: <.5 .5-.6 .6-.7 .7-.8 .8-.9 .9+
+      same-cam reacquire:    0    1    1    2    0    0   (pick same_camera_threshold below the same-person cluster)
+      cross-camera:          1    2    4    0    1    0   (pick cross_camera_threshold below the true-match cluster)
+[live:metrics] t=+40s  (elapsed=40.0s, max_batch=8)
+    cam_213: read=981 (24.5fps)  rendered=915  written=0 (0.0fps)  slot_drop=9  rq_drop=0  wq_drop=0  reconnects=0
+    cam_224: read=574 (14.3fps)  rendered=559  written=0 (0.0fps)  slot_drop=0  rq_drop=0  wq_drop=0  reconnects=0
+    cam_219: read=920 (23.0fps)  rendered=907  written=0 (0.0fps)  slot_drop=0  rq_drop=0  wq_drop=0  reconnects=0
+    scheduler: batches=932 frames=2465 avg_batch=2.64 util=33% stale_skipped=0
+    drops/peaks: infer_q=4/2 identity_in=0/3 identity_fair_drop=0 writer_q_peak=0 | inference_done=2442
+    identity: minted=8 reacquired=4 linked=3 active=8 resolved_frames=2442 stored=507
+    x-camera: attempts=9 linked=3 rejected[thresh=3 margin=1 recip=2 topology=0] max_subthreshold_score=0.599
+    same-cam reacquire: attempts=7 ok=4 rejected_below_thr=3 max_rejected_score=0.645  (high rejected_below_thr => fragmentation; same_camera_threshold too strict)
+    coactive_vetoes=16  (co-present same-camera false-merges prevented)   topology_pruned=0  (impossible cross-camera candidates removed)
+    score histograms (best candidate per attempt)   bins: <.5 .5-.6 .6-.7 .7-.8 .8-.9 .9+
+      same-cam reacquire:    0    1    2    4    0    0   (pick same_camera_threshold below the same-person cluster)
+      cross-camera:          1    2    4    1    1    0   (pick cross_camera_threshold below the true-match cluster)
+[live:metrics] t=+50s  (elapsed=50.1s, max_batch=8)
+    cam_213: read=1231 (24.6fps)  rendered=1163  written=0 (0.0fps)  slot_drop=12  rq_drop=0  wq_drop=0  reconnects=0
+    cam_224: read=724 (14.5fps)  rendered=709  written=0 (0.0fps)  slot_drop=0  rq_drop=0  wq_drop=0  reconnects=0
+    cam_219: read=1170 (23.4fps)  rendered=1158  written=0 (0.0fps)  slot_drop=0  rq_drop=0  wq_drop=0  reconnects=0
+    scheduler: batches=1174 frames=3113 avg_batch=2.65 util=33% stale_skipped=0
+    drops/peaks: infer_q=4/2 identity_in=0/3 identity_fair_drop=0 writer_q_peak=0 | inference_done=3091
+    identity: minted=8 reacquired=6 linked=3 active=8 resolved_frames=3091 stored=649
+    x-camera: attempts=9 linked=3 rejected[thresh=3 margin=1 recip=2 topology=0] max_subthreshold_score=0.599
+    same-cam reacquire: attempts=9 ok=6 rejected_below_thr=3 max_rejected_score=0.645  (high rejected_below_thr => fragmentation; same_camera_threshold too strict)
+    coactive_vetoes=19  (co-present same-camera false-merges prevented)   topology_pruned=0  (impossible cross-camera candidates removed)
+    score histograms (best candidate per attempt)   bins: <.5 .5-.6 .6-.7 .7-.8 .8-.9 .9+
+      same-cam reacquire:    0    1    2    5    0    1   (pick same_camera_threshold below the same-person cluster)
+      cross-camera:          1    2    4    1    1    0   (pick cross_camera_threshold below the true-match cluster)
+[live:metrics] t=+60s  (elapsed=60.1s, max_batch=8)
+    cam_213: read=1481 (24.7fps)  rendered=1411  written=0 (0.0fps)  slot_drop=13  rq_drop=0  wq_drop=0  reconnects=0
+    cam_224: read=874 (14.5fps)  rendered=858  written=0 (0.0fps)  slot_drop=0  rq_drop=0  wq_drop=0  reconnects=0
+    cam_219: read=1420 (23.6fps)  rendered=1403  written=0 (0.0fps)  slot_drop=2  rq_drop=0  wq_drop=0  reconnects=0
+    scheduler: batches=1414 frames=3758 avg_batch=2.66 util=33% stale_skipped=0
+    drops/peaks: infer_q=4/2 identity_in=0/3 identity_fair_drop=0 writer_q_peak=0 | inference_done=3736
+    identity: minted=10 reacquired=7 linked=3 active=10 resolved_frames=3736 stored=772
+    x-camera: attempts=11 linked=3 rejected[thresh=3 margin=1 recip=4 topology=0] max_subthreshold_score=0.599
+    same-cam reacquire: attempts=12 ok=7 rejected_below_thr=5 max_rejected_score=0.645  (high rejected_below_thr => fragmentation; same_camera_threshold too strict)
+    coactive_vetoes=23  (co-present same-camera false-merges prevented)   topology_pruned=0  (impossible cross-camera candidates removed)
+    score histograms (best candidate per attempt)   bins: <.5 .5-.6 .6-.7 .7-.8 .8-.9 .9+
+      same-cam reacquire:    0    3    2    5    1    1   (pick same_camera_threshold below the same-person cluster)
+      cross-camera:          1    2    5    2    1    0   (pick cross_camera_threshold below the true-match cluster)
+[live:metrics] t=+70s  (elapsed=70.1s, max_batch=8)
+    cam_213: read=1731 (24.7fps)  rendered=1662  written=0 (0.0fps)  slot_drop=13  rq_drop=0  wq_drop=0  reconnects=0
+    cam_224: read=1025 (14.6fps)  rendered=1009  written=0 (0.0fps)  slot_drop=0  rq_drop=0  wq_drop=0  reconnects=0
+    cam_219: read=1669 (23.8fps)  rendered=1654  written=0 (0.0fps)  slot_drop=3  rq_drop=0  wq_drop=0  reconnects=0
+    scheduler: batches=1654 frames=4408 avg_batch=2.67 util=33% stale_skipped=0
+    drops/peaks: infer_q=4/2 identity_in=0/3 identity_fair_drop=0 writer_q_peak=0 | inference_done=4386
+    identity: minted=11 reacquired=9 linked=3 active=11 resolved_frames=4386 stored=888
+    x-camera: attempts=12 linked=3 rejected[thresh=3 margin=1 recip=5 topology=0] max_subthreshold_score=0.599
+    same-cam reacquire: attempts=15 ok=9 rejected_below_thr=6 max_rejected_score=0.687  (high rejected_below_thr => fragmentation; same_camera_threshold too strict)
+    coactive_vetoes=32  (co-present same-camera false-merges prevented)   topology_pruned=0  (impossible cross-camera candidates removed)
+    score histograms (best candidate per attempt)   bins: <.5 .5-.6 .6-.7 .7-.8 .8-.9 .9+
+      same-cam reacquire:    0    3    3    7    1    1   (pick same_camera_threshold below the same-person cluster)
+      cross-camera:          1    2    6    2    1    0   (pick cross_camera_threshold below the true-match cluster)
+[live:metrics] t=+80s  (elapsed=80.1s, max_batch=8)
+    cam_213: read=1982 (24.7fps)  rendered=1907  written=0 (0.0fps)  slot_drop=17  rq_drop=0  wq_drop=0  reconnects=0
+    cam_224: read=1175 (14.7fps)  rendered=1159  written=0 (0.0fps)  slot_drop=0  rq_drop=0  wq_drop=0  reconnects=0
+    cam_219: read=1919 (24.0fps)  rendered=1903  written=0 (0.0fps)  slot_drop=3  rq_drop=0  wq_drop=0  reconnects=0
+    scheduler: batches=1896 frames=5054 avg_batch=2.67 util=33% stale_skipped=0
+    drops/peaks: infer_q=4/2 identity_in=0/3 identity_fair_drop=0 writer_q_peak=0 | inference_done=5033
+    identity: minted=12 reacquired=9 linked=3 active=12 resolved_frames=5033 stored=1008
+    x-camera: attempts=13 linked=3 rejected[thresh=3 margin=1 recip=6 topology=0] max_subthreshold_score=0.599
+    same-cam reacquire: attempts=16 ok=9 rejected_below_thr=7 max_rejected_score=0.687  (high rejected_below_thr => fragmentation; same_camera_threshold too strict)
+    coactive_vetoes=34  (co-present same-camera false-merges prevented)   topology_pruned=0  (impossible cross-camera candidates removed)
+    score histograms (best candidate per attempt)   bins: <.5 .5-.6 .6-.7 .7-.8 .8-.9 .9+
+      same-cam reacquire:    0    3    4    7    1    1   (pick same_camera_threshold below the same-person cluster)
+      cross-camera:          1    2    6    2    2    0   (pick cross_camera_threshold below the true-match cluster)
+[live:metrics] t=+90s  (elapsed=90.1s, max_batch=8)
+    cam_213: read=2232 (24.8fps)  rendered=2157  written=0 (0.0fps)  slot_drop=18  rq_drop=0  wq_drop=0  reconnects=0
+    cam_224: read=1324 (14.7fps)  rendered=1309  written=0 (0.0fps)  slot_drop=0  rq_drop=0  wq_drop=0  reconnects=0
+    cam_219: read=2168 (24.1fps)  rendered=2150  written=0 (0.0fps)  slot_drop=4  rq_drop=0  wq_drop=0  reconnects=0
+    scheduler: batches=2138 frames=5702 avg_batch=2.67 util=33% stale_skipped=0
+    drops/peaks: infer_q=4/2 identity_in=0/3 identity_fair_drop=0 writer_q_peak=0 | inference_done=5682
+    identity: minted=12 reacquired=9 linked=3 active=12 resolved_frames=5682 stored=1122
+    x-camera: attempts=13 linked=3 rejected[thresh=3 margin=1 recip=6 topology=0] max_subthreshold_score=0.599
+    same-cam reacquire: attempts=16 ok=9 rejected_below_thr=7 max_rejected_score=0.687  (high rejected_below_thr => fragmentation; same_camera_threshold too strict)
+    coactive_vetoes=34  (co-present same-camera false-merges prevented)   topology_pruned=0  (impossible cross-camera candidates removed)
+    score histograms (best candidate per attempt)   bins: <.5 .5-.6 .6-.7 .7-.8 .8-.9 .9+
+      same-cam reacquire:    0    3    4    7    1    1   (pick same_camera_threshold below the same-person cluster)
+      cross-camera:          1    2    6    2    2    0   (pick cross_camera_threshold below the true-match cluster)
+[live:metrics] t=+100s  (elapsed=100.1s, max_batch=8)
+    cam_213: read=2480 (24.8fps)  rendered=2405  written=0 (0.0fps)  slot_drop=18  rq_drop=0  wq_drop=0  reconnects=0
+    cam_224: read=1475 (14.7fps)  rendered=1459  written=0 (0.0fps)  slot_drop=0  rq_drop=0  wq_drop=0  reconnects=0
+    cam_219: read=2419 (24.2fps)  rendered=2400  written=0 (0.0fps)  slot_drop=5  rq_drop=0  wq_drop=0  reconnects=0
+    scheduler: batches=2378 frames=6351 avg_batch=2.67 util=33% stale_skipped=0
+    drops/peaks: infer_q=4/2 identity_in=0/3 identity_fair_drop=0 writer_q_peak=0 | inference_done=6325
+    identity: minted=12 reacquired=10 linked=3 active=12 resolved_frames=6325 stored=1234
+    x-camera: attempts=13 linked=3 rejected[thresh=3 margin=1 recip=6 topology=0] max_subthreshold_score=0.599
+    same-cam reacquire: attempts=17 ok=10 rejected_below_thr=7 max_rejected_score=0.687  (high rejected_below_thr => fragmentation; same_camera_threshold too strict)
+    coactive_vetoes=34  (co-present same-camera false-merges prevented)   topology_pruned=0  (impossible cross-camera candidates removed)
+    score histograms (best candidate per attempt)   bins: <.5 .5-.6 .6-.7 .7-.8 .8-.9 .9+
+      same-cam reacquire:    0    3    4    8    1    1   (pick same_camera_threshold below the same-person cluster)
+      cross-camera:          1    2    6    2    2    0   (pick cross_camera_threshold below the true-match cluster)
+[live:metrics] t=+110s  (elapsed=110.1s, max_batch=8)
+    cam_213: read=2729 (24.8fps)  rendered=2651  written=0 (0.0fps)  slot_drop=21  rq_drop=0  wq_drop=0  reconnects=0
+    cam_224: read=1625 (14.8fps)  rendered=1610  written=0 (0.0fps)  slot_drop=0  rq_drop=0  wq_drop=0  reconnects=0
+    cam_219: read=2668 (24.2fps)  rendered=2651  written=0 (0.0fps)  slot_drop=5  rq_drop=0  wq_drop=0  reconnects=0
+    scheduler: batches=2620 frames=6995 avg_batch=2.67 util=33% stale_skipped=0
+    drops/peaks: infer_q=4/2 identity_in=0/3 identity_fair_drop=0 writer_q_peak=0 | inference_done=6973
+    identity: minted=14 reacquired=10 linked=3 active=14 resolved_frames=6973 stored=1344
+    x-camera: attempts=15 linked=3 rejected[thresh=3 margin=1 recip=8 topology=0] max_subthreshold_score=0.599
+    same-cam reacquire: attempts=19 ok=10 rejected_below_thr=9 max_rejected_score=0.687  (high rejected_below_thr => fragmentation; same_camera_threshold too strict)
+    coactive_vetoes=37  (co-present same-camera false-merges prevented)   topology_pruned=0  (impossible cross-camera candidates removed)
+    score histograms (best candidate per attempt)   bins: <.5 .5-.6 .6-.7 .7-.8 .8-.9 .9+
+      same-cam reacquire:    0    4    5    8    1    1   (pick same_camera_threshold below the same-person cluster)
+      cross-camera:          1    2    8    2    2    0   (pick cross_camera_threshold below the true-match cluster)
+[live:metrics] t=+120s  (elapsed=120.1s, max_batch=8)
+    cam_213: read=2979 (24.8fps)  rendered=2899  written=0 (0.0fps)  slot_drop=23  rq_drop=0  wq_drop=0  reconnects=0
+    cam_224: read=1775 (14.8fps)  rendered=1760  written=0 (0.0fps)  slot_drop=0  rq_drop=0  wq_drop=0  reconnects=0
+    cam_219: read=2918 (24.3fps)  rendered=2900  written=0 (0.0fps)  slot_drop=5  rq_drop=0  wq_drop=0  reconnects=0
+    scheduler: batches=2861 frames=7643 avg_batch=2.67 util=33% stale_skipped=0
+    drops/peaks: infer_q=4/2 identity_in=0/3 identity_fair_drop=0 writer_q_peak=0 | inference_done=7620
+    identity: minted=14 reacquired=11 linked=3 active=14 resolved_frames=7620 stored=1448
+    x-camera: attempts=15 linked=3 rejected[thresh=3 margin=1 recip=8 topology=0] max_subthreshold_score=0.599
+    same-cam reacquire: attempts=20 ok=11 rejected_below_thr=9 max_rejected_score=0.687  (high rejected_below_thr => fragmentation; same_camera_threshold too strict)
+    coactive_vetoes=38  (co-present same-camera false-merges prevented)   topology_pruned=0  (impossible cross-camera candidates removed)
+    score histograms (best candidate per attempt)   bins: <.5 .5-.6 .6-.7 .7-.8 .8-.9 .9+
+      same-cam reacquire:    0    4    5    8    2    1   (pick same_camera_threshold below the same-person cluster)
+      cross-camera:          1    2    8    2    2    0   (pick cross_camera_threshold below the true-match cluster)
+
+[live] Ctrl-C -> stopping and finalizing outputs. Do NOT press Ctrl-C again: the reconciled cross-camera ids are decided during this step.
+[capture:cam_219] done (3011 frames, 0 reconnects).
+[capture:cam_213] done (3072 frames, 0 reconnects).
+[capture:cam_224] done (1831 frames, 0 reconnects).
+[render:cam_224] captured 1815 processed frames -> ._live_src_cam_224.mp4
+[render:cam_213] captured 2989 processed frames -> ._live_src_cam_213.mp4
+[render:cam_219] captured 2992 processed frames -> ._live_src_cam_219.mp4
+[render:cam_213] box geometry -> ._live_src_cam_213.annotations.json
+[render:cam_224] box geometry -> ._live_src_cam_224.annotations.json
+[render:cam_219] box geometry -> ._live_src_cam_219.annotations.json
+[live:metrics] final SUMMARY  (elapsed=124.0s, max_batch=8)
+    cam_213: read=3072 (24.8fps)  rendered=2989  written=0 (0.0fps)  slot_drop=25  rq_drop=0  wq_drop=0  reconnects=0
+    cam_224: read=1831 (14.8fps)  rendered=1815  written=0 (0.0fps)  slot_drop=0  rq_drop=0  wq_drop=0  reconnects=0
+    cam_219: read=3011 (24.3fps)  rendered=2992  written=0 (0.0fps)  slot_drop=5  rq_drop=0  wq_drop=0  reconnects=0
+    scheduler: batches=2951 frames=7881 avg_batch=2.67 util=33% stale_skipped=0
+    drops/peaks: infer_q=4/2 identity_in=0/3 identity_fair_drop=0 writer_q_peak=0 | inference_done=7860
+    identity: minted=14 reacquired=11 linked=3 active=14 resolved_frames=7857 stored=1482
+    x-camera: attempts=15 linked=3 rejected[thresh=3 margin=1 recip=8 topology=0] max_subthreshold_score=0.599
+    same-cam reacquire: attempts=20 ok=11 rejected_below_thr=9 max_rejected_score=0.687  (high rejected_below_thr => fragmentation; same_camera_threshold too strict)
+    coactive_vetoes=38  (co-present same-camera false-merges prevented)   topology_pruned=0  (impossible cross-camera candidates removed)
+    score histograms (best candidate per attempt)   bins: <.5 .5-.6 .6-.7 .7-.8 .8-.9 .9+
+      same-cam reacquire:    0    4    5    8    2    1   (pick same_camera_threshold below the same-person cluster)
+      cross-camera:          1    2    8    2    2    0   (pick cross_camera_threshold below the true-match cluster)
+
+[live] Please wait a moment while we render the final outputs (offline reconciliation)...
+[live] persisted 1482 observation(s) for run 20260730_120551.
+[live] reconciling identities across cameras...
+  tracklet reconcile: same-camera bars cam_213=0.80, cam_219=0.90, cam_224=0.90  (global 0.90, cross-camera 0.70)
+  tracklet reconcile: suppressed ('cam_213', 14) (2 obs < 3)
+  tracklet reconcile: suppressed ('cam_213', 53) (2 obs < 3)
+  tracklet reconcile: same-camera merge ('cam_219', 12) + ('cam_219', 44) (cosine 0.991)
+  tracklet reconcile: same-camera merge ('cam_213', 34) + ('cam_213', 52) (cosine 0.970)
+  tracklet reconcile: same-camera merge ('cam_213', 24) + ('cam_213', 26) (cosine 0.953)
+  tracklet reconcile: same-camera merge ('cam_213', 26) + ('cam_213', 38) (cosine 0.948)
+  tracklet reconcile: same-camera merge ('cam_213', 38) + ('cam_213', 45) (cosine 0.935)
+  tracklet reconcile: same-camera merge ('cam_213', 19) + ('cam_213', 34) (cosine 0.917)
+  tracklet reconcile: same-camera merge ('cam_213', 1) + ('cam_213', 22) (cosine 0.891)
+  tracklet reconcile: same-camera merge ('cam_213', 3) + ('cam_213', 19) (cosine 0.879)
+  tracklet reconcile: same-camera merge ('cam_213', 22) + ('cam_213', 51) (cosine 0.800)
+  tracklet reconcile: cross-camera cluster merge ('cam_219', 29) + ('cam_224', 35) (cosine 0.909 >= 0.70)
+  tracklet reconcile: cross-camera cluster merge ('cam_219', 10) + ('cam_224', 6) (cosine 0.886 >= 0.70)
+  tracklet reconcile: cross-camera cluster merge ('cam_213', 1) + ('cam_224', 9) (cosine 0.858 >= 0.70)
+  tracklet reconcile: cross-camera cluster merge ('cam_213', 24) + ('cam_224', 40) (cosine 0.839 >= 0.70)
+  tracklet reconcile: cross-camera cluster merge ('cam_213', 3) + ('cam_224', 36) (cosine 0.796 >= 0.70)
+  tracklet reconcile: cross-camera cluster merge ('cam_213', 37) + ('cam_219', 29) (cosine 0.866 >= 0.70)
+  tracklet reconcile: cross-camera cluster merge ('cam_219', 11) + ('cam_224', 7) (cosine 0.777 >= 0.70)
+  tracklet reconcile: cross-camera cluster merge ('cam_219', 12) + ('cam_224', 27) (cosine 0.703 >= 0.70)
+  tracklet reconcile: 28 tracklets -> 11 identities.
+  --- reconcile diagnostics ---
+    decisions evaluated: 86
+    gate failures: {'MIN_OBSERVATIONS': 2, 'ABSOLUTE_THRESHOLD': 43, 'RECIPROCAL_BEST': 14}
+    candidate exclusions: {'TEMPORAL_CONFLICT_SAME_CAMERA': 304, 'NOT_MERGEABLE_CROSS': 118, 'BELOW_ABSOLUTE_THRESHOLD': 490}
+    tracklets=30 -> identities=11  max/identity=5  mean=2.55
+    suppressed=2 (0.27% of observations)  expired_unresolved=0
+      cam_213: 14 tracklet(s), obs total=196 min=2 max=37 mean=14.0
+      cam_219: 5 tracklet(s), obs total=803 min=34 max=301 mean=160.6
+      cam_224: 11 tracklet(s), obs total=483 min=3 max=184 mean=43.91
+    identities spanning >1 camera: 7
+      cam_213 <-> cam_219: considered=124 merged=2 excluded={'BELOW_ABSOLUTE_THRESHOLD': 60, 'TEMPORAL_CONFLICT_SAME_CAMERA': 46}
+      cam_213 <-> cam_224: considered=330 merged=8 excluded={'BELOW_ABSOLUTE_THRESHOLD': 192, 'TEMPORAL_CONFLICT_SAME_CAMERA': 116}
+      cam_219 <-> cam_224: considered=334 merged=8 excluded={'BELOW_ABSOLUTE_THRESHOLD': 148, 'TEMPORAL_CONFLICT_SAME_CAMERA': 132}
+    TOP2_MARGIN disagreement: 27/43 = 62.79% (hard constraints reshaping the candidate space)  [+43 with no selectable candidate]
+  tracklet reconcile: decision log -> logs/reconcile_decisions_20260730_120551.jsonl
+[live] rendering final annotated videos with reconciled ids...
+[video_source] End of video file.
+[render] Final annotated video -> output_cam_213.mp4
+[video_source] End of video file.
+[render] Final annotated video -> output_cam_224.mp4
+[video_source] End of video file.
+[render] Final annotated video -> output_cam_219.mp4
+
+===== RUN SUMMARY =====
+  Run id: 20260730_120551
+  Store: 1482 observations -> 11 distinct people (reid_ids)
+  Cross-camera people: 7
+    GID 1: cam_213 (track 0001 + track 0022 + track 0051) + cam_224 (track 0009)
+    GID 2: cam_213 (track 0003 + track 0019 + track 0034 + track 0052) + cam_224 (track 0036)
+    GID 3: cam_213 (track 0024 + track 0026 + track 0038 + track 0045) + cam_224 (track 0040)
+    GID 4: cam_213 (track 0037) + cam_219 (track 0029) + cam_224 (track 0035)
+    GID 5: cam_219 (track 0010) + cam_224 (track 0006)
+    GID 6: cam_219 (track 0011) + cam_224 (track 0007)
+    GID 7: cam_219 (track 0012 + track 0044) + cam_224 (track 0027)
+  Annotated videos: output_cam_213.mp4, output_cam_224.mp4, output_cam_219.mp4
+=======================
+
+[live] keeping processed-frame clip: ._live_src_cam_213.mp4 (+ ._live_src_cam_213.annotations.json)
+[live] keeping processed-frame clip: ._live_src_cam_224.mp4 (+ ._live_src_cam_224.annotations.json)
+[live] keeping processed-frame clip: ._live_src_cam_219.mp4 (+ ._live_src_cam_219.annotations.json)
+[live] re-render these at other reconcile settings with: python tests/calibration/rerender_from_clips.py 20260730_120551
+[live] shutdown complete.
+[main] All done.
