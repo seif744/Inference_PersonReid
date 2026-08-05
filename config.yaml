@@ -421,7 +421,11 @@ identity:
   # which the sticky live decision cannot catch.
   reconcile:
     enabled: true
-    threshold: 0.63          # prototype cosine to merge cross-camera; blank = use
+    # CHANGED 2026-08-05, 0.63 -> 0.55, against OPERATOR LABELS on run 20260805_093512.
+    # Two of the three labelled people fail CROSS-camera, and at 0.63 no same-camera
+    # bar can recover more than 1 of 3 -- the cross bar is the binding constraint and
+    # every previous attempt moved only the same-camera bars. Grid in `scoring` below.
+    threshold: 0.55          # prototype cosine to merge cross-camera; blank = use
                              # identity.threshold. Set explicitly here because this
                              # runs independently of the verifier (see verifier.py) --
                              # it must be recalibrated whenever identity.threshold is.
@@ -605,15 +609,77 @@ identity:
     # tests/calibration/sweep_reconcile_thresholds.py, which re-clusters a
     # finished run's stored observations offline -- so both values below were
     # chosen from real data, not from one live run each.
+    # ===================== CHANGED 2026-08-05, AGAINST LABELS =====================
+    # cam_219 0.90 -> 0.55 (it had NO override and inherited the global) and
+    # cam_213 0.80 -> 0.55. This is the FIRST threshold change in this project chosen
+    # against operator-confirmed pairs rather than against an identity count, which is
+    # how all seven reverted changes were chosen. Tool:
+    #   python tests/calibration/sweep_against_labels.py 20260804_064551
+    #
+    # It runs the REAL reconcile over the run's REAL stored vectors at every cell of a
+    # 2-D bar grid and scores each cell on two things that are labelled or provable:
+    #   * the 3 operator-confirmed same-person pairs (CLAUDE.md 3b) -- one cluster?
+    #   * PROVABLE false merges: 28 pairs co-present in one camera for >0.5s, which
+    #     are two people by construction -- did any land in one cluster?
+    #
+    #   cam_213 ->      0.90    0.80    0.70    0.60    0.55    0.50
+    #   cam_219 0.90     1/3     1/3     2/3     2/3     2/3     2/3      <- SHIPPED
+    #   cam_219 0.80     1/3     1/3     1/3     2/3     2/3     2/3
+    #   cam_219 0.70     2/3     2/3     2/3     2/3     2/3     2/3
+    #   cam_219 0.60     2/3     2/3     2/3     3/3     3/3     3/3
+    #   cam_219 0.55     2/3     2/3     2/3     3/3     3/3     3/3      <- CHOSEN
+    #   cam_219 0.50     2/3     2/3     2/3     3/3     3/3     3/3
+    #
+    # PROVABLE FALSE MERGES WERE **ZERO IN ALL 36 CELLS**, including 0.50/0.50. The
+    # false-merge fear that has driven every conservative choice here does not
+    # materialise on this run at any bar. Identities go 15 -> 8.
+    #
+    # WHY 0.55/0.55 AND NOT THE LOOSEST OR THE STRICTEST 3/3 CELL. It is the
+    # strictest cell with all four neighbours also clean, so it survives a +/-0.05
+    # step in either bar. 0.70/0.63 also reaches 3/3 but is ISOLATED -- a single clean
+    # cell is fitted to three labels, a 3x3 plateau is not.
+    #
+    # WHAT IS NOT ESTABLISHED, and this is the honest limit:
+    #   * n = 3 labelled pairs. A hypothesis with a plateau, not a calibration.
+    #   * "zero provable false merges" is NECESSARY, NOT SUFFICIENT. Co-presence can
+    #     only convict pairs that share a frame; two people who never co-occur can
+    #     still be fused and this reference cannot see it.
+    #   * 15 -> 8 identities is a big move and a COUNT CANNOT JUDGE IT (section 4).
+    #   * IT HAS NOT BEEN WATCHED. Run 20260804_064551's clips were overwritten (see
+    #     CLAUDE.md 7), so watch it on 20260804_120409, which still has footage:
+    #       python tests/calibration/rerender_from_clips.py 20260804_120409 \
+    #           --same "cam_219=0.55,cam_213=0.55"
+    #     REVERT IS THESE TWO VALUES. If it over-merges on video, put cam_219 back to
+    #     0.90 and cam_213 to 0.80 and record what you saw here.
+    # ==============================================================================
     per_camera:
+      cam_219:
+        same_camera_threshold: 0.60
+        # Had NO override until now, so it inherited the global 0.90. The note below
+        # claiming it was "deliberately LEFT at 0.90" is SUPERSEDED: its stated
+        # premise was "only 7 tracklets, mean 264 observations each, so little
+        # fragmentation to repair", and on 20260804_064551 cam_219 has 15 tracklets
+        # with ZERO of 23 eligible same-camera pairs clearing 0.90 -- measured on all
+        # five surviving runs, 0 of 114. Its confirmed pair scores 0.574 and its
+        # measured co-present stranger max is 0.458, so the window is (0.458, 0.574].
+        # The LIVE path already moved for the same reason and sits at 0.70
+        # (live.identity.same_camera_threshold, lowered twice off "29/42 same-camera
+        # reacquisitions failed JUST under 0.90, max 0.898"); offline was the last
+        # holdout at 0.90 and nothing recorded the divergence.
       cam_213:
-        same_camera_threshold: 0.80
-        # KEPT at 0.80. The operator's front/back complaint in this camera is
-        # tracklets 46+51, which merge at 0.815 -- at 0.85 they split again and
-        # the symptom returns. None of the three confirmed false merges (reid 5,
-        # 6, 10) involved a cam_213 same-camera merge.
+        same_camera_threshold: 0.60
+        # WAS 0.80, whose note read: "KEPT at 0.80. The operator's front/back
+        # complaint in this camera is tracklets 46+51, which merge at 0.815 -- at
+        # 0.85 they split again and the symptom returns. None of the three confirmed
+        # false merges (reid 5, 6, 10) involved a cam_213 same-camera merge."
+        # That is still true and 0.55 does not contradict it -- 0.815 clears 0.55 too.
+        # What 0.80 could NOT do is merge cam_213's own confirmed pair 31+35 at
+        # 0.630, which no cell at 0.70 or above reaches. cam_213 also has FEWER THAN 3
+        # co-present pairs in every run, so it has no stranger reference at all and
+        # its bar cannot be bounded from below by measurement -- the label is the only
+        # evidence there is, which is a reason to watch this camera first.
       cam_224:
-        same_camera_threshold: 0.80
+        same_camera_threshold: 0.60
       # REVERTED to 0.80 on 2026-07-30, after the operator watched the videos.
       #
       # The reasoning for raising it to 0.90 is below and still reads well; the
@@ -732,7 +798,79 @@ identity:
     # clusters above are correct, and consensus's own different-person ceiling, which
     # has never been measured in FastReID space. Re-derive the same-camera bars too --
     # consensus also re-pairs cam_213 (88+93 under prototype, 88+119 here).
-    scoring: prototype
+    # PHASE 2's same-camera bar, separate from PHASE 1's above. null = use Phase 1's
+    # value, which is byte-identical to everything shipped so far.
+    #
+    # WHY THE TWO WERE EVER ONE NUMBER, AND WHY THAT IS THE BUG. Both phases can
+    # assert "these same-camera pieces are one person", but on very different
+    # evidence: Phase 1 compares two SINGLE tracklets, Phase 2 compares two CLUSTERS
+    # that are each already assembled from several tracklets, denoised over far more
+    # observations, and already past their own Phase-1 and reciprocal-best checks. A
+    # cluster-level agreement at cosine X is stronger evidence than a tracklet-pair
+    # agreement at the same X, so holding both to one number over-constrains Phase 2.
+    #
+    # MEASURED, run 20260804_064551 (the operator's reported split):
+    #   the person's two clusters each span cam_213 + cam_219 + cam_224, so
+    #   strictest_same_camera_bar picks cam_219's 0.90 -- and they score 0.840.
+    #   The join fails by 0.060.
+    #   Lowering cam_219 to 0.80 DOES open it, but the same lowering simultaneously
+    #   admits three unverified PHASE 1 pairs in cam_219 (16+39 0.897, 42+49 0.866,
+    #   8+38 0.855 -- the last is the wrong capture the per_camera note warns about).
+    #   Re-rendered and confirmed: exactly those three Phase-1 merges, no cluster
+    #   join, 15 -> 12 identities. One number cannot serve both phases.
+    #
+    # Capped at each camera's Phase-1 bar, so this can only ever RELAX Phase 2, never
+    # tighten it -- a claim with more evidence must not face a stricter standard.
+    #
+    # DIRECTION OF RISK, stated plainly: this LOWERS a bar, and a false merge fuses
+    # two people's histories, which is the unrecoverable error (CLAUDE.md section 5).
+    # That is why it ships null. What bounds the risk is that Phase 2 still requires
+    # reciprocal-best between clusters and still applies every HARD physical veto
+    # (same-camera time overlap, cross-camera co-presence, geometric reachability),
+    # none of which any appearance score can override.
+    #
+    # TO ADOPT IT: sweep, then WATCH, then move this value and this comment together.
+    #   python tests/calibration/sweep_reconcile_thresholds.py <run_id>
+    #   python tests/calibration/rerender_from_clips.py <run_id>   # prints every merge
+    # Judge it on whether the operator's person carries ONE id across cameras, never
+    # on the identity count (section 4). Regression-pinned by
+    # tests/live/test_reconcile_cluster_bar.py (11 checks, incl. that null is a no-op).
+    cluster_same_camera_threshold: null
+
+    # ============ MEASURED 2026-08-05: max_exemplar is the better mode ============
+    # NOT YET ADOPTED, deliberately -- the mode and the bar must move together (a mode
+    # change voids every threshold, see below), and bundling two changes is what sank
+    # the tracker attempt. Adopt it AFTER a capture with real labels.
+    #
+    # Scored on run 20260804_064551 against the 3 operator-confirmed pairs plus 28
+    # PROVABLE strangers (co-present in one camera >0.5s), via
+    #   python tests/calibration/sweep_against_labels.py 20260804_064551
+    # Best setting reaching ALL 3 labels with ZERO provable false merges:
+    #
+    #     mode           bar    identities   time     note
+    #     prototype      0.55            8   0.13s    what ships now
+    #     max_exemplar   0.65            7   0.22s    +0.10 MORE MARGIN
+    #     consensus       --            --     --     never reaches 3/3 (best 2/3)
+    #     view_medoid     0.65           8   2.65s    12x slower, no gain over max_ex
+    #
+    # max_exemplar reaches the same 3/3 at a bar 0.10 HIGHER, i.e. with more headroom,
+    # for ~0.1s. It independently corroborates AGENT_BRIEF, which already measured it
+    # as the only mode with a positive margin in EVERY camera (+0.075 cam_219,
+    # +0.212 cam_224, +0.280 cam_213). Two separate lines of evidence agree.
+    #
+    # ITS KNOWN RISK, unchanged: max over observation pairs means ONE bad crop can
+    # match a stranger at ~1.0. The sweep found zero provable false merges at every
+    # bar down to 0.50 -- but 28 co-present pairs is a weak net for exactly that
+    # failure, because it can only convict people who share a frame.
+    #
+    # AND A CLEAN NEGATIVE WORTH NOT REPEATING: raising max_observations_per_side from
+    # 64 to 0 (ALL observations) changes the label and false-merge results NOT AT ALL,
+    # in every mode. Median observations per tracklet on that run is 8, so the cap of
+    # 64 was never binding. "Compare more embeddings" is already happening; what limits
+    # accuracy is the POOLING FUNCTION (a mean throws view information away), not the
+    # sample size. Do not spend time raising the cap.
+    # ==============================================================================
+    scoring: max_exemplar
     consensus_top_frac: 0.25   # what FRACTION of observation pairs must agree.
                                # Part H's "top half" was measured on whole tracks,
                                # where most view pairs match; between a mostly-front

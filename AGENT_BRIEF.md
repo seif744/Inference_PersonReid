@@ -1,15 +1,88 @@
-# AGENT BRIEF — revision 3, 2026-08-04
+# AGENT BRIEF — revision 4, 2026-08-05
 
-**Supersedes every earlier revision. Overwrite the tracked copy, do not append.**
-Self-contained: the ADR set is gitignored and is not in your clone (`CLAUDE.md` §7).
+**Supersedes every earlier revision.** Revision 3's central claim — "the usable window
+is EMPTY, no bar satisfies both sides" — is **WITHDRAWN**. It was computed by pooling
+cameras and taking a MAX on a contaminated control. Per camera, against p95, and now
+against real labels, a window exists and has been found.
 
-Tracked companions, already in the repo: `RECONCILE_PATCHES.md`,
-`CAPTURE_PROTOCOL.md`, `tools/inspect_tracklet_pairs.py`,
-`tests/live/test_same_camera_chain.py`.
+## THE STATE, 2026-08-05 — read this and nothing else if you are short of time
 
-Earlier revisions contained two errors of fact, both corrected below: they claimed
-the Qdrant collection was empty (it is not), and they said "change nothing in config"
-while `HEAD` shipped a setting already measured to be worse.
+**Ground truth exists.** Run `20260805_093512` (3 cams, 92 s, 1299 obs, clips kept)
+carries 32 operator-confirmed pairs in `calibration/tracklet_pairs.jsonl`, including
+the project's **first cross-camera same-person labels**. Three people: A (reids 3+4+8,
+3 cameras, 8 tracklets), B (7+9), C (6+11).
+
+**At the shipped settings, 0 of 3 were recovered.** The fix, measured with
+`tests/calibration/sweep_against_labels.py` and now in `config.yaml`:
+
+| | was | now | why |
+|---|---|---|---|
+| `identity.reconcile.threshold` | 0.63 | **0.55** | 2 of 3 failures are cross-camera; at 0.63 NO same-camera bar exceeds 1/3 |
+| per-camera same bars | 0.90 / 0.80 / 0.80 | **0.60** all three | cam_219 had no override at all and inherited 0.90 |
+| `scoring` | prototype | **max_exemplar** | 3/3 with 0.10 more cross headroom; compares observation pairs, not two means |
+
+3/3 people recovered, **zero provable false merges**, 7 identities. Label-validated,
+**not yet watched** — the footage exists, so `rerender_from_clips.py 20260805_093512`
+closes the loop with no camera time. THAT IS THE NEXT ACTION.
+
+## What revision 3 got wrong, so nobody re-derives it
+
+| rev 3 claim | status |
+|---|---|
+| "the window is EMPTY; no bar satisfies both" | **withdrawn** — artefact of pooling cameras + MAX. Per camera against p95 it was already positive in RAW space. |
+| "same-person split-half min 0.594" | contaminated: those tracklets were chimeric (two people under one track_id). |
+| "cross-camera `threshold` is never consulted" | **false in general.** It is the binding constraint for 2 of 3 labelled people. |
+| "threshold tuning was never going to work" | **false.** It works when the CROSS bar moves and when settings are scored against labels rather than counts. |
+| camera-bias / feature centring (hypothesis #3) | measured: **inconclusive and expensive.** 8 of 8 held-out margins improved but NOT ONE ranking changed, and the tail is a cross-space comparison that licenses nothing. Parked on cost. |
+| prototype mean-pooling destroys view info (hypothesis #1) | **supported** — `max_exemplar` beats `prototype` on labels. Acted on. |
+
+## Rules that outrank instinct — additions since revision 3
+
+1. **Score against labels, never a count.** `sweep_against_labels.py`, not
+   `sweep_reconcile_thresholds.py`. Every one of the seven reverted changes was chosen
+   from a count.
+2. **The grids are non-monotonic.** A plateau of adjacent clean cells is the unit of
+   evidence; a single cell is an overfit.
+3. **"Zero provable false merges" is necessary, not sufficient.** Co-presence only
+   convicts people who share a frame.
+4. **Copy `._live_src_*` aside under the run_id before every capture.** Filenames carry
+   no run_id and every run overwrites them; run `20260804_064551`'s footage was lost
+   this way and is unrecoverable.
+5. **Never join a run's store against another run's clips.** ByteTrack renumbers per
+   run; the id spaces barely intersect. It reported cam_219 100% UNRESOLVED and 84% of
+   all boxes, which was a join error, not a pipeline failure. Both tools now refuse it.
+6. **Every measurement here reads the STORE, so anything failing upstream of the store
+   is invisible to all of them.** The annotations sidecar is the only independent
+   source — `measure_unresolved.py` joins the two.
+
+## Closed since revision 3 — do not reopen without a number
+
+- **The unresolved/coverage question.** 14.4% of drawn boxes carried no id; **99% of
+  that was ONE static false positive** (cam_219 track 10: 47.6 s, motion 4.7 px,
+  `bad_aspect_hi` 100%). Furniture, correctly refused by the quality gate. Real rate
+  ~0.6%. `no track_id` 0.3%, `min_tracklet_observations` 0.2%. **The quality gate is
+  exonerated**; `min_box_area_ratio` fired 0% everywhere.
+- **Frame dropping starving ByteTrack.** Dead: processed frames == captured frames.
+- **Crop preprocessing.** Faithful to FastReID upstream.
+- **`max_observations_per_side`.** Raising 64 → all changes nothing; median 8 obs/tracklet.
+- **Phase-1 vs Phase-2 bar conflation.** Real, now separable via
+  `cluster_same_camera_threshold` (ships `null`), pinned by 11 checks. Verified it does
+  NOT fix 064551 — recorded so nobody expects it to.
+
+## Still open, ranked
+
+1. **WATCH the new settings.** `rerender_from_clips.py 20260805_093512`. Nothing else
+   matters until this is done.
+2. **Person A's cam_213 front/back pair** (`19` vs `22`) is the hardest label — it is
+   the "reid 2 by his front, reid 7 by his back" symptom, in the camera with **no
+   stranger reference at all** (fewer than 3 co-present pairs in every run).
+3. **cam_206** — absent since 2026-07-30, never measured under yolo11m.
+4. **cam_213's stream may be a SUB-stream** (`/1/1`, 1920x1080 vs 2560x1440 on the
+   others). At imgsz 1280 its detections went 31 → 167 on the same 300 frames. Check
+   the main stream before touching anything in the identity layer for that camera.
+5. **`max_exemplar`'s single-bad-crop risk** is unfalsified, only unobserved on 23
+   provable strangers.
+6. Labels are 3 people on 92 seconds. Extend them on the next capture.
 
 ---
 

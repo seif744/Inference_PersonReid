@@ -252,6 +252,12 @@ def resolve_reconcile_kwargs(cfg, log=print):
         "threshold": float(threshold),
         "same_camera_threshold": float(recon.get("same_camera_threshold", 0.90)),
         "same_camera_thresholds": resolve_same_camera_thresholds(recon, log=log),
+        # PHASE 2's same-camera bar, separated from PHASE 1's. None = use Phase 1's
+        # value, which is byte-identical to what shipped. See reconcile_tracklets'
+        # docstring for why the two are different claims.
+        "cluster_same_camera_threshold": (
+            None if recon.get("cluster_same_camera_threshold") is None
+            else float(recon["cluster_same_camera_threshold"])),
         "require_reciprocal_best": bool(recon.get("require_reciprocal_best", True)),
         "min_tracklet_observations": int(recon.get("min_tracklet_observations", 3)),
         "scoring": recon.get("scoring", PROTOTYPE),
@@ -286,6 +292,8 @@ def describe_reconcile_kwargs(kw):
         f"same={kw['same_camera_threshold']:.2f}"
         + (" (" + ", ".join(f"{c}={v:.2f}" for c, v in sorted(per_cam.items())) + ")"
            if per_cam else "")
+        + ("" if kw.get("cluster_same_camera_threshold") is None
+           else f" cluster_same={kw['cluster_same_camera_threshold']:.2f}")
         + f" scoring={kw['scoring']}"
         + (f"/top_frac={kw['consensus_top_frac']}" if kw["scoring"] == CONSENSUS else "")
         + (f"/k={kw.get('view_medoid_k')}" if kw["scoring"] == VIEW_MEDOID else "")
@@ -862,6 +870,7 @@ def reconcile_tracklets(store, threshold, run_id=None,
                         same_camera_reciprocal_best=False,
                         same_camera_rounds=False,
                         same_camera_member_quorum=1.0,
+                        cluster_same_camera_threshold=None,
                         geometry=None,
                         quality_out=None):
     """
@@ -883,6 +892,39 @@ def reconcile_tracklets(store, threshold, run_id=None,
         At 0.90, cam_213 got zero eligible same-camera partners across 11 subjects
         and cam_224 managed it for 5 of 17, while cam_206 saw 9.0 per subject.
         See REMEDIATION_PLAN.md J.6.
+
+    cluster_same_camera_threshold : PHASE 2's same-camera bar, separate from Phase
+        1's. None (the default) means "use Phase 1's value", which reproduces the
+        shipped behaviour exactly.
+
+        WHY THE TWO ARE DIFFERENT CLAIMS, and why conflating them made the operator's
+        reported split unfixable by any single number. Both phases can assert "these
+        same-camera pieces are one person", but they do it on very different evidence:
+
+          Phase 1 compares two SINGLE tracklets. Prototype over one track each.
+          Phase 2 compares two CLUSTERS, each already assembled from several
+                  tracklets, denoised over far more observations, and each already
+                  past its own Phase-1 and reciprocal-best checks.
+
+        A cluster-level agreement is therefore stronger evidence than a tracklet-pair
+        agreement at the same cosine, so demanding the same number from both is wrong
+        in a specific direction: Phase 2 is over-constrained.
+
+        MEASURED, run 20260804_064551. The operator's person is split across two
+        clusters that each span cam_213 + cam_219 + cam_224, so
+        strictest_same_camera_bar picks cam_219's 0.90 -- and the two clusters score
+        0.840. The join fails by 0.060. Lowering cam_219 to 0.80 does let it through,
+        but the SAME lowering simultaneously admits three unverified Phase-1 pairs in
+        cam_219 (16+39 at 0.897, 42+49 at 0.866, 8+38 at 0.855 -- the last is the
+        capture this file's per_camera note warns about), and the re-render confirmed
+        exactly those three and no cluster join. One number cannot serve both.
+
+        DIRECTION OF RISK, stated plainly: this LOWERS a bar, and a false merge fuses
+        two people's histories, which is the unrecoverable error (CLAUDE.md section
+        5). It ships OFF for that reason. What limits the risk is that Phase 2 already
+        requires reciprocal-best between clusters and still applies every hard
+        physical veto (same-camera time overlap, cross-camera co-presence, geometric
+        reachability), none of which any appearance score can override.
 
     min_tracklet_observations : a real identity needs sustained observation. A
         tracklet with fewer stored observations than this is treated as detector
@@ -932,9 +974,25 @@ def reconcile_tracklets(store, threshold, run_id=None,
                 f"{same_camera_threshold}")
 
     def cam_bar(*cameras):
-        """The same-camera bar for one camera, or the strictest over several."""
+        """PHASE 1's same-camera bar: one camera's, or the strictest over several."""
         return strictest_same_camera_bar(cameras, per_cam_bar,
                                         same_camera_threshold)
+
+    def cluster_cam_bar(*cameras):
+        """PHASE 2's same-camera bar for a cluster pair sharing `cameras`.
+
+        Falls back to cam_bar when unconfigured, so None reproduces the shipped
+        behaviour byte for byte. When configured it is ONE global number rather than
+        per-camera: the per-camera bars exist because a camera's own fragmentation
+        differs, while this expresses "how much evidence a CLUSTER-level claim needs",
+        which is a property of the phase, not of a view. Never allowed above Phase
+        1's bar for the same cameras -- a Phase 2 claim carries more evidence, so
+        demanding more of it would be backwards.
+        """
+        phase1 = cam_bar(*cameras)
+        if cluster_same_camera_threshold is None:
+            return phase1
+        return min(float(cluster_same_camera_threshold), phase1)
 
     # A configured camera that is not in this run is almost always a typo, and a
     # typo here is invisible in the output -- the camera just keeps the global bar
@@ -952,6 +1010,11 @@ def reconcile_tracklets(store, threshold, run_id=None,
             + ", ".join(f"{c}={cam_bar(c):.2f}"
                         for c in sorted(cameras_present, key=str))
             + f"  (global {same_camera_threshold:.2f}, cross-camera {threshold:.2f})")
+    if cluster_same_camera_threshold is not None:
+        log(f"  tracklet reconcile: PHASE 2 same-camera bar separated from Phase 1 "
+            f"-- cluster claims use {float(cluster_same_camera_threshold):.2f} "
+            f"(capped at each camera's Phase-1 bar), Phase 1 unchanged. A cluster "
+            f"pair carries more evidence than a tracklet pair; see the docstring.")
 
     # ---- cross-camera simultaneity veto (#38, Phase 7) --------------------
     covis_enabled, covis_pairs = (covisibility if covisibility is not None
@@ -1589,7 +1652,7 @@ def reconcile_tracklets(store, threshold, run_id=None,
             shared = shared_cameras(a, b)
             if not shared:
                 return threshold
-            return cam_bar(*shared)
+            return cluster_cam_bar(*shared)
 
         def pair_bar_now(a, b):
             """The bar for this pair given the CURRENT clusters -- the #27 fix.
@@ -1607,7 +1670,7 @@ def reconcile_tracklets(store, threshold, run_id=None,
             shared = live_shared_cameras(a, b)
             if not shared:
                 return threshold
-            return cam_bar(*shared)
+            return cluster_cam_bar(*shared)
 
         root_scores = {}
         for i, a in enumerate(root_keys):

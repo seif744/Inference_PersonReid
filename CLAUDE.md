@@ -141,6 +141,57 @@ cross-camera `threshold` is **never consulted**. Consequences:
 
 Full detail, the retired-approaches table and the task order: `AGENT_BRIEF.md`.
 
+## 3c. GROUND TRUTH EXISTS NOW (2026-08-05). Use it. Stop using proxies.
+
+Run **`20260805_093512`** (3 cameras, 92 s, 1299 obs, clips + sidecars kept) is the
+first run with **operator-confirmed identities read off the video**, and the first
+with **CROSS-CAMERA same-person labels** — every cross-camera claim before this was
+unmeasurable. 32 labelled pairs in `calibration/tracklet_pairs.jsonl` (8 same-camera,
+24 cross-camera), three people:
+
+```
+A  reid 3 + 4 + 8   cam_213:19,22   cam_219:7,12,25   cam_224:3,15,24
+B  reid 7 + 9       cam_219:6                          cam_224:1
+C  reid 6 + 11      cam_219:5                          cam_224:4,10
+```
+
+**At the settings that shipped, 0 of 3 were recovered** — A split three ways, B and C
+two ways each. Measured with `tests/calibration/sweep_against_labels.py`, which runs
+the REAL reconcile over the run's stored vectors and scores every cell on the labels
+plus 23 PROVABLE strangers (co-present in one camera >0.5 s):
+
+```
+people recovered / provable false merges / identities
+                     same-> 0.90  0.80  0.70  0.60  0.55
+prototype     cross 0.63     0/3   0/3   0/3   1/3   1/3   <- WAS SHIPPING
+prototype     cross 0.45     1/3   1/3   1/3   3/3   3/3
+max_exemplar  cross 0.55     1/3   2/3   1/3  3/3.0.7  3/3  <- NOW SHIPPING
+```
+
+Four things follow, and each one contradicts something this repo used to say:
+
+1. **The CROSS-camera bar is the binding constraint, not the same-camera bars.** At
+   `threshold: 0.63` no same-camera value reaches better than 1 of 3. Every previous
+   attempt moved same-camera bars only. Now `threshold: 0.55`.
+2. **`max_exemplar` beats `prototype`**, reaching 3/3 with 0.10 more headroom on the
+   cross bar. It compares observation PAIRS instead of two means, which is the loss
+   §3a's window was really describing. Now `scoring: max_exemplar`.
+3. **PROVABLE false merges were ZERO in every cell of both grids**, down to cross 0.40
+   / same 0.50. The false-merge fear that drove every conservative choice here does
+   not materialise on this footage at any bar. That is *necessary, not sufficient* —
+   co-presence can only convict people who share a frame.
+4. **The grids are NON-MONOTONIC** (max_exemplar recovers 2/3 at same=0.80 but 1/3 at
+   0.70). Merge order interacts, so a plateau is the unit of evidence and a single
+   cell is meaningless. Never quote one cell.
+
+**Raising `max_observations_per_side` from 64 to 0 (all observations) changes nothing**
+in any mode — median observations per tracklet is 8, so the cap was never binding.
+"Compare more embeddings" is already happening; the pooling function was the problem.
+
+**These values are label-validated but NOT YET WATCHED.** The footage exists, so
+close the loop with no camera time:
+`python tests/calibration/rerender_from_clips.py 20260805_093512`
+
 ## 4. A cluster count cannot tell you whether a cluster is one person or three.
 
 Every number quoted for the 2026-07-30 threshold change was **equally consistent

@@ -236,7 +236,22 @@ def reconcile_settings(cfg=None, log=print, owns=(), extra_flags=()):
     if mine("--same-global") is not None:
         kw["same_camera_threshold"] = float(mine("--same-global"))
     if mine("--same") is not None:
-        kw["same_camera_thresholds"] = parse_same(mine("--same"))
+        # MERGE over config.yaml's per_camera map, never REPLACE it. Replacing meant
+        # `--same "cam_219=0.55"` silently dropped every OTHER camera's override back
+        # to the global bar: on 20260804_120409 that pushed cam_224 from its
+        # configured 0.80 to 0.90 without a word, so a run intended to move ONE bar
+        # moved three, and a comparison against the unflagged baseline was measuring
+        # two axes at once in opposite directions. Exactly the class of defect this
+        # resolver's docstring exists to prevent, one level in.
+        overrides = parse_same(mine("--same"))
+        merged = dict(kw.get("same_camera_thresholds") or {})
+        merged.update(overrides)
+        kw["same_camera_thresholds"] = merged
+        untouched = {c: v for c, v in merged.items() if c not in overrides}
+        if untouched:
+            log(f"  [settings] --same overrode {sorted(overrides)}; "
+                f"config's other per-camera bars are KEPT: "
+                + ", ".join(f"{c}={v:.2f}" for c, v in sorted(untouched.items())))
     if mine("--min-obs") is not None:
         kw["min_tracklet_observations"] = int(mine("--min-obs"))
     if mine("--scoring") is not None:
